@@ -4,7 +4,8 @@ use std::time::Duration;
 use common::{AppError, EmailEvent, Recipient};
 use futures_lite::StreamExt;
 use lapin::{options::*, types::FieldTable, Channel, Connection, ConnectionProperties};
-use mailer::EmailSender;
+use mailer::message::ResolvedAttachment;
+use mailer::{fetch_attachments, EmailSender};
 use rate_limiter::MailRateLimiter;
 use recipient_filter::RecipientFilter;
 use reqwest::Client;
@@ -125,10 +126,12 @@ async fn connect_and_consume(
                 let rl       = rate_limiter.clone();
                 let cfg      = cfg.clone();
                 let http     = Arc::clone(&http);
+                // Pass shutdown into each task so retry sleeps can be interrupted.
+                let shutdown = shutdown.clone();
 
                 tokio::spawn(async move {
                     let _permit = permit;
-                    handle_delivery(delivery, store, sender, filter, rl, http, cfg).await;
+                    handle_delivery(delivery, store, sender, filter, rl, http, cfg, shutdown).await;
                 });
             }
         }
@@ -139,6 +142,11 @@ async fn connect_and_consume(
 
 /// Handle one delivery.
 ///
+/// Attachments are fetched ONCE here at the event level, then the resolved
+/// bytes are passed to every recipient.  This prevents:
+///   - N×M HTTP GETs for N recipients × M attachments
+///   - Pre-signed URL expiry for recipients processed later in the loop
+///
 /// For each recipient in the event:
 /// - Blocked  → logged as BLOCKED, continues to next recipient
 /// - Sent     → logged as SENT,    continues to next recipient
@@ -146,7 +154,8 @@ async fn connect_and_consume(
 /// - Failed   → retried with backoff (per-recipient, independent of others)
 ///
 /// The AMQP message is ACK'd once ALL recipients are resolved.
-/// It is NACK'd (→ DLQ) only if the message itself cannot be deserialized.
+/// It is NACK'd (→ DLQ) only if the message itself cannot be deserialized
+/// or if the event-level attachment fetch fails permanently.
 async fn handle_delivery(
     delivery: lapin::message::Delivery,
     store: EmailLogStore,
@@ -155,6 +164,7 @@ async fn handle_delivery(
     rate_limiter: MailRateLimiter,
     http: Arc<Client>,
     cfg: ConsumerConfig,
+    shutdown: CancellationToken,
 ) {
     let event: EmailEvent = match serde_json::from_slice(&delivery.data) {
         Ok(e) => e,
@@ -176,6 +186,35 @@ async fn handle_delivery(
         return;
     }
 
+    // ── Fetch attachments once for the whole event ───────────────────────────
+    // Errors here apply to all recipients equally, so we NACK the whole
+    // message rather than failing each recipient individually.
+    //   - Permanent errors (4xx, expired URL, size cap) → DLQ (requeue: false)
+    //   - Transient errors (5xx, network)               → requeue: true (broker retries)
+    let resolved_attachments: Vec<ResolvedAttachment> = if event.attachments.is_empty() {
+        vec![]
+    } else {
+        match fetch_attachments(&http, &event.attachments, &event.timestamp).await {
+            Ok(atts) => atts,
+            Err(ref e) => {
+                let permanent = matches!(e, AppError::Mailer(m) if m.starts_with("permanent:"));
+                error!(
+                    event_id  = %event.event_id,
+                    error     = %e,
+                    permanent,
+                    "Attachment fetch failed — NACKing message"
+                );
+                let _ = delivery
+                    .nack(BasicNackOptions {
+                        requeue: !permanent,
+                        ..Default::default()
+                    })
+                    .await;
+                return;
+            }
+        }
+    };
+
     // Process every recipient independently.
     for recipient in &event.recipients {
         process_one_recipient(
@@ -183,10 +222,11 @@ async fn handle_delivery(
             &sender,
             &filter,
             &rate_limiter,
-            &http,
             &event,
             recipient,
+            &resolved_attachments,
             &cfg,
+            &shutdown,
         )
         .await;
     }
@@ -202,10 +242,11 @@ async fn process_one_recipient(
     sender: &Arc<dyn EmailSender>,
     filter: &RecipientFilter,
     rate_limiter: &MailRateLimiter,
-    http: &Client,
     event: &EmailEvent,
     recipient: &Recipient,
+    attachments: &[ResolvedAttachment],
     cfg: &ConsumerConfig,
+    shutdown: &CancellationToken,
 ) {
     // Seed attempt counter from DB so restarts don't reset the count.
     let initial = store
@@ -220,7 +261,17 @@ async fn process_one_recipient(
     const MAX_RL_WAITS: u32 = 5;
 
     loop {
-        match process_recipient(store, sender, filter, rate_limiter, http, event, recipient).await {
+        match process_recipient(
+            store,
+            sender,
+            filter,
+            rate_limiter,
+            event,
+            recipient,
+            attachments,
+        )
+        .await
+        {
             RecipientOutcome::Sent | RecipientOutcome::Blocked(_) | RecipientOutcome::Skipped => {
                 return; // all terminal-OK outcomes
             }
@@ -278,7 +329,12 @@ async fn process_one_recipient(
                 let _ = store
                     .mark_failed(event.event_id, &recipient.email, msg, false)
                     .await;
-                sleep(delay).await;
+                // Issue 2 fix: select against shutdown so this sleep does not
+                // block graceful drain when the process is asked to stop.
+                tokio::select! {
+                    _ = sleep(delay) => {}
+                    _ = shutdown.cancelled() => return,
+                }
                 // attempt NOT incremented; only rl_count tracks this path
             }
 
@@ -298,7 +354,12 @@ async fn process_one_recipient(
                 let _ = store
                     .mark_failed(event.event_id, &recipient.email, &e.to_string(), false)
                     .await;
-                sleep(delay).await;
+                // Issue 2 fix: select against shutdown so this sleep does not
+                // block graceful drain when the process is asked to stop.
+                tokio::select! {
+                    _ = sleep(delay) => {}
+                    _ = shutdown.cancelled() => return,
+                }
             }
         }
     }

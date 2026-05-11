@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use common::{AppError, EmailEvent, FromOverride, Recipient};
+use mailer::message::ResolvedAttachment;
 use mailer::smtp::is_permanent_smtp_error;
-use mailer::{fetch_attachments, render_template, templates_for, EmailMessage, EmailSender};
+use mailer::{render_template, templates_for, EmailMessage, EmailSender};
 use metrics::{counter, histogram};
 use rate_limiter::MailRateLimiter;
 use recipient_filter::RecipientFilter;
-use reqwest::Client;
 use store::EmailLogStore;
 use tracing::{info, instrument, warn};
 
@@ -21,18 +21,23 @@ pub enum RecipientOutcome {
 
 /// Process a single recipient for an event.
 ///
+/// `attachments` are pre-fetched at the event level (once for all recipients)
+/// and passed in as resolved bytes. This avoids re-fetching per-signed URLs
+/// for every recipient, which would waste bandwidth and risk URL expiry for
+/// later recipients in the list.
+///
 /// Returns the outcome for this recipient. The caller (runner) decides
 /// whether to retry on `Failed`.
-#[instrument(skip(store, sender, filter, rate_limiter, http, event, recipient),
+#[instrument(skip(store, sender, filter, rate_limiter, event, recipient, attachments),
              fields(event_id = %event.event_id, email = %recipient.email))]
 pub async fn process_recipient(
     store: &EmailLogStore,
     sender: &Arc<dyn EmailSender>,
     filter: &RecipientFilter,
     rate_limiter: &MailRateLimiter,
-    http: &Client,
     event: &EmailEvent,
     recipient: &Recipient,
+    attachments: &[ResolvedAttachment],
 ) -> RecipientOutcome {
     // ── 1. Template lookup (before DB write) ────────────────────────────────
     // Validate the template exists BEFORE inserting the PENDING row.  If we
@@ -100,30 +105,6 @@ pub async fn process_recipient(
         }
     }
 
-    // ── 6. Fetch attachments ─────────────────────────────────────────────────
-    // Each AttachmentRef carries a URL; we download the bytes here so the
-    // SMTP / webhook backend receives a ready-to-attach ResolvedAttachment.
-    //
-    // Error classification (from fetcher.rs):
-    //   4xx response      → permanent (expired URL, bad URL, auth failure)
-    //   5xx / network     → transient (retried by the runner)
-    //   max_age exceeded  → permanent (URL window elapsed before this attempt)
-    //   size cap exceeded → permanent (file too large)
-    let resolved_attachments = if event.attachments.is_empty() {
-        vec![]
-    } else {
-        match fetch_attachments(http, &event.attachments, &event.timestamp).await {
-            Ok(atts) => atts,
-            Err(e) => {
-                let permanent = is_permanent_attachment_error(&e);
-                let _ = store
-                    .mark_failed(event.event_id, &recipient.email, &e.to_string(), permanent)
-                    .await;
-                return RecipientOutcome::Failed(e);
-            }
-        }
-    };
-
     let msg = EmailMessage {
         event_id: event.event_id,
         to_email: recipient.email.clone(),
@@ -133,13 +114,15 @@ pub async fn process_recipient(
         body_text,
         from_email_override,
         from_name_override,
-        attachments: resolved_attachments,
+        // Clone resolved bytes — cheap Arc or Vec clone; bytes were fetched once
+        // at the event level in handle_delivery() and shared across all recipients.
+        attachments: attachments.to_vec(),
     };
 
-    // ── 7. Rate-limit token ──────────────────────────────────────────────────
+    // ── 6. Rate-limit token ──────────────────────────────────────────────────
     rate_limiter.wait_for_token().await;
 
-    // ── 8. Send ───────────────────────────────────────────────────────────────
+    // ── 7. Send ───────────────────────────────────────────────────────────────
     let send_start = std::time::Instant::now();
     match sender.send(&msg).await {
         Ok(()) => {
@@ -167,12 +150,6 @@ pub async fn process_recipient(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Returns true for attachment fetch errors that should NOT be retried.
-/// These all carry a "permanent:" prefix (set by fetcher.rs).
-fn is_permanent_attachment_error(err: &AppError) -> bool {
-    matches!(err, AppError::Mailer(m) if m.starts_with("permanent:"))
-}
 
 /// Minimal RFC-5322 email address format check.
 fn is_valid_email(addr: &str) -> bool {
