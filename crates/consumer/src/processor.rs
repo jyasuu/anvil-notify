@@ -50,7 +50,22 @@ pub async fn process_recipient(
         Err(e) => return RecipientOutcome::Failed(e),
     };
 
-    // ── 2. Idempotency ───────────────────────────────────────────────────────
+    // ── 2. from_override validation (before DB write) ───────────────────────
+    // Validate the From address override BEFORE inserting the PENDING row.
+    // If we insert first and then discover an invalid address, the row is
+    // stuck PENDING forever: every subsequent redelivery hits the idempotency
+    // guard (Skipped) and the bad address is never surfaced again.
+    // Failing here keeps the DB clean and surfaces the misconfiguration fast.
+    let (from_email_override, from_name_override) =
+        resolve_from_override(event.from_override.as_ref());
+    if let Some(ref addr) = from_email_override {
+        if !is_valid_email(addr) {
+            let msg = format!("invalid from_override email address: {addr}");
+            return RecipientOutcome::Failed(AppError::Mailer(format!("permanent: {msg}")));
+        }
+    }
+
+    // ── 3. Idempotency ───────────────────────────────────────────────────────
     // Serialise from_override and attachments refs for DB storage so they
     // can be recovered verbatim when a manual retry re-publishes the event.
     let from_override_json = event
@@ -83,7 +98,7 @@ pub async fn process_recipient(
         Err(e) => return RecipientOutcome::Failed(e),
     }
 
-    // ── 3. Recipient filter ──────────────────────────────────────────────────
+    // ── 4. Recipient filter ──────────────────────────────────────────────────
     if let Err(AppError::Blocked(reason)) = filter.check(&recipient.email) {
         warn!(reason = %reason, "Recipient blocked — dropping");
         let _ = store
@@ -108,18 +123,8 @@ pub async fn process_recipient(
         }
     };
 
-    // ── 5. Resolve and validate per-event From override ─────────────────────
-    let (from_email_override, from_name_override) =
-        resolve_from_override(event.from_override.as_ref());
-    if let Some(ref addr) = from_email_override {
-        if !is_valid_email(addr) {
-            let msg = format!("invalid from_override email address: {addr}");
-            let _ = store
-                .mark_failed(event.event_id, &recipient.email, &msg, true)
-                .await;
-            return RecipientOutcome::Failed(AppError::Mailer(format!("permanent: {msg}")));
-        }
-    }
+    // from_email_override / from_name_override were already resolved and
+    // validated in step 2 (before insert_pending). No work needed here.
 
     let msg = EmailMessage {
         event_id: event.event_id,
@@ -135,10 +140,10 @@ pub async fn process_recipient(
         attachments: attachments.to_vec(),
     };
 
-    // ── 6. Rate-limit token ──────────────────────────────────────────────────
+    // ── 5. Rate-limit token ──────────────────────────────────────────────────
     rate_limiter.wait_for_token().await;
 
-    // ── 7. Send ───────────────────────────────────────────────────────────────
+    // ── 6. Send ───────────────────────────────────────────────────────────────
     let send_start = std::time::Instant::now();
     match sender.send(&msg).await {
         Ok(()) => {

@@ -18,6 +18,14 @@ pub struct ConsumerConfig {
     /// Maximum allowed size per fetched attachment in bytes.
     /// Attachments exceeding this are permanently rejected (no retry).
     pub max_attachment_bytes: usize,
+    /// Maximum consecutive rate-limit backoff cycles before a recipient is
+    /// permanently marked FAILED.
+    ///
+    /// Each cycle waits up to `30 * 2^attempt` seconds (capped at 30 * 8 = 240s).
+    /// With the default of 5 cycles that is roughly 2–4 minutes of total
+    /// rate-limit hold time before giving up.  Increase for providers with
+    /// very long cooldown windows; decrease to fail fast during outages.
+    pub max_rl_waits: u32,
 }
 
 impl Default for ConsumerConfig {
@@ -31,6 +39,7 @@ impl Default for ConsumerConfig {
             retry_base_ms: 1_000,
             max_concurrency: 10,
             max_attachment_bytes: 10 * 1024 * 1024,
+            max_rl_waits: 5,
         }
     }
 }

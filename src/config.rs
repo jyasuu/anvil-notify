@@ -31,6 +31,10 @@ pub struct AppConfig {
     pub max_attachment_bytes: usize,
 }
 
+fn default_max_rl_waits() -> u32 {
+    5
+}
+
 fn default_template_cache_ttl_secs() -> u64 {
     300
 }
@@ -54,6 +58,10 @@ pub struct AmqpConfig {
     pub retry_base_ms: u64,
     /// Cap on concurrent in-flight message handlers (default: 10).
     pub max_concurrency: usize,
+    /// Maximum consecutive rate-limit backoff cycles per recipient (default: 5).
+    /// See `ConsumerConfig::max_rl_waits` for the full explanation.
+    #[serde(default = "default_max_rl_waits")]
+    pub max_rl_waits: u32,
     /// Outbox poll interval in ms (default: 1000). Only used when outbox worker is enabled.
     pub outbox_poll_interval_ms: Option<u64>,
     /// Outbox batch size (default: 50). Only used when outbox worker is enabled.

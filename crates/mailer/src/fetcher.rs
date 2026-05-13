@@ -101,7 +101,11 @@ pub async fn fetch_attachments_with_limit(
 
 /// Fetch a single attachment URL and return the raw bytes.
 #[instrument(skip(client, att_ref), fields(url = %att_ref.url, filename = %att_ref.filename))]
-async fn fetch_one(client: &Client, att_ref: &AttachmentRef, max_bytes: usize) -> Result<Vec<u8>, AppError> {
+async fn fetch_one(
+    client: &Client,
+    att_ref: &AttachmentRef,
+    max_bytes: usize,
+) -> Result<Vec<u8>, AppError> {
     debug!("Fetching attachment");
 
     let mut req = client.get(&att_ref.url);

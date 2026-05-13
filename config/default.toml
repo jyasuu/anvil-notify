@@ -17,6 +17,11 @@ routing_key           = "email.requested"
 max_retries           = 3
 retry_base_ms         = 1000
 max_concurrency       = 10      # max parallel message handlers
+# Maximum consecutive rate-limit backoff cycles per recipient before it is
+# permanently marked FAILED.  Each cycle waits up to ~4 minutes total.
+# Increase for providers with long rate-limit cooldown windows (e.g. free-tier
+# SendGrid); decrease to fail faster during sustained outages.
+max_rl_waits          = 5
 outbox_poll_interval_ms = 1000  # ms between outbox scans (when worker enabled)
 outbox_batch_size     = 50      # rows per scan
 

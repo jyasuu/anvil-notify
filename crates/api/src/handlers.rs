@@ -123,6 +123,45 @@ async fn republish_event(state: &ApiState, event_id: Uuid) -> Result<(), ApiErro
         .find_map(|l| l.attachments.clone())
         .unwrap_or(serde_json::Value::Array(vec![]));
 
+    // Warn callers when stored attachment URLs are provably expired so they
+    // learn upfront rather than getting a cryptic permanent-failure on the
+    // consumer side.  We only check refs that carry a `max_age_secs` hint;
+    // pre-signed URLs without the hint are forwarded unconditionally (the
+    // fetcher will classify a 4xx response as a permanent error).
+    if let Some(refs) = attachments.as_array() {
+        // Use the created_at of the earliest log row as a proxy for the
+        // original event timestamp (all rows for the same event are inserted
+        // within milliseconds of each other).
+        if let Some(original_ts) = logs.iter().map(|l| l.created_at).min() {
+            let age_secs = Utc::now()
+                .signed_duration_since(original_ts)
+                .num_seconds()
+                .max(0) as u64;
+
+            let expired: Vec<&str> = refs
+                .iter()
+                .filter_map(|r| {
+                    let max_age = r.get("max_age_secs")?.as_u64()?;
+                    if age_secs > max_age {
+                        r.get("filename")?.as_str()
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if !expired.is_empty() {
+                return Err(ApiError(AppError::Mailer(format!(
+                    "permanent: {} attachment URL(s) have expired (age {}s > max_age_secs): {}. \
+                     The business service must re-publish the event with fresh URLs before retrying.",
+                    expired.len(),
+                    age_secs,
+                    expired.join(", "),
+                ))));
+            }
+        }
+    }
+
     let recipients: Vec<serde_json::Value> = logs
         .iter()
         .map(|l| {

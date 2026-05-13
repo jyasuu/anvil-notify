@@ -157,5 +157,3 @@ impl TemplateStore {
         info!("Template cache cleared");
     }
 }
-
-

@@ -117,6 +117,56 @@ auth_token = "bearer-token"  # optional
 Messages that exhaust retries are routed to `email.requested.dlq` via the
 `notifications.dlx` dead-letter exchange.
 
+### Attachment URL expiry sizing
+
+Pre-signed URLs (S3, GCS, Azure Blob) must remain valid for the full retry
+window. Use this formula as a minimum:
+
+```
+expiry ≥ max_age_secs + (max_retries × max_retry_delay_secs)
+```
+
+With the defaults (`max_retries = 3`, last backoff step = 8 s):
+
+```
+expiry ≥ max_age_secs + (3 × 8) = max_age_secs + 24 s
+```
+
+In practice, add a generous buffer for queue lag and clock skew — **5 minutes
+is the recommended minimum** for any pre-signed URL referenced in an event.
+
+If a URL expires before the service can fetch it, the delivery is permanently
+marked FAILED (no further retries). The retry API (`POST /emails/{id}/retry`)
+will return a `400` error listing the expired filenames; the business service
+must re-publish the event with fresh URLs before retrying.
+
+## Per-recipient FAILED recovery
+
+When a recipient exhausts all in-process retries it is marked `FAILED` in
+`email_log` and the AMQP message is ACK'd (other recipients in the same event
+are unaffected). There is no automatic re-queue; recovery requires a manual
+operator action via the HTTP API:
+
+```bash
+# Inspect which recipients failed
+GET /emails/{event_id}
+
+# Reset one recipient and re-enqueue the event
+POST /emails/{event_id}/recipients/{email}/retry
+
+# Reset ALL failed recipients for an event at once
+POST /emails/{event_id}/retry
+```
+
+Both endpoints atomically reset the affected row(s) to `PENDING` and
+re-publish the event to RabbitMQ. The consumer's idempotency guard ensures
+already-`SENT` or `BLOCKED` recipients are skipped on re-delivery; only the
+reset `PENDING` rows are re-processed.
+
+For automated recovery, poll `GET /emails/{event_id}` and trigger the retry
+endpoint when `summary.failed > 0`, or set up an alert on the
+`emails_failed_total` Prometheus metric combined with the DLQ queue depth.
+
 ## Adding a new template
 
 Edit `crates/mailer/src/template.rs` → `templates_for()` to add a new

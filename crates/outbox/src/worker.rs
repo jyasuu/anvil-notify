@@ -230,6 +230,12 @@ async fn publish_and_mark(
         // Business service writes: { "from_override": { "email": "...", "name": "..." } }
         "from_override": row.payload.get("from_override").cloned().unwrap_or(serde_json::Value::Null),
         "metadata":      row.payload.get("metadata").cloned().unwrap_or(serde_json::Value::Null),
+        // Forward attachment URL references so the consumer can fetch and attach
+        // files at send time.  Business service writes:
+        //   { "attachments": [{ "url": "...", "filename": "...", "content_type": "..." }] }
+        // An absent key is promoted to an empty array — the consumer treats both
+        // identically (no attachments).
+        "attachments":   row.payload.get("attachments").cloned().unwrap_or(serde_json::Value::Array(vec![])),
     });
 
     let body = serde_json::to_vec(&event)?;

@@ -159,6 +159,30 @@ async fn connect_and_consume(
 /// The AMQP message is ACK'd once ALL recipients are resolved.
 /// It is NACK'd (→ DLQ) only if the message itself cannot be deserialized
 /// or if the event-level attachment fetch fails permanently.
+///
+/// # Per-recipient FAILED recovery
+///
+/// When a recipient exhausts all retries it is marked FAILED in `email_log`
+/// and the AMQP message is still ACK'd (the remaining recipients are
+/// unaffected).  There is no automatic re-queue: recovery requires a manual
+/// operator action via the HTTP API:
+///
+/// ```text
+/// # Reset one recipient and re-enqueue the event
+/// POST /emails/{event_id}/recipients/{email}/retry
+///
+/// # Reset ALL failed recipients for an event
+/// POST /emails/{event_id}/retry
+/// ```
+///
+/// Both endpoints reset the affected row(s) to PENDING and re-publish the
+/// event to RabbitMQ.  The consumer's idempotency guard (ON CONFLICT DO
+/// NOTHING) ensures already-SENT or already-BLOCKED recipients are skipped
+/// on re-delivery; only the reset PENDING rows are re-processed.
+///
+/// For automated recovery, operators can poll `GET /emails/{event_id}` and
+/// trigger the retry endpoint when `summary.failed > 0`, or set up an alert
+/// on the `emails_failed_total` Prometheus metric and the DLQ queue depth.
 async fn handle_delivery(
     delivery: lapin::message::Delivery,
     store: EmailLogStore,
@@ -194,7 +218,14 @@ async fn handle_delivery(
     let resolved_attachments: Vec<ResolvedAttachment> = if event.attachments.is_empty() {
         vec![]
     } else {
-        match fetch_attachments_with_limit(&http, &event.attachments, &event.timestamp, cfg.max_attachment_bytes).await {
+        match fetch_attachments_with_limit(
+            &http,
+            &event.attachments,
+            &event.timestamp,
+            cfg.max_attachment_bytes,
+        )
+        .await
+        {
             Ok(atts) => atts,
             Err(ref e) => {
                 let permanent = matches!(e, AppError::Mailer(m) if m.starts_with("permanent:"));
@@ -256,7 +287,6 @@ async fn process_one_recipient(
 
     let mut attempt = initial;
     let mut rl_count: u32 = 0;
-    const MAX_RL_WAITS: u32 = 5;
 
     loop {
         match process_recipient(
@@ -305,11 +335,12 @@ async fn process_one_recipient(
             // but cap consecutive rate-limit waits to prevent infinite loops.
             RecipientOutcome::Failed(AppError::RateLimited(ref msg)) => {
                 rl_count += 1;
-                if rl_count > MAX_RL_WAITS {
+                if rl_count > cfg.max_rl_waits {
                     error!(
-                        event_id = %event.event_id,
-                        email    = %recipient.email,
+                        event_id   = %event.event_id,
+                        email      = %recipient.email,
                         rl_count,
+                        max_rl_waits = cfg.max_rl_waits,
                         "Rate-limit backoff limit reached — marking FAILED"
                     );
                     let _ = store
