@@ -5,75 +5,11 @@ use axum::{
     Json,
 };
 use chrono::Utc;
-use common::{AppError, EmailStatus};
+use common::{is_valid_email, AppError, EmailStatus};
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::{errors::ApiError, state::ApiState};
-
-/// Basic email address format check reused from the processor module.
-///
-/// Extracted here so `republish_event` can reject a bad `from_override`
-/// address at the API layer before re-enqueuing — preventing a guaranteed
-/// permanent failure on the consumer side.
-fn is_valid_email(addr: &str) -> bool {
-    if addr.len() > 254 {
-        return false;
-    }
-    let (local, domain) = match addr.split_once('@') {
-        Some(parts) => parts,
-        None => return false,
-    };
-    is_valid_local(local) && is_valid_domain(domain)
-}
-
-fn is_valid_local(local: &str) -> bool {
-    if local.is_empty() || local.len() > 64 {
-        return false;
-    }
-    if local.starts_with('.') || local.ends_with('.') || local.contains("..") {
-        return false;
-    }
-    local.chars().all(|c| {
-        c.is_ascii_alphanumeric()
-            || matches!(
-                c,
-                '!' | '#'
-                    | '$'
-                    | '%'
-                    | '&'
-                    | '\''
-                    | '*'
-                    | '+'
-                    | '/'
-                    | '='
-                    | '?'
-                    | '^'
-                    | '_'
-                    | '`'
-                    | '{'
-                    | '|'
-                    | '}'
-                    | '~'
-                    | '-'
-                    | '.'
-            )
-    })
-}
-
-fn is_valid_domain(domain: &str) -> bool {
-    if domain.is_empty() || domain.len() > 253 {
-        return false;
-    }
-    let labels: Vec<&str> = domain.split('.').collect();
-    labels.iter().all(|label| {
-        !label.is_empty()
-            && label.len() <= 63
-            && !label.starts_with('-')
-            && !label.ends_with('-')
-            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-    })
-}
 
 /// Re-publish an event to the queue so the consumer re-processes it.
 ///

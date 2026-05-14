@@ -123,6 +123,17 @@ async fn fetch_one(
 
     let status = resp.status();
 
+    // 429 → rate-limited by the file server.
+    // Must be checked BEFORE the generic is_client_error() branch below,
+    // because 429 is a 4xx and would otherwise be permanently failed.
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        warn!(filename = %att_ref.filename, "Attachment source returned 429");
+        return Err(AppError::RateLimited(format!(
+            "attachment '{}' source returned HTTP 429",
+            att_ref.filename
+        )));
+    }
+
     // 4xx → permanent: bad URL, expired pre-signed URL, access denied, etc.
     // No point retrying — the business system must re-publish with a fresh URL.
     if status.is_client_error() {
@@ -136,15 +147,6 @@ async fn fetch_one(
     if status.is_server_error() {
         return Err(AppError::Mailer(format!(
             "attachment '{}' fetch returned HTTP {status} — will retry",
-            att_ref.filename
-        )));
-    }
-
-    // 429 → rate-limited by the file server
-    if status == StatusCode::TOO_MANY_REQUESTS {
-        warn!(filename = %att_ref.filename, "Attachment source returned 429");
-        return Err(AppError::RateLimited(format!(
-            "attachment '{}' source returned HTTP 429",
             att_ref.filename
         )));
     }

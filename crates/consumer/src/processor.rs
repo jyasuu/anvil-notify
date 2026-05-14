@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use common::{AppError, EmailEvent, FromOverride, Recipient};
+use common::{is_valid_email, AppError, EmailEvent, FromOverride, Recipient};
 use mailer::message::ResolvedAttachment;
 use mailer::smtp::is_permanent_smtp_error;
 use mailer::{render_html_template, render_template, EmailMessage, EmailSender};
@@ -98,7 +98,7 @@ pub async fn process_recipient(
         Err(e) => return RecipientOutcome::Failed(e),
     }
 
-    // ── 4. Recipient filter ──────────────────────────────────────────────────
+    // ── 4. Recipient filter ───────────────────────────────────────────────────
     if let Err(AppError::Blocked(reason)) = filter.check(&recipient.email) {
         warn!(reason = %reason, "Recipient blocked — dropping");
         let _ = store
@@ -172,83 +172,6 @@ pub async fn process_recipient(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Validate a `from_override` email address before attempting to send.
-///
-/// This is deliberately stricter than a full RFC-5321 parser but stops
-/// well short of one: the goal is to catch obvious typos and structural
-/// errors in operator-supplied config before they reach the SMTP server,
-/// not to implement the full address grammar.
-///
-/// Rules applied:
-/// - Must contain exactly one `@` separating a non-empty local part and domain.
-/// - Local part: 1–64 characters, no leading/trailing dot, no consecutive dots.
-///   Allowed characters: alphanumeric, and `!#$%&'*+/=?^_{|}~.-`
-/// - Domain: at least two labels separated by `.`, each label 1–63 chars,
-///   alphanumeric plus hyphens (not leading/trailing).
-/// - Total length ≤ 254 characters (RFC-5321 §4.5.3.1.3).
-///
-/// Note: intentionally accepts `user@localhost` — valid for internal mail
-/// relays and SMTP test servers (e.g. MailHog, Mailpit).
-fn is_valid_email(addr: &str) -> bool {
-    if addr.len() > 254 {
-        return false;
-    }
-    let (local, domain) = match addr.split_once('@') {
-        Some(parts) => parts,
-        None => return false,
-    };
-    is_valid_local(local) && is_valid_domain(domain)
-}
-
-fn is_valid_local(local: &str) -> bool {
-    if local.is_empty() || local.len() > 64 {
-        return false;
-    }
-    if local.starts_with('.') || local.ends_with('.') || local.contains("..") {
-        return false;
-    }
-    local.chars().all(|c| {
-        c.is_ascii_alphanumeric()
-            || matches!(
-                c,
-                '!' | '#'
-                    | '$'
-                    | '%'
-                    | '&'
-                    | '\''
-                    | '*'
-                    | '+'
-                    | '/'
-                    | '='
-                    | '?'
-                    | '^'
-                    | '_'
-                    | '`'
-                    | '{'
-                    | '|'
-                    | '}'
-                    | '~'
-                    | '-'
-                    | '.'
-            )
-    })
-}
-
-fn is_valid_domain(domain: &str) -> bool {
-    if domain.is_empty() || domain.len() > 253 {
-        return false;
-    }
-    let labels: Vec<&str> = domain.split('.').collect();
-    // Allow single-label domains (e.g. "localhost") for internal relay support.
-    labels.iter().all(|label| {
-        !label.is_empty()
-            && label.len() <= 63
-            && !label.starts_with('-')
-            && !label.ends_with('-')
-            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-    })
-}
-
 fn resolve_from_override(ov: Option<&FromOverride>) -> (Option<String>, Option<String>) {
     match ov {
         None => (None, None),
@@ -277,79 +200,5 @@ fn error_reason_label(err: &AppError) -> &'static str {
         AppError::Database(_) => "database",
         AppError::Template(_) => "template",
         _ => "other",
-    }
-}
-
-#[cfg(test)]
-mod email_validation_tests {
-    use super::*;
-
-    // ── Valid addresses ───────────────────────────────────────────────────────
-    #[test]
-    fn accepts_standard_address() {
-        assert!(is_valid_email("user@example.com"));
-    }
-    #[test]
-    fn accepts_subdomain() {
-        assert!(is_valid_email("user@mail.example.co.uk"));
-    }
-    #[test]
-    fn accepts_plus_tag() {
-        assert!(is_valid_email("user+tag@example.com"));
-    }
-    #[test]
-    fn accepts_dots_in_local() {
-        assert!(is_valid_email("first.last@example.com"));
-    }
-    #[test]
-    fn accepts_localhost_for_internal_relay() {
-        assert!(is_valid_email("user@localhost"));
-    }
-    #[test]
-    fn accepts_hyphen_in_domain_label() {
-        assert!(is_valid_email("user@my-company.com"));
-    }
-
-    // ── Invalid addresses ─────────────────────────────────────────────────────
-    #[test]
-    fn rejects_missing_at() {
-        assert!(!is_valid_email("userexample.com"));
-    }
-    #[test]
-    fn rejects_empty_local() {
-        assert!(!is_valid_email("@example.com"));
-    }
-    #[test]
-    fn rejects_empty_domain() {
-        assert!(!is_valid_email("user@"));
-    }
-    #[test]
-    fn rejects_leading_dot_in_local() {
-        assert!(!is_valid_email(".user@example.com"));
-    }
-    #[test]
-    fn rejects_trailing_dot_in_local() {
-        assert!(!is_valid_email("user.@example.com"));
-    }
-    #[test]
-    fn rejects_consecutive_dots_in_local() {
-        assert!(!is_valid_email("us..er@example.com"));
-    }
-    #[test]
-    fn rejects_leading_hyphen_in_domain_label() {
-        assert!(!is_valid_email("user@-example.com"));
-    }
-    #[test]
-    fn rejects_trailing_hyphen_in_domain_label() {
-        assert!(!is_valid_email("user@example-.com"));
-    }
-    #[test]
-    fn rejects_space_in_address() {
-        assert!(!is_valid_email("us er@example.com"));
-    }
-    #[test]
-    fn rejects_address_over_254_chars() {
-        let long_local = "a".repeat(65);
-        assert!(!is_valid_email(&format!("{long_local}@example.com")));
     }
 }
