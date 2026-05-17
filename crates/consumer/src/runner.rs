@@ -5,7 +5,7 @@ use common::{AppError, EmailEvent, Recipient};
 use futures_lite::StreamExt;
 use lapin::{options::*, types::FieldTable, Channel, Connection, ConnectionProperties};
 use mailer::message::ResolvedAttachment;
-use mailer::{fetch_attachments_with_limit, EmailSender};
+use mailer::{fetch_attachments_with_limit, EmailSender, SenderRegistry};
 use rate_limiter::MailRateLimiter;
 use recipient_filter::RecipientFilter;
 use reqwest::Client;
@@ -27,6 +27,7 @@ pub async fn run_consumer(
     store: EmailLogStore,
     template_store: TemplateStore,
     sender: Arc<dyn EmailSender>,
+    sender_registry: SenderRegistry,
     filter: RecipientFilter,
     rate_limiter: MailRateLimiter,
     shutdown: CancellationToken,
@@ -44,6 +45,7 @@ pub async fn run_consumer(
         store,
         template_store,
         sender,
+        sender_registry,
         filter,
         rate_limiter,
     };
@@ -233,7 +235,8 @@ async fn process_one_recipient(
     shutdown: &CancellationToken,
 ) {
     // Seed attempt counter from DB so restarts don't reset the count.
-    let initial = ctx.store
+    let initial = ctx
+        .store
         .get_retry_count(event.event_id, &recipient.email)
         .await
         .unwrap_or(0) as u32;
@@ -254,7 +257,8 @@ async fn process_one_recipient(
                     error    = %e,
                     "Permanent failure for recipient — marking FAILED"
                 );
-                let _ = ctx.store
+                let _ = ctx
+                    .store
                     .mark_failed(event.event_id, &recipient.email, &e.to_string(), true)
                     .await;
                 return;
@@ -267,7 +271,8 @@ async fn process_one_recipient(
                     attempt,
                     "Max retries exhausted for recipient"
                 );
-                let _ = ctx.store
+                let _ = ctx
+                    .store
                     .mark_failed(event.event_id, &recipient.email, &e.to_string(), true)
                     .await;
                 return;
@@ -285,7 +290,8 @@ async fn process_one_recipient(
                         max_rl_waits = cfg.max_rl_waits,
                         "Rate-limit backoff limit reached — marking FAILED"
                     );
-                    let _ = ctx.store
+                    let _ = ctx
+                        .store
                         .mark_failed(event.event_id, &recipient.email, msg, true)
                         .await;
                     return;
@@ -298,12 +304,30 @@ async fn process_one_recipient(
                     delay_secs = delay.as_secs(),
                     "Rate-limited — backing off without consuming retry slot"
                 );
-                let _ = ctx.store
+                let _ = ctx
+                    .store
                     .mark_failed(event.event_id, &recipient.email, msg, false)
                     .await;
                 tokio::select! {
                     _ = sleep(delay) => {}
-                    _ = shutdown.cancelled() => return,
+                    _ = shutdown.cancelled() => {
+                        // Shutdown arrived during backoff. The row is already
+                        // PENDING (mark_failed with exhausted=false above), which
+                        // would leave it stuck with no queue message to pick it up.
+                        // Flip it to FAILED so the operator can see it and use the
+                        // retry API after the service restarts.
+                        warn!(
+                            event_id = %event.event_id,
+                            email    = %recipient.email,
+                            "Shutdown during rate-limit backoff — marking FAILED for manual retry"
+                        );
+                        let _ = ctx
+                            .store
+                            .mark_failed(event.event_id, &recipient.email,
+                                "service shutdown during rate-limit backoff", true)
+                            .await;
+                        return;
+                    }
                 }
             }
 
@@ -320,12 +344,29 @@ async fn process_one_recipient(
                     error    = %e,
                     "Transient failure — retrying"
                 );
-                let _ = ctx.store
+                let _ = ctx
+                    .store
                     .mark_failed(event.event_id, &recipient.email, &e.to_string(), false)
                     .await;
                 tokio::select! {
                     _ = sleep(delay) => {}
-                    _ = shutdown.cancelled() => return,
+                    _ = shutdown.cancelled() => {
+                        // Shutdown arrived during retry backoff. The row is already
+                        // PENDING; flip it to FAILED so it is visible and recoverable
+                        // via the retry API after restart.
+                        warn!(
+                            event_id = %event.event_id,
+                            email    = %recipient.email,
+                            attempt,
+                            "Shutdown during retry backoff — marking FAILED for manual retry"
+                        );
+                        let _ = ctx
+                            .store
+                            .mark_failed(event.event_id, &recipient.email,
+                                "service shutdown during retry backoff", true)
+                            .await;
+                        return;
+                    }
                 }
             }
         }

@@ -8,9 +8,9 @@ use api::{build_router, ApiState, Publisher};
 use consumer::{run_consumer, ConsumerConfig};
 use mailer::smtp::SmtpConfig;
 use mailer::webhook::WebhookConfig;
-use mailer::{EmailSender, SmtpSender, WebhookSender};
+use mailer::{EmailSender, SenderRegistry, SmtpSender, WebhookSender};
 use metrics_exporter_prometheus::PrometheusBuilder;
-use outbox::{run_outbox_worker, OutboxConfig};
+
 use rate_limiter::MailRateLimiter;
 use recipient_filter::RecipientFilter;
 use sqlx::postgres::PgPoolOptions;
@@ -24,10 +24,23 @@ use config::{AppConfig, MailerConfig};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // ── Tracing ───────────────────────────────────────────────────────────────
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .with(tracing_subscriber::fmt::layer().json())
-        .init();
+    // LOG_FORMAT=json   → structured JSON (default in Docker / production)
+    // LOG_FORMAT=pretty  → human-readable coloured output (local dev)
+    // LOG_FORMAT=compact → human-readable, no colours (CI / plain terminals)
+    let log_format = std::env::var("LOG_FORMAT").unwrap_or_else(|_| "json".into());
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    let registry = tracing_subscriber::registry().with(filter);
+    match log_format.to_lowercase().as_str() {
+        "pretty" => registry
+            .with(tracing_subscriber::fmt::layer().pretty())
+            .init(),
+        "compact" => registry
+            .with(tracing_subscriber::fmt::layer().compact())
+            .init(),
+        _ => registry
+            .with(tracing_subscriber::fmt::layer().json())
+            .init(),
+    }
 
     // ── Config ────────────────────────────────────────────────────────────────
     let cfg = AppConfig::load().context("Failed to load config")?;
@@ -47,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Database ──────────────────────────────────────────────────────────────
     let pool = PgPoolOptions::new()
-        .max_connections(10)
+        .max_connections(cfg.database.pool_size)
         .connect(&cfg.database.url)
         .await
         .context("Failed to connect to PostgreSQL")?;
@@ -95,6 +108,29 @@ async fn main() -> anyhow::Result<()> {
             }))
         }
     };
+
+    // ── Named sender accounts (multi-business-system SMTP) ──────────────────
+    // Each entry in sender_accounts gets its own SmtpSender instance so
+    // per-account credentials are never mixed. The global `sender` above is
+    // used when an event omits `sender_account` or names an unknown account.
+    let mut sender_registry = SenderRegistry::new();
+    for (name, acct) in &cfg.sender_accounts {
+        let acct_sender = SmtpSender::new(mailer::smtp::SmtpConfig {
+            host: acct.host.clone(),
+            port: acct.port,
+            username: acct.username.clone(),
+            password: acct.password.clone(),
+            from_email: acct.from_email.clone(),
+            from_name: acct.from_name.clone(),
+        })
+        .with_context(|| format!("Failed to build SMTP sender for account '{name}'"))?;
+        sender_registry.register(name.clone(), Arc::new(acct_sender));
+        info!(
+            account = name,
+            from_email = acct.from_email,
+            "Registered named sender account"
+        );
+    }
 
     // ── Rate limiter ──────────────────────────────────────────────────────────
     let rate_limiter = MailRateLimiter::new(cfg.rate_limit.clone());
@@ -173,6 +209,7 @@ async fn main() -> anyhow::Result<()> {
             store,
             template_store,
             sender,
+            sender_registry,
             filter,
             rate_limiter,
             consumer_shutdown,
@@ -182,28 +219,6 @@ async fn main() -> anyhow::Result<()> {
             tracing::error!(error = %e, "Consumer exited with error");
         }
     });
-
-    // ── Outbox worker ─────────────────────────────────────────────────────────
-    let outbox_task = if let Some(outbox_db_url) = cfg.outbox_database_url {
-        let outbox_cfg = OutboxConfig {
-            database_url: outbox_db_url,
-            amqp_url: cfg.amqp.url.clone(),
-            exchange: cfg.amqp.exchange.clone(),
-            routing_key: cfg.amqp.routing_key.clone(),
-            poll_interval_ms: cfg.amqp.outbox_poll_interval_ms.unwrap_or(1_000),
-            batch_size: cfg.amqp.outbox_batch_size.unwrap_or(50),
-        };
-        let outbox_shutdown = shutdown.clone();
-        info!("Starting outbox worker");
-        Some(tokio::spawn(async move {
-            if let Err(e) = run_outbox_worker(outbox_cfg, outbox_shutdown).await {
-                tracing::error!(error = %e, "Outbox worker exited with error");
-            }
-        }))
-    } else {
-        info!("No OUTBOX_DATABASE_URL set — outbox worker disabled");
-        None
-    };
 
     info!("Notification service running");
 
@@ -232,9 +247,6 @@ async fn main() -> anyhow::Result<()> {
     if tokio::time::timeout(timeout, async {
         let _ = api_task.await;
         let _ = consumer_task.await;
-        if let Some(t) = outbox_task {
-            let _ = t.await;
-        }
     })
     .await
     .is_err()
