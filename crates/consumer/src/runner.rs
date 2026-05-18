@@ -22,6 +22,7 @@ use crate::{
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_consumer(
     cfg: ConsumerConfig,
     store: EmailLogStore,

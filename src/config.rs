@@ -54,7 +54,10 @@ pub struct AppConfig {
 }
 
 /// SMTP credentials for a named sender account.
-/// All fields are required — there is no partial fallback to the global mailer.
+/// All required fields must be present — there is no partial fallback to the global mailer.
+///
+/// Optional tuning fields (`tls_mode`, `*_timeout_ms`, `pool_size`) default to the
+/// same values as the global `[mailer]` SMTP block.
 ///
 /// The `password` field is redacted in `Debug` output so it never appears in
 /// log lines even when someone prints the full config for diagnostics.
@@ -62,10 +65,22 @@ pub struct AppConfig {
 pub struct SmtpAccountConfig {
     pub host: String,
     pub port: u16,
+    #[serde(default)]
     pub username: String,
+    #[serde(default)]
     pub password: String,
     pub from_email: String,
     pub from_name: String,
+    /// Explicit TLS mode override. Omit to infer from port.
+    pub tls_mode: Option<mailer::smtp::SmtpTlsMode>,
+    #[serde(default = "default_connection_timeout_ms")]
+    pub connection_timeout_ms: u64,
+    #[serde(default = "default_read_timeout_ms")]
+    pub read_timeout_ms: u64,
+    #[serde(default = "default_write_timeout_ms")]
+    pub write_timeout_ms: u64,
+    #[serde(default = "default_smtp_pool_size")]
+    pub pool_size: u32,
 }
 
 impl std::fmt::Debug for SmtpAccountConfig {
@@ -77,6 +92,11 @@ impl std::fmt::Debug for SmtpAccountConfig {
             .field("password", &"[REDACTED]")
             .field("from_email", &self.from_email)
             .field("from_name", &self.from_name)
+            .field("tls_mode", &self.tls_mode)
+            .field("connection_timeout_ms", &self.connection_timeout_ms)
+            .field("read_timeout_ms", &self.read_timeout_ms)
+            .field("write_timeout_ms", &self.write_timeout_ms)
+            .field("pool_size", &self.pool_size)
             .finish()
     }
 }
@@ -140,21 +160,56 @@ pub struct HttpConfig {
 }
 
 /// Which email backend to use.
+///
+/// SMTP fields mirror Spring Boot's `spring.mail.*` namespace.
+/// The `backend` discriminant selects the variant.
 #[derive(Deserialize, Clone)]
 #[serde(tag = "backend", rename_all = "snake_case")]
 pub enum MailerConfig {
     Smtp {
         host: String,
         port: u16,
+        #[serde(default)]
         username: String,
+        #[serde(default)]
         password: String,
         from_email: String,
         from_name: String,
+        /// Explicit TLS mode. Omit to infer from port (Spring Boot default behaviour).
+        tls_mode: Option<mailer::smtp::SmtpTlsMode>,
+        /// TCP connect timeout in milliseconds. Default: 5000.
+        /// `spring.mail.properties.mail.smtp.connectiontimeout`
+        #[serde(default = "default_connection_timeout_ms")]
+        connection_timeout_ms: u64,
+        /// Socket read timeout in milliseconds. Default: 10000.
+        /// `spring.mail.properties.mail.smtp.timeout`
+        #[serde(default = "default_read_timeout_ms")]
+        read_timeout_ms: u64,
+        /// Socket write timeout in milliseconds. Default: 10000.
+        /// `spring.mail.properties.mail.smtp.writetimeout`
+        #[serde(default = "default_write_timeout_ms")]
+        write_timeout_ms: u64,
+        /// SMTP connection pool size. Default: 5.
+        #[serde(default = "default_smtp_pool_size")]
+        pool_size: u32,
     },
     Webhook {
         url: String,
         auth_token: Option<String>,
     },
+}
+
+fn default_connection_timeout_ms() -> u64 {
+    5_000
+}
+fn default_read_timeout_ms() -> u64 {
+    10_000
+}
+fn default_write_timeout_ms() -> u64 {
+    10_000
+}
+fn default_smtp_pool_size() -> u32 {
+    5
 }
 
 impl std::fmt::Debug for MailerConfig {
@@ -166,6 +221,11 @@ impl std::fmt::Debug for MailerConfig {
                 username,
                 from_email,
                 from_name,
+                tls_mode,
+                connection_timeout_ms,
+                read_timeout_ms,
+                write_timeout_ms,
+                pool_size,
                 ..
             } => f
                 .debug_struct("MailerConfig::Smtp")
@@ -175,6 +235,11 @@ impl std::fmt::Debug for MailerConfig {
                 .field("password", &"[REDACTED]")
                 .field("from_email", from_email)
                 .field("from_name", from_name)
+                .field("tls_mode", tls_mode)
+                .field("connection_timeout_ms", connection_timeout_ms)
+                .field("read_timeout_ms", read_timeout_ms)
+                .field("write_timeout_ms", write_timeout_ms)
+                .field("pool_size", pool_size)
                 .finish(),
             MailerConfig::Webhook { url, auth_token } => f
                 .debug_struct("MailerConfig::Webhook")

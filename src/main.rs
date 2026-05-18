@@ -86,6 +86,11 @@ async fn main() -> anyhow::Result<()> {
             password,
             from_email,
             from_name,
+            tls_mode,
+            connection_timeout_ms,
+            read_timeout_ms,
+            write_timeout_ms,
+            pool_size,
         } => {
             info!(host, "Using SMTP backend");
             Arc::new(
@@ -96,6 +101,11 @@ async fn main() -> anyhow::Result<()> {
                     password: password.clone(),
                     from_email: from_email.clone(),
                     from_name: from_name.clone(),
+                    tls_mode: tls_mode.clone(),
+                    connection_timeout: std::time::Duration::from_millis(*connection_timeout_ms),
+                    read_timeout: std::time::Duration::from_millis(*read_timeout_ms),
+                    write_timeout: std::time::Duration::from_millis(*write_timeout_ms),
+                    pool_size: *pool_size,
                 })
                 .context("Failed to build SMTP sender")?,
             )
@@ -122,6 +132,13 @@ async fn main() -> anyhow::Result<()> {
             password: acct.password.clone(),
             from_email: acct.from_email.clone(),
             from_name: acct.from_name.clone(),
+            // Named accounts inherit the global timeout/pool defaults.
+            // Override via SmtpAccountConfig if per-account tuning is needed.
+            tls_mode: acct.tls_mode.clone(),
+            connection_timeout: std::time::Duration::from_millis(acct.connection_timeout_ms),
+            read_timeout: std::time::Duration::from_millis(acct.read_timeout_ms),
+            write_timeout: std::time::Duration::from_millis(acct.write_timeout_ms),
+            pool_size: acct.pool_size,
         })
         .with_context(|| format!("Failed to build SMTP sender for account '{name}'"))?;
         sender_registry.register(name.clone(), Arc::new(acct_sender));

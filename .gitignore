@@ -1,2 +1,5 @@
 target
 .env
+# Local config overrides often contain real credentials (SMTP passwords, DB URLs).
+# Never commit this file — use environment variables (AN__*) or a secrets manager in CI.
+config/local.toml

@@ -41,14 +41,28 @@ blocked_domains = []
 # allowed_emails  = ["tester@external.com"]
 
 # ── Mailer ────────────────────────────────────────────────────────────────────
-# Dev default: points at the Mailpit catch-all (start with --profile dev).
-# For production, change host/port/username/password/from_email/from_name,
-# or supply AN__MAILER__PASSWORD via an env var / Docker secret.
+# Dev default: points at the Mailpit catch-all SMTP server.
+# Start Mailpit with: docker compose up mailpit  (or --profile dev)
+# View caught emails at: http://localhost:8025
+#
+# Mailpit listens on port 1025 with no auth and no TLS — tls_mode = "none"
+# and empty username/password match that exactly.
+#
+# For production, replace with real SMTP credentials or supply via env vars:
+#   AN__MAILER__HOST, AN__MAILER__PORT, AN__MAILER__USERNAME, AN__MAILER__PASSWORD
+#   AN__MAILER__FROM_EMAIL, AN__MAILER__FROM_NAME
 [mailer]
 backend    = "smtp"
-host       = "mailpit"
+host       = "mailpit"         # docker-compose service name; use "localhost" when running outside compose
 port       = 1025
-username   = ""
+username   = ""                # Mailpit requires no authentication
 password   = ""
 from_email = "no-reply@example.com"
-from_name  = "AnvilNotify"
+from_name  = "AnvilNotify Dev"
+tls_mode   = "none"            # port 1025 is plain — no TLS negotiation
+
+# Timeouts are intentionally short for local dev so failures surface quickly.
+connection_timeout_ms = 2000   # default: 5000
+read_timeout_ms       = 5000   # default: 10000
+write_timeout_ms      = 5000   # default: 10000
+pool_size             = 2      # small pool is fine for dev; default: 5

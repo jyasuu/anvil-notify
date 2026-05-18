@@ -28,7 +28,7 @@ mod processor_tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use crate::processor::{is_retryable, ProcessorContext, RecipientOutcome};
+    use crate::processor::{is_retryable, ProcessorContext};
 
     // ── Mock sender ───────────────────────────────────────────────────────────
 
@@ -97,6 +97,7 @@ mod processor_tests {
             from_override: None,
             metadata: Default::default(),
             attachments: vec![],
+            sender_account: None,
         }
     }
 
@@ -228,7 +229,7 @@ mod processor_tests {
         // of how many normal retries remain.
         let max_retries: u32 = 10; // high, so normal cap isn't the trigger
         let max_rl_waits: u32 = 3;
-        let mut attempt: u32 = 0;
+        let attempt: u32 = 0;
         let mut rl_count: u32 = 0;
         let mut hit_rl_cap = false;
 

@@ -60,8 +60,8 @@ impl Default for OutboxConfig {
             exchange: "anvil-notify".into(),
             routing_key: "email.requested".into(),
             poll_interval_ms: 1_000,
-            batch_size: 10,   // reduced from 50 — smaller lock window per cycle
-            pool_size: 2,     // reduced from 5 — worker rarely uses more than 2
+            batch_size: 10, // reduced from 50 — smaller lock window per cycle
+            pool_size: 2,   // reduced from 5 — worker rarely uses more than 2
             stale_lock_timeout_secs: 300, // 5 minutes
         }
     }

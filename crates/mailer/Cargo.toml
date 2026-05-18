@@ -16,12 +16,16 @@ chrono      = { workspace = true }
 uuid        = { workspace = true }
 
 # SMTP backend — smtp-transport required for AsyncSmtpTransport and transport::smtp
-lettre = { version = "0.11", features = ["tokio1", "tokio1-native-tls", "builder", "smtp-transport"], default-features = false }
+lettre = { version = "0.11", features = ["tokio1", "tokio1-native-tls", "builder", "smtp-transport", "pool"], default-features = false }
 
 # Webhook backend
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
 # Concurrent attachment fetching
 futures = "0.3"
+
+# Template engine — Jinja2-compatible, auto-escaping, serde_json Value support
+# `speedups` enables v_htmlescape for faster HTML escaping
+minijinja = { version = "2", features = ["speedups"] }
 
 base64 = { workspace = true }

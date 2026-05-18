@@ -10,6 +10,6 @@ pub use fetcher::{fetch_attachments, fetch_attachments_with_limit};
 pub use message::{EmailMessage, ResolvedAttachment};
 pub use registry::SenderRegistry;
 pub use sender::EmailSender;
-pub use smtp::SmtpSender;
+pub use smtp::{SmtpSender, SmtpTlsMode};
 pub use template::{render_html_template, render_template, templates_for};
 pub use webhook::WebhookSender;

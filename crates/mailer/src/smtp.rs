@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use common::AppError;
 use lettre::{
@@ -5,18 +7,185 @@ use lettre::{
     transport::smtp::authentication::Credentials,
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
 };
+use serde::{Deserialize, Serialize};
 use tracing::{info, instrument, warn};
 
 use crate::{EmailMessage, EmailSender};
 
+// ── TLS mode ──────────────────────────────────────────────────────────────────
+
+/// Controls how the SMTP connection is secured.
+///
+/// Mirrors the Spring Boot `spring.mail.properties.mail.smtp.ssl.*` / starttls
+/// knobs but expressed as a single enum so misconfiguration is a compile-time
+/// (or config parse-time) error rather than a silent no-op.
+///
+/// **Auto-detection (default):** omit `tls_mode` and AnvilNotify will infer
+/// the right mode from the port number, matching the Spring Boot defaults:
+///
+/// | Port | Inferred mode |
+/// |------|---------------|
+/// | 465  | `smtps` (implicit TLS)  |
+/// | 587 / 25 | `starttls` |
+/// | other | `none` — plain, no encryption (dev only) |
+///
+/// Explicitly setting `tls_mode` overrides port-based inference, which is
+/// useful when your provider uses a non-standard port.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SmtpTlsMode {
+    /// Implicit TLS from the first byte (port 465 / SMTPS).
+    /// Equivalent to `spring.mail.properties.mail.smtp.ssl.enable=true`.
+    Smtps,
+    /// Upgrade a plain connection to TLS via the STARTTLS command (port 587/25).
+    /// Equivalent to `spring.mail.properties.mail.smtp.starttls.enable=true`.
+    Starttls,
+    /// No encryption. Dev catch-all servers only (Mailpit, MailHog).
+    /// Never use in production — credentials are transmitted in the clear.
+    None,
+}
+
+// ── SmtpConfig ────────────────────────────────────────────────────────────────
+
+/// Full SMTP configuration, modelled after Spring Boot's `spring.mail.*`
+/// namespace so the field names are familiar to Java/Kotlin developers.
+///
+/// TOML equivalent of Spring Boot:
+/// ```toml
+/// [mailer]
+/// backend    = "smtp"
+/// host       = "smtp.gmail.com"         # spring.mail.host
+/// port       = 587                      # spring.mail.port
+/// username   = "user@gmail.com"         # spring.mail.username
+/// password   = "app-password"           # spring.mail.password
+/// from_email = "no-reply@example.com"   # spring.mail.from  (custom)
+/// from_name  = "My App"                 # spring.mail.from_name  (custom)
+///
+/// # Optional tuning — all have sensible defaults:
+/// # tls_mode           = "starttls"     # explicit override; inferred from port by default
+/// # connection_timeout_ms = 5000        # spring.mail.properties.mail.smtp.connectiontimeout
+/// # read_timeout_ms       = 5000        # spring.mail.properties.mail.smtp.timeout
+/// # write_timeout_ms      = 5000        # spring.mail.properties.mail.smtp.writetimeout
+/// # pool_size             = 5           # lettre connection-pool size (default: 5)
+/// ```
+#[derive(Debug, Clone)]
 pub struct SmtpConfig {
+    // ── Required ──────────────────────────────────────────────────────────────
+    /// SMTP server hostname. `spring.mail.host`.
+    pub host: String,
+    /// SMTP server port. `spring.mail.port`.
+    /// Drives TLS-mode auto-detection when `tls_mode` is `None`.
+    pub port: u16,
+    /// SMTP authentication username. `spring.mail.username`.
+    /// Leave empty to skip credential handshake (dev catch-all servers).
+    pub username: String,
+    /// SMTP authentication password. `spring.mail.password`.
+    pub password: String,
+    /// Envelope / display From address. Equivalent to `spring.mail.from`.
+    pub from_email: String,
+    /// Display name shown in the From header alongside `from_email`.
+    pub from_name: String,
+
+    // ── Optional / tuning ────────────────────────────────────────────────────
+    /// Explicit TLS mode. When `None`, inferred automatically from `port`.
+    /// `spring.mail.properties.mail.smtp.ssl.enable` /
+    /// `spring.mail.properties.mail.smtp.starttls.enable`.
+    pub tls_mode: Option<SmtpTlsMode>,
+
+    /// TCP connection establishment timeout.
+    /// `spring.mail.properties.mail.smtp.connectiontimeout`. Default: 5 s.
+    pub connection_timeout: Duration,
+
+    /// Socket read timeout (time to wait for server response after sending data).
+    /// `spring.mail.properties.mail.smtp.timeout`. Default: 10 s.
+    pub read_timeout: Duration,
+
+    /// Socket write timeout.
+    /// `spring.mail.properties.mail.smtp.writetimeout`. Default: 10 s.
+    pub write_timeout: Duration,
+
+    /// Maximum number of open SMTP connections kept in lettre's connection pool.
+    /// Increase for high-throughput deployments; leave at the default (5) for
+    /// most services. `spring.mail` has no direct equivalent — this is a
+    /// transport-layer pool, not a thread pool.
+    pub pool_size: u32,
+}
+
+impl SmtpConfig {
+    /// Resolve the effective TLS mode: use the explicit override if set,
+    /// otherwise infer from the port number (Spring Boot–compatible defaults).
+    fn effective_tls_mode(&self) -> SmtpTlsMode {
+        if let Some(ref m) = self.tls_mode {
+            return m.clone();
+        }
+        match self.port {
+            465 => SmtpTlsMode::Smtps,
+            587 | 25 => SmtpTlsMode::Starttls,
+            _ => SmtpTlsMode::None,
+        }
+    }
+}
+
+/// Deserializable form of `SmtpConfig`, used by `config.rs` / TOML.
+/// All optional fields default to Spring Boot–compatible values.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SmtpConfigRaw {
     pub host: String,
     pub port: u16,
+    #[serde(default)]
     pub username: String,
+    #[serde(default)]
     pub password: String,
     pub from_email: String,
     pub from_name: String,
+    /// Explicit TLS mode override. Omit to infer from port.
+    pub tls_mode: Option<SmtpTlsMode>,
+    /// TCP connect timeout in milliseconds. Default: 5000.
+    #[serde(default = "default_connection_timeout_ms")]
+    pub connection_timeout_ms: u64,
+    /// Socket read timeout in milliseconds. Default: 10000.
+    #[serde(default = "default_read_timeout_ms")]
+    pub read_timeout_ms: u64,
+    /// Socket write timeout in milliseconds. Default: 10000.
+    #[serde(default = "default_write_timeout_ms")]
+    pub write_timeout_ms: u64,
+    /// SMTP connection pool size. Default: 5.
+    #[serde(default = "default_pool_size")]
+    pub pool_size: u32,
 }
+
+fn default_connection_timeout_ms() -> u64 {
+    5_000
+}
+fn default_read_timeout_ms() -> u64 {
+    10_000
+}
+fn default_write_timeout_ms() -> u64 {
+    10_000
+}
+fn default_pool_size() -> u32 {
+    5
+}
+
+impl From<SmtpConfigRaw> for SmtpConfig {
+    fn from(r: SmtpConfigRaw) -> Self {
+        Self {
+            host: r.host,
+            port: r.port,
+            username: r.username,
+            password: r.password,
+            from_email: r.from_email,
+            from_name: r.from_name,
+            tls_mode: r.tls_mode,
+            connection_timeout: Duration::from_millis(r.connection_timeout_ms),
+            read_timeout: Duration::from_millis(r.read_timeout_ms),
+            write_timeout: Duration::from_millis(r.write_timeout_ms),
+            pool_size: r.pool_size,
+        }
+    }
+}
+
+// ── SmtpSender ────────────────────────────────────────────────────────────────
 
 pub struct SmtpSender {
     transport: AsyncSmtpTransport<Tokio1Executor>,
@@ -26,24 +195,22 @@ pub struct SmtpSender {
 
 impl SmtpSender {
     pub fn new(cfg: SmtpConfig) -> Result<Self, AppError> {
-        // TLS mode is selected automatically by port:
-        //   465          → implicit TLS (SMTPS)
-        //   587 / 25     → STARTTLS
-        //   anything else → plain (e.g. Mailpit / MailHog on port 1025)
-        //
-        // Credentials are only attached when a username is configured.
-        // Dev catch-all servers (Mailpit, MailHog) advertise no auth mechanisms
-        // and return "No compatible authentication mechanism was found" if the
-        // client attempts a credential handshake even with valid credentials.
         let with_creds = !cfg.username.is_empty();
+        let mode = cfg.effective_tls_mode();
 
+        // Macro: attach port + optional credentials then build the transport.
+        // Used for the two Result-returning builder variants (relay / starttls_relay).
         macro_rules! build_transport {
             ($builder:expr) => {{
                 let b = $builder
-                    .map_err(|e| AppError::Mailer(e.to_string()))?
-                    .port(cfg.port);
+                    .map_err(|e: lettre::transport::smtp::Error| AppError::Mailer(e.to_string()))?
+                    .port(cfg.port)
+                    .timeout(Some(cfg.connection_timeout))
+                    .pool_config(
+                        lettre::transport::smtp::PoolConfig::new().max_size(cfg.pool_size),
+                    );
                 if with_creds {
-                    b.credentials(Credentials::new(cfg.username, cfg.password))
+                    b.credentials(Credentials::new(cfg.username.clone(), cfg.password.clone()))
                         .build()
                 } else {
                     b.build()
@@ -51,17 +218,37 @@ impl SmtpSender {
             }};
         }
 
-        let transport = match cfg.port {
-            465 => build_transport!(AsyncSmtpTransport::<Tokio1Executor>::relay(&cfg.host)),
-            587 | 25 => {
+        let transport = match mode {
+            SmtpTlsMode::Smtps => {
+                // Credentials are only attached when a username is configured.
+                // Dev catch-all servers (Mailpit, MailHog) advertise no auth mechanisms
+                // and return "No compatible authentication mechanism was found" if the
+                // client attempts a credential handshake even with valid credentials.
+                build_transport!(AsyncSmtpTransport::<Tokio1Executor>::relay(&cfg.host))
+            }
+            SmtpTlsMode::Starttls => {
                 build_transport!(AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(
                     &cfg.host
                 ))
             }
-            _ => {
+            SmtpTlsMode::None => {
+                // No TLS. Intended for local dev catch-all servers
+                // (Mailpit on 1025, MailHog on 1025/2525). If this fires in production
+                // you likely have the wrong port configured — 587 (STARTTLS) or 465
+                // (implicit TLS) are the correct choices for real SMTP providers.
+                warn!(
+                    port = cfg.port,
+                    host = %cfg.host,
+                    "SMTP: using plain (no-TLS) transport on non-standard port. \
+                     Intended for local dev only — verify port is correct for production."
+                );
                 // builder_dangerous does not return a Result, so handle separately.
                 let b = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&cfg.host)
-                    .port(cfg.port);
+                    .port(cfg.port)
+                    .timeout(Some(cfg.connection_timeout))
+                    .pool_config(
+                        lettre::transport::smtp::PoolConfig::new().max_size(cfg.pool_size),
+                    );
                 if with_creds {
                     b.credentials(Credentials::new(cfg.username, cfg.password))
                         .build()

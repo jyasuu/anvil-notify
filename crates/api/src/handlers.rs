@@ -5,8 +5,10 @@ use axum::{
     Json,
 };
 use chrono::Utc;
-use common::{is_valid_email, AppError, AttachmentRef, EmailEvent, EmailStatus, FromOverride, Recipient};
 use common::event::Metadata;
+use common::{
+    is_valid_email, AppError, AttachmentRef, EmailEvent, EmailStatus, FromOverride, Recipient,
+};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -153,8 +155,7 @@ async fn republish_event(
 
     // Deserialize stored attachment refs back to typed structs for the same
     // reason — field names are guaranteed consistent with EmailEvent.
-    let attachments: Vec<AttachmentRef> = serde_json::from_value(attachments)
-        .unwrap_or_default();
+    let attachments: Vec<AttachmentRef> = serde_json::from_value(attachments).unwrap_or_default();
 
     let event = EmailEvent {
         event_id,
@@ -167,8 +168,7 @@ async fn republish_event(
         attachments,
         sender_account,
     };
-    let body =
-        serde_json::to_vec(&event).map_err(|e| ApiError(AppError::Queue(e.to_string())))?;
+    let body = serde_json::to_vec(&event).map_err(|e| ApiError(AppError::Queue(e.to_string())))?;
     state.publisher.publish(body).await.map_err(ApiError)?;
     Ok(())
 }
@@ -332,7 +332,7 @@ pub async fn retry_recipient(
     state.store.reset_for_retry(event_id, &email).await?;
     // Only re-enqueue the one recipient that was reset — not the whole event.
     // SENT/BLOCKED recipients in the same event must not be re-published.
-    republish_event(&state, event_id, Some(&[email.clone()])).await?;
+    republish_event(&state, event_id, Some(std::slice::from_ref(&email))).await?;
 
     Ok((
         StatusCode::ACCEPTED,

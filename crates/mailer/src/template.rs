@@ -1,146 +1,380 @@
+//! Template rendering via [minijinja].
+//!
+//! Templates are Jinja2-compatible strings stored in the `email_template`
+//! table.  The engine is configured once per render call (stateless — no
+//! shared `Environment` singleton needed at these call volumes).
+//!
+//! # Escaping contract
+//!
+//! | Function               | Auto-escape | Use for                        |
+//! |------------------------|-------------|--------------------------------|
+//! | [`render_html_template`] | **on** (HTML) | `body_html` column           |
+//! | [`render_template`]      | **off**     | `subject` and `body_text`      |
+//!
+//! Within an HTML template, every `{{ variable }}` is HTML-escaped by
+//! default.  To insert a pre-rendered HTML block verbatim — e.g. the
+//! `body_html` field of `GENERIC_HTML` — use the `| safe` filter:
+//!
+//! ```jinja
+//! {{ body_html | safe }}
+//! ```
+//!
+//! The `| safe` filter is the **only** way to bypass auto-escaping.  It must
+//! only be used for values that are already safe HTML (operator-owned content,
+//! not end-user data).
+//!
+//! # Syntax quick-reference
+//!
+//! ```jinja
+//! {# comment — stripped from output #}
+//!
+//! {# variable interpolation — HTML-escaped in body_html, verbatim elsewhere #}
+//! {{ orderId }}
+//! {{ name | upper }}
+//! {{ amount | round(2) }}
+//!
+//! {# conditional #}
+//! {% if isPremium %}
+//!   <p>Premium member</p>
+//! {% endif %}
+//!
+//! {# loop over an array payload field #}
+//! {% for item in items %}
+//!   <li>{{ item.name }} — ${{ item.price }}</li>
+//! {% endfor %}
+//!
+//! {# dot-path access into nested objects #}
+//! {{ order.shipping.address }}
+//!
+//! {# verbatim HTML block — only for operator-trusted content #}
+//! {{ body_html | safe }}
+//! ```
+//!
+//! For the full filter/test catalogue see the
+//! [minijinja docs](https://docs.rs/minijinja/latest/minijinja/).
+
 use common::AppError;
+use minijinja::{Environment, ErrorKind};
 use serde_json::Value;
 
-/// Escape HTML special characters to prevent XSS when payload values are
-/// interpolated into the HTML body template.
+// ── Environment builders ──────────────────────────────────────────────────────
+
+/// Build a minijinja `Environment` for **HTML** templates.
 ///
-/// Only five characters require escaping per WHATWG HTML:
-/// `&`, `<`, `>`, `"`, `'`.
-fn escape_html(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#x27;"),
-            _ => out.push(c),
-        }
-    }
-    out
+/// Auto-escape is enabled for all templates so every `{{ variable }}`
+/// is HTML-escaped.  The `| safe` filter (built-in) is the explicit
+/// opt-out for trusted HTML blocks.
+fn html_env() -> Environment<'static> {
+    let mut env = Environment::new();
+    env.set_auto_escape_callback(|_name| minijinja::AutoEscape::Html);
+    // Strict: referencing a variable absent from the payload is a hard error
+    // rather than silently rendering an empty string.  A missing variable
+    // means the payload contract is wrong — better to fail permanently (DLQ)
+    // than deliver an email with a blank field.
+    env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+    env
 }
 
-/// Render a template string by replacing `{{key}}` placeholders
-/// with values from the JSON payload.
+/// Build a minijinja `Environment` for **plain-text** templates (subject,
+/// body_text).
 ///
-/// When `html` is `true`, string values are HTML-escaped before substitution
-/// to prevent XSS in rendered HTML body templates.  Plain-text templates
-/// (`html = false`) receive raw values.
-fn render_template_inner(template: &str, payload: &Value, html: bool) -> Result<String, AppError> {
-    let obj = payload
-        .as_object()
-        .ok_or_else(|| AppError::Template("Payload must be a JSON object".into()))?;
-
-    let mut result = template.to_string();
-
-    for (key, val) in obj {
-        let placeholder = format!("{{{{{key}}}}}");
-        let raw = match val {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        };
-        let replacement = if html { escape_html(&raw) } else { raw };
-        result = result.replace(&placeholder, &replacement);
-    }
-
-    Ok(result)
+/// Auto-escape is disabled: values are inserted verbatim.  This is correct
+/// for plain-text email parts where HTML entities must not appear.
+fn text_env() -> Environment<'static> {
+    let mut env = Environment::new();
+    env.set_auto_escape_callback(|_name| minijinja::AutoEscape::None);
+    env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+    env
 }
 
-/// Render a plain-text template. Values are substituted verbatim.
+// ── Public rendering API ──────────────────────────────────────────────────────
+
+/// Render a **plain-text** template (subject line or `body_text`).
+///
+/// Values are inserted verbatim; no HTML escaping is applied.
+/// Jinja2 syntax (conditionals, loops, filters) is fully supported.
+///
+/// # Errors
+/// Returns [`AppError::Template`] when the template fails to parse or render.
+/// This is a permanent error — the consumer routes it to DLQ without retrying.
 pub fn render_template(template: &str, payload: &Value) -> Result<String, AppError> {
-    render_template_inner(template, payload, false)
+    render_with_env(text_env(), template, payload)
 }
 
-/// Render an HTML template. String values are HTML-escaped before
-/// substitution to prevent XSS from untrusted payload data.
+/// Render an **HTML** template (`body_html`).
+///
+/// Every `{{ variable }}` is HTML-escaped automatically.  Use `{{ x | safe }}`
+/// to insert a pre-rendered HTML block verbatim — only for operator-owned
+/// content, never for raw end-user data.
+///
+/// # Errors
+/// Returns [`AppError::Template`] when the template fails to parse or render.
+/// This is a permanent error — the consumer routes it to DLQ without retrying.
 pub fn render_html_template(template: &str, payload: &Value) -> Result<String, AppError> {
-    render_template_inner(template, payload, true)
+    render_with_env(html_env(), template, payload)
 }
 
-/// Resolve a (subject_template, html_template, text_template) triplet
-/// from the event type.
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn render_with_env(
+    mut env: Environment<'static>,
+    template: &str,
+    payload: &Value,
+) -> Result<String, AppError> {
+    // add_template_owned takes a String, so the environment holds no borrow
+    // into the caller's `template` slice — no lifetime coupling needed.
+    env.add_template_owned("t", template.to_owned())
+        .map_err(|e| template_err("parse", e))?;
+
+    let tmpl = env
+        .get_template("t")
+        // Safety: we just added it above; this cannot fail in practice.
+        .map_err(|e| template_err("load", e))?;
+
+    tmpl.render(payload).map_err(|e| template_err("render", e))
+}
+
+fn template_err(phase: &str, err: minijinja::Error) -> AppError {
+    // Surface the template source location when available so operators
+    // can fix DB template rows without guesswork.
+    let detail = match err.kind() {
+        ErrorKind::UndefinedError => {
+            format!("undefined variable during {phase}: {err}")
+        }
+        _ => format!("template {phase} error: {err}"),
+    };
+    AppError::Template(detail)
+}
+
+// ── Built-in fallback templates ───────────────────────────────────────────────
+//
+// These exist so the CLI `ns send` command and unit tests can work without
+// a database.  The `TemplateStore` (backed by the `email_template` table) is
+// the authoritative source at runtime; these are only consulted when no DB
+// row is found.
+//
+// Migration 0010 / 0017 seeds these same strings into the DB.
+// Migration 0018 updates GENERIC_HTML to use `| safe` for body_html.
+
+/// Resolve a `(subject_template, html_template, text_template)` triplet from
+/// the event type.
 ///
-/// Returns `AppError::Template` for unknown event types so the message is
-/// immediately routed to DLQ without wasting retry slots.
-///
-/// # Built-in default templates
-///
-/// Two generic templates are provided for callers that want to send
-/// freeform content without registering a custom template:
-///
-/// ## `GENERIC_TEXT`
-/// Plain-text only email. Payload fields:
-/// - `subject` — email subject line
-/// - `body`    — plain-text body (rendered verbatim in both parts)
-///
-/// ## `GENERIC_HTML`
-/// Rich HTML email with a plain-text fallback. Payload fields:
-/// - `subject`    — email subject line
-/// - `body_html`  — full HTML body (inserted inside a styled wrapper)
-/// - `body_text`  — plain-text fallback for clients that don't render HTML
+/// Returns [`AppError::Template`] for unknown event types so the consumer can
+/// immediately route to DLQ without burning retry slots.
 pub fn templates_for(
     event_type: &str,
 ) -> Result<(&'static str, &'static str, &'static str), AppError> {
     match event_type {
         "ORDER_CONFIRMATION" => Ok((
-            "Order {{orderId}} confirmed",
-            r#"<h1>Hi {{name}},</h1><p>Your order <strong>{{orderId}}</strong> of ${{amount}} has been confirmed.</p>"#,
-            "Hi {{name}}, Your order {{orderId}} of ${{amount}} has been confirmed.",
+            "Order {{ orderId }} confirmed",
+            r#"<h1>Hi {{ name }},</h1>
+<p>Your order <strong>{{ orderId }}</strong> of ${{ amount }} has been confirmed.</p>"#,
+            "Hi {{ name }}, Your order {{ orderId }} of ${{ amount }} has been confirmed.",
         )),
         "PASSWORD_RESET" => Ok((
             "Reset your password",
-            r#"<p>Click <a href="{{resetLink}}">here</a> to reset your password.</p>"#,
-            "Visit this link to reset your password: {{resetLink}}",
+            r#"<p>Click <a href="{{ resetLink }}">here</a> to reset your password.</p>"#,
+            "Visit this link to reset your password: {{ resetLink }}",
         )),
         "WELCOME" => Ok((
-            "Welcome to {{appName}}!",
-            r#"<h1>Welcome, {{name}}!</h1><p>Thanks for joining {{appName}}.</p>"#,
-            "Welcome, {{name}}! Thanks for joining {{appName}}.",
+            "Welcome to {{ appName }}!",
+            r#"<h1>Welcome, {{ name }}!</h1><p>Thanks for joining {{ appName }}.</p>"#,
+            "Welcome, {{ name }}! Thanks for joining {{ appName }}.",
         )),
-        // ── Generic default templates ─────────────────────────────────────────
+
+        // ── Generic built-ins ─────────────────────────────────────────────────
         //
-        // Use these when the calling service needs to send freeform content
-        // without registering a dedicated template.  All content is supplied
-        // via `payload` fields — no code change or redeploy required.
+        // GENERIC_TEXT: plain-text email via payload fields `subject` + `body`.
         "GENERIC_TEXT" => Ok((
-            "{{subject}}",
-            // Wrap in a minimal HTML shell so the message is valid HTML even
-            // though the intent is plain-text.  The real content lives in
-            // body_text; this HTML part is just a safety fallback.
-            r#"<div style="font-family:sans-serif;white-space:pre-wrap">{{body}}</div>"#,
-            "{{body}}",
+            "{{ subject }}",
+            r#"<div style="font-family:sans-serif;white-space:pre-wrap">{{ body }}</div>"#,
+            "{{ body }}",
         )),
+
+        // GENERIC_HTML: caller supplies pre-rendered HTML in `body_html`.
+        // `| safe` bypasses auto-escaping — the caller owns this HTML and is
+        // responsible for its safety.  `body_text` is the plain-text fallback.
         "GENERIC_HTML" => Ok((
-            "{{subject}}",
-            // Caller supplies the full HTML in `body_html`; we wrap it in a
-            // minimal responsive shell with sane font defaults.
-            r#"<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="margin:0;padding:24px;font-family:sans-serif;color:#111">{{body_html}}</body></html>"#,
-            // Plain-text fallback is required; caller must supply it.
-            "{{body_text}}",
+            "{{ subject }}",
+            concat!(
+                "<!DOCTYPE html><html>",
+                "<head><meta charset=\"utf-8\">",
+                "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"></head>",
+                "<body style=\"margin:0;padding:24px;font-family:sans-serif;color:#111\">",
+                "{{ body_html | safe }}",
+                "</body></html>"
+            ),
+            "{{ body_text }}",
         )),
+
         other => Err(AppError::Template(format!(
             "Unknown event type '{other}' — no template registered"
         ))),
     }
 }
 
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
+    // ── render_template (plain-text) ──────────────────────────────────────────
+
     #[test]
-    fn renders_placeholders() {
-        let out = render_template("Hello {{name}}", &json!({"name": "World"})).unwrap();
+    fn plain_renders_variable() {
+        let out = render_template("Hello {{ name }}", &json!({"name": "World"})).unwrap();
         assert_eq!(out, "Hello World");
     }
 
     #[test]
-    fn leaves_unknown_placeholders_intact() {
-        let out = render_template("{{missing}}", &json!({})).unwrap();
-        assert_eq!(out, "{{missing}}");
+    fn plain_does_not_escape_html() {
+        let out = render_template("Hello {{ name }}", &json!({"name": "<World>"})).unwrap();
+        assert_eq!(out, "Hello <World>");
     }
+
+    #[test]
+    fn plain_undefined_variable_is_error() {
+        let err = render_template("{{ missing }}", &json!({})).unwrap_err();
+        assert!(matches!(err, AppError::Template(_)));
+    }
+
+    #[test]
+    fn plain_dot_path_access() {
+        let out = render_template("{{ order.id }}", &json!({"order": {"id": "X-999"}})).unwrap();
+        assert_eq!(out, "X-999");
+    }
+
+    #[test]
+    fn plain_loop_over_array() {
+        let out = render_template(
+            "{% for x in items %}{{ x }}{% if not loop.last %},{% endif %}{% endfor %}",
+            &json!({"items": ["a", "b", "c"]}),
+        )
+        .unwrap();
+        assert_eq!(out, "a,b,c");
+    }
+
+    #[test]
+    fn plain_conditional() {
+        let out = render_template(
+            "{% if premium %}VIP{% else %}Standard{% endif %}",
+            &json!({"premium": true}),
+        )
+        .unwrap();
+        assert_eq!(out, "VIP");
+    }
+
+    // ── render_html_template ──────────────────────────────────────────────────
+
+    #[test]
+    fn html_escapes_ampersand() {
+        let out = render_html_template("<p>{{ company }}</p>", &json!({"company": "Acme & Sons"}))
+            .unwrap();
+        assert_eq!(out, "<p>Acme &amp; Sons</p>");
+    }
+
+    #[test]
+    fn html_escapes_angle_brackets() {
+        let out = render_html_template(
+            "<p>{{ name }}</p>",
+            &json!({"name": "<script>alert(1)</script>"}),
+        )
+        .unwrap();
+        // minijinja's HTML escaper also encodes `/` as `&#x2f;` (defence-in-depth
+        // against </script> injection in JS contexts).  We assert the tags are
+        // neutralised rather than pinning the exact entity spellings.
+        assert!(
+            out.contains("&lt;script&gt;"),
+            "opening tag must be escaped"
+        );
+        assert!(!out.contains("<script>"), "raw opening tag must not appear");
+        assert!(
+            !out.contains("</script>"),
+            "raw closing tag must not appear"
+        );
+    }
+
+    #[test]
+    fn html_escapes_double_quotes() {
+        let out = render_html_template(
+            r#"<a href="{{ url }}">click</a>"#,
+            &json!({"url": r#"" onclick="bad()"#}),
+        )
+        .unwrap();
+        // minijinja encodes `"` as `&#34;`, neutralising the attribute-break
+        // injection attempt.  We assert the quote is encoded (by any entity
+        // spelling) and that the injected attribute name cannot appear as a
+        // bare word in the output.
+        assert!(
+            out.contains("&#34;") || out.contains("&quot;"),
+            "double-quote must be encoded: {out}"
+        );
+        assert!(
+            !out.contains(r#"" onclick"#),
+            "attribute-break injection must be neutralised: {out}"
+        );
+    }
+
+    #[test]
+    fn html_safe_filter_passes_html_verbatim() {
+        let out = render_html_template(
+            "<body>{{ body_html | safe }}</body>",
+            &json!({"body_html": "<p>Hello</p>"}),
+        )
+        .unwrap();
+        assert_eq!(out, "<body><p>Hello</p></body>");
+    }
+
+    #[test]
+    fn html_without_safe_escapes_tags() {
+        let out = render_html_template(
+            "<body>{{ body_html }}</body>",
+            &json!({"body_html": "<p>Hello</p>"}),
+        )
+        .unwrap();
+        // Tags must be escaped; we don't pin the exact entity for `/`.
+        assert!(
+            out.contains("&lt;p&gt;Hello"),
+            "opening tag must be escaped"
+        );
+        assert!(!out.contains("<p>"), "raw tag must not appear");
+        assert!(!out.contains("</p>"), "raw closing tag must not appear");
+    }
+
+    #[test]
+    fn html_filter_upper() {
+        let out = render_html_template("{{ name | upper }}", &json!({"name": "alice"})).unwrap();
+        assert_eq!(out, "ALICE");
+    }
+
+    #[test]
+    fn html_undefined_variable_is_error() {
+        let err = render_html_template("{{ missing }}", &json!({})).unwrap_err();
+        assert!(matches!(err, AppError::Template(_)));
+    }
+
+    #[test]
+    fn html_loop_and_conditional() {
+        let tpl = concat!(
+            "{%- for item in items -%}",
+            "<li>{{ item.name }}{% if item.sale %} — SALE{% endif %}</li>",
+            "{%- endfor -%}",
+        );
+        let out = render_html_template(
+            tpl,
+            &json!({"items": [
+                {"name": "Widget", "sale": false},
+                {"name": "Gadget", "sale": true},
+            ]}),
+        )
+        .unwrap();
+        assert!(out.contains("<li>Widget</li>"));
+        assert!(out.contains("<li>Gadget — SALE</li>"));
+    }
+
+    // ── templates_for integration ─────────────────────────────────────────────
 
     #[test]
     fn unknown_event_type_is_template_error() {
@@ -149,73 +383,67 @@ mod tests {
     }
 
     #[test]
-    fn html_template_escapes_ampersand() {
-        let out =
-            render_html_template("<p>{{company}}</p>", &json!({"company": "Acme & Sons"})).unwrap();
-        assert_eq!(out, "<p>Acme &amp; Sons</p>");
+    fn order_confirmation_renders() {
+        let (subj, html, text) = templates_for("ORDER_CONFIRMATION").unwrap();
+        let payload = json!({"name": "Alice", "orderId": "ORD-1", "amount": "42.00"});
+        assert_eq!(
+            render_template(subj, &payload).unwrap(),
+            "Order ORD-1 confirmed"
+        );
+        assert!(render_html_template(html, &payload)
+            .unwrap()
+            .contains("Alice"));
+        assert!(render_template(text, &payload).unwrap().contains("ORD-1"));
     }
 
     #[test]
-    fn html_template_escapes_angle_brackets() {
-        let out = render_html_template(
-            "<p>{{name}}</p>",
-            &json!({"name": "<script>alert(1)</script>"}),
-        )
-        .unwrap();
-        assert_eq!(out, "<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>");
+    fn order_confirmation_escapes_xss_in_name() {
+        let (_, html, _) = templates_for("ORDER_CONFIRMATION").unwrap();
+        let payload = json!({"name": "<script>alert(1)</script>", "orderId": "X", "amount": "0"});
+        let out = render_html_template(html, &payload).unwrap();
+        assert!(!out.contains("<script>"));
+        assert!(out.contains("&lt;script&gt;"));
     }
 
     #[test]
-    fn html_template_escapes_quotes() {
-        let out = render_html_template(
-            "<a href=\"{{url}}\">click</a>",
-            &json!({"url": "\" onclick=\"bad()"}),
-        )
-        .unwrap();
-        assert!(out.contains("&quot;"));
+    fn generic_text_renders() {
+        let (subj, html, text) = templates_for("GENERIC_TEXT").unwrap();
+        let payload = json!({"subject": "Hello", "body": "Line one\nLine two"});
+        assert_eq!(render_template(subj, &payload).unwrap(), "Hello");
+        assert_eq!(
+            render_template(text, &payload).unwrap(),
+            "Line one\nLine two"
+        );
+        assert!(render_html_template(html, &payload)
+            .unwrap()
+            .contains("Line one\nLine two"));
     }
 
     #[test]
-    fn plain_template_does_not_escape() {
-        let out = render_template("Hello {{name}}", &json!({"name": "<World>"})).unwrap();
-        assert_eq!(out, "Hello <World>");
-    }
-
-    #[test]
-    fn generic_text_renders_subject_and_body() {
-        let (subj_tpl, html_tpl, text_tpl) = templates_for("GENERIC_TEXT").unwrap();
-        let payload = json!({ "subject": "Hello there", "body": "Line one\nLine two" });
-        assert_eq!(render_template(subj_tpl, &payload).unwrap(), "Hello there");
-        assert_eq!(render_template(text_tpl, &payload).unwrap(), "Line one\nLine two");
-        // HTML wrapper preserves the body verbatim (pre-wrap, no escaping for plain sender)
-        assert!(render_html_template(html_tpl, &payload).unwrap().contains("Line one\nLine two"));
-    }
-
-    #[test]
-    fn generic_html_renders_all_three_parts() {
-        let (subj_tpl, html_tpl, text_tpl) = templates_for("GENERIC_HTML").unwrap();
+    fn generic_html_passes_body_html_verbatim() {
+        let (subj, html, text) = templates_for("GENERIC_HTML").unwrap();
         let payload = json!({
-            "subject":   "Your invoice is ready",
+            "subject":   "Your invoice",
             "body_html": "<p>Please find your invoice attached.</p>",
             "body_text": "Please find your invoice attached.",
         });
-        assert_eq!(render_template(subj_tpl, &payload).unwrap(), "Your invoice is ready");
-        let html = render_html_template(html_tpl, &payload).unwrap();
-        assert!(html.contains("<p>Please find your invoice attached.</p>"));
-        assert!(html.contains("<body"));
-        assert_eq!(render_template(text_tpl, &payload).unwrap(), "Please find your invoice attached.");
+        assert_eq!(render_template(subj, &payload).unwrap(), "Your invoice");
+        let rendered = render_html_template(html, &payload).unwrap();
+        assert!(
+            rendered.contains("<p>Please find your invoice attached.</p>"),
+            "body_html must arrive verbatim via | safe, not escaped: {rendered}"
+        );
+        assert!(rendered.contains("<body"));
+        assert_eq!(
+            render_template(text, &payload).unwrap(),
+            "Please find your invoice attached."
+        );
     }
 
     #[test]
-    fn generic_html_escapes_body_html_xss() {
-        let (_, html_tpl, _) = templates_for("GENERIC_HTML").unwrap();
-        let payload = json!({
-            "subject":   "Test",
-            "body_html": "<script>alert(1)</script>",
-            "body_text": "test",
-        });
-        let html = render_html_template(html_tpl, &payload).unwrap();
-        assert!(!html.contains("<script>"), "raw <script> must be escaped");
-        assert!(html.contains("&lt;script&gt;"));
+    fn generic_html_subject_is_plain_text_no_escaping() {
+        let (subj, _, _) = templates_for("GENERIC_HTML").unwrap();
+        let payload = json!({"subject": "Hello & Goodbye", "body_html": "", "body_text": ""});
+        assert_eq!(render_template(subj, &payload).unwrap(), "Hello & Goodbye");
     }
 }

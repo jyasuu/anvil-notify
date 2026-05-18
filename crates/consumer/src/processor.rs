@@ -123,18 +123,21 @@ pub async fn process_recipient(
         .await
     {
         Ok(InsertResult::Inserted) => {} // fresh row — proceed normally
-        Ok(InsertResult::Duplicate { retry_count }) => {
+        Ok(InsertResult::Duplicate {
+            retry_count,
+            status,
+        }) => {
             // Row already exists. Check whether it is in a terminal state.
-            match ctx.store.get_status(event.event_id, &recipient.email).await {
-                Ok(common::EmailStatus::Sent) | Ok(common::EmailStatus::Blocked) => {
+            // `status` is returned inline from the INSERT ... RETURNING clause,
+            // so no second query is needed.
+            match status.as_str() {
+                "SENT" | "BLOCKED" => {
                     info!("Skipping already-terminal recipient");
                     return RecipientOutcome::Skipped;
                 }
                 // PENDING or FAILED — surface the retry_count to the runner so
                 // it can seed its in-memory attempt counter without another query.
-                Ok(_) => return RecipientOutcome::Duplicate { retry_count },
-                // Can't read status — treat as transient and let runner decide.
-                Err(e) => return RecipientOutcome::Failed(e),
+                _ => return RecipientOutcome::Duplicate { retry_count },
             }
         }
         Err(e) => return RecipientOutcome::Failed(e),
@@ -251,6 +254,8 @@ fn error_reason_label(err: &AppError) -> &'static str {
         AppError::Mailer(_) => "transient",
         AppError::Database(_) => "database",
         AppError::Template(_) => "template",
+        AppError::Queue(_) => "queue",
+        AppError::NotFound(_) => "not_found",
         _ => "other",
     }
 }

@@ -75,11 +75,24 @@ max_attachment_bytes = 10485760  # 10 * 1024 * 1024
 
 # ── Choose one backend ────────────────────────────────────────────────────────
 #
-# TLS mode is selected automatically by port:
-#   465  → implicit TLS (SMTPS)        e.g. AWS SES, Fastmail
-#   587  → STARTTLS                    e.g. SendGrid, Mailgun, Gmail SMTP
-#   25   → STARTTLS                    standard MTA submission
-#   other (e.g. 1025, 2525) → plain    dev catch-all servers (Mailpit, MailHog)
+# TLS mode is selected automatically by port (Spring Boot-compatible defaults):
+#   465  → smtps (implicit TLS)     e.g. AWS SES, Fastmail
+#   587  → starttls                 e.g. SendGrid, Mailgun, Gmail SMTP
+#   25   → starttls                 standard MTA submission
+#   other (e.g. 1025, 2525) → none  dev catch-all servers (Mailpit, MailHog)
+#
+# Set `tls_mode` explicitly to override port-based inference.
+#
+# Field mapping to Spring Boot's spring.mail.* namespace:
+#   host                    → spring.mail.host
+#   port                    → spring.mail.port
+#   username                → spring.mail.username
+#   password                → spring.mail.password
+#   from_email              → spring.mail.from  (AnvilNotify extension)
+#   from_name               → spring.mail.from_name  (AnvilNotify extension)
+#   connection_timeout_ms   → spring.mail.properties.mail.smtp.connectiontimeout
+#   read_timeout_ms         → spring.mail.properties.mail.smtp.timeout
+#   write_timeout_ms        → spring.mail.properties.mail.smtp.writetimeout
 
 # Option A: SMTP
 [mailer]
@@ -90,6 +103,13 @@ username   = "user@example.com"
 password   = "secret"
 from_email = "no-reply@example.com"
 from_name  = "Example App"
+
+# Optional SMTP tuning (all have sensible defaults):
+# tls_mode             = "starttls"   # "smtps" | "starttls" | "none" — overrides port inference
+# connection_timeout_ms = 5000        # spring.mail.properties.mail.smtp.connectiontimeout
+# read_timeout_ms       = 10000       # spring.mail.properties.mail.smtp.timeout
+# write_timeout_ms      = 10000       # spring.mail.properties.mail.smtp.writetimeout
+# pool_size             = 5           # max open SMTP connections (lettre connection pool)
 
 # Option B: Webhook
 # [mailer]
@@ -105,21 +125,27 @@ from_name  = "Example App"
 # an account. When the field is absent or the name is not found here, the
 # service falls back to the global [mailer] config above.
 #
+# All optional tuning fields (tls_mode, *_timeout_ms, pool_size) behave
+# identically to the global [mailer] block and have the same defaults.
+#
 # Example — two business systems sharing this notification service:
 #
 # [sender_accounts.system_a]
 # host       = "smtp.gmail.com"
 # port       = 587
 # username   = "A@example.com"
-# password   = "app-password-a"     # Gmail App Password (not login password)
+# password   = "app-password-a"          # Gmail App Password (not login password)
 # from_email = "A@example.com"
 # from_name  = "System A"
+# # tls_mode = "starttls"                # optional: inferred from port 587
+# # connection_timeout_ms = 5000
+# # pool_size = 5
 #
 # [sender_accounts.system_b]
 # host       = "smtp.sendgrid.net"
 # port       = 587
-# username   = "apikey"             # SendGrid: literal "apikey"
-# password   = "SG.xxxxxxxxxxxx"    # SendGrid API key with Mail Send scope
+# username   = "apikey"                  # SendGrid: literal "apikey"
+# password   = "SG.xxxxxxxxxxxx"         # SendGrid API key with Mail Send scope
 # from_email = "B@example.com"
 # from_name  = "System B"
 #

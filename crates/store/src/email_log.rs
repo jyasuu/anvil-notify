@@ -8,9 +8,9 @@ use uuid::Uuid;
 pub enum InsertResult {
     /// A new row was inserted (first attempt for this recipient).
     Inserted,
-    /// The row already existed; carries the current `retry_count` so the
-    /// caller can seed its in-memory attempt counter without an extra query.
-    Duplicate { retry_count: i32 },
+    /// The row already existed; carries the current `retry_count` and `status`
+    /// so the caller can make terminal-state decisions without a second query.
+    Duplicate { retry_count: i32, status: String },
 }
 
 /// All database operations for the `email_log` table.
@@ -59,10 +59,14 @@ impl EmailLogStore {
         attachments: Option<&serde_json::Value>,
         sender_account: Option<&str>,
     ) -> Result<InsertResult, AppError> {
-        // Use DO UPDATE to return the existing retry_count on conflict so the
-        // caller can seed its in-memory attempt counter without a second query.
-        // The UPDATE expression is a no-op (status stays unchanged); we only
-        // need the RETURNING clause to fire on conflict rows.
+        // Use DO UPDATE to return the existing retry_count and status on conflict
+        // so the caller can make terminal-state decisions (SENT/BLOCKED skip) in
+        // a single round-trip.  The UPDATE expression is a no-op (status stays
+        // unchanged); we only need the RETURNING clause to fire on conflict rows.
+        //
+        // Note: `xmax <> 0` is a PostgreSQL-specific trick — xmax holds the
+        // transaction ID of the last deleting or locking transaction; on a plain
+        // INSERT it is always 0, so a non-zero value reliably signals a conflict.
         let row = sqlx::query!(
             r#"
             INSERT INTO email_log
@@ -70,7 +74,7 @@ impl EmailLogStore {
             VALUES ($1, $2, $3, $4, 'PENDING', $5, $6, $7, $8)
             ON CONFLICT (event_id, recipient_email) DO UPDATE
                 SET updated_at = email_log.updated_at  -- no-op; fires RETURNING on conflict
-            RETURNING id, retry_count,
+            RETURNING id, retry_count, status,
                       (xmax <> 0) AS "was_conflict!: bool"
             "#,
             event_id,
@@ -88,6 +92,7 @@ impl EmailLogStore {
         if row.was_conflict {
             Ok(InsertResult::Duplicate {
                 retry_count: row.retry_count,
+                status: row.status,
             })
         } else {
             Ok(InsertResult::Inserted)
@@ -157,8 +162,7 @@ impl EmailLogStore {
             return Err(AppError::NotFound(event_id.to_string()));
         }
 
-        Ok(rows
-            .into_iter()
+        rows.into_iter()
             .map(|r| {
                 Ok(EmailLog {
                     id: r.id,
@@ -178,7 +182,7 @@ impl EmailLogStore {
                     updated_at: r.updated_at,
                 })
             })
-            .collect::<Result<Vec<_>, AppError>>()?)
+            .collect::<Result<Vec<_>, AppError>>()
     }
 
     /// Fetch the row for a single recipient within an event.

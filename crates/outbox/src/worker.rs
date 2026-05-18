@@ -60,7 +60,7 @@ pub async fn run_outbox_worker(
     // Requires migration 0016_outbox_locked_at.sql to have been applied to the
     // business DB. If the column is absent the first reaper query will fail;
     // the error is logged but does not abort the main poll loop.
-    let reaper_pool    = pool.clone();
+    let reaper_pool = pool.clone();
     let reaper_timeout = Duration::from_secs(cfg.stale_lock_timeout_secs);
     let reaper_shutdown = shutdown.clone();
     tokio::spawn(run_reaper(reaper_pool, reaper_timeout, reaper_shutdown));
