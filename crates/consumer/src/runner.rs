@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{AppError, NotificationEvent, Recipient, SendMode};
+use common::{AppError, NotificationEvent, Recipient, RetryPolicy, SendMode};
 use futures_lite::StreamExt;
 use lapin::{options::*, types::FieldTable, Channel, Connection, ConnectionProperties};
 use mailer::fetch_attachments_with_limit;
@@ -416,6 +416,26 @@ async fn process_one_recipient(
                 return;
             }
 
+            // NoRetry policy — any failure (including rate-limits) is
+            // treated as immediately exhausted.  Mark FAILED now rather than
+            // waiting for back-off cycles.  The row remains visible in status
+            // queries and can be replayed via the operator retry API.
+            RecipientOutcome::Failed(ref e)
+                if email_opts.retry_policy == RetryPolicy::NoRetry =>
+            {
+                error!(
+                    event_id = %event.event_id,
+                    email    = %recipient.email,
+                    error    = %e,
+                    "NoRetry policy — marking FAILED without automatic retry"
+                );
+                let _ = ctx
+                    .store
+                    .mark_failed(event.event_id, &recipient.email, &e.to_string(), true)
+                    .await;
+                return;
+            }
+
             // Rate-limited — back off without consuming a retry slot,
             // but cap consecutive rate-limit waits to prevent infinite loops.
             RecipientOutcome::Failed(AppError::RateLimited(ref msg)) => {
@@ -625,6 +645,24 @@ async fn process_one_group(
                 return;
             }
 
+            // NoRetry policy — fail immediately, same as the individual path.
+            RecipientOutcome::Failed(ref e)
+                if email_opts.retry_policy == RetryPolicy::NoRetry =>
+            {
+                error!(
+                    event_id = %event.event_id,
+                    error    = %e,
+                    "NoRetry policy — marking group send FAILED without automatic retry"
+                );
+                if let Some(primary) = email_opts.recipients.first() {
+                    let _ = ctx
+                        .store
+                        .mark_failed(event.event_id, &primary.email, &e.to_string(), true)
+                        .await;
+                }
+                return;
+            }
+
             RecipientOutcome::Failed(AppError::RateLimited(ref msg)) => {
                 rl_count += 1;
                 if rl_count > cfg.max_rl_waits {
@@ -668,6 +706,62 @@ async fn process_one_group(
                         return;
                     }
                 }
+            }
+
+            // ── Individual-row fallback ──────────────────────────────────────
+            // `process_group` already wrote an `email_log` row for *every*
+            // recipient (GroupRetryMode::Individual) before the send attempt
+            // failed.  Re-sending the whole group email would duplicate
+            // recipients who were already delivered to by the SMTP server
+            // before the connection dropped.
+            //
+            // Instead, fall back to `process_one_recipient` for each address.
+            // Recipients whose row is already SENT or BLOCKED will be skipped
+            // by the idempotency check inside `process_recipient`, so only
+            // genuinely unsent addresses receive a new (individual) email.
+            //
+            // Trade-off: retried recipients receive a separate email whose
+            // `To:` header shows only their own address; the shared-`To:`
+            // visibility of the original group email is not preserved on retry.
+            RecipientOutcome::GroupFailedWithIndividualRows(ref e) => {
+                warn!(
+                    event_id         = %event.event_id,
+                    error            = %e,
+                    recipient_count  = email_opts.recipients.len(),
+                    "Group send failed after per-recipient rows written \
+                     — falling back to individual retry path"
+                );
+                let mut join_set = tokio::task::JoinSet::new();
+                for recipient in email_opts.recipients.clone() {
+                    let ctx       = ctx.clone();
+                    let event     = event.clone();
+                    let opts      = email_opts.clone();
+                    let atts      = attachments.to_vec();
+                    let cfg       = cfg.clone();
+                    let shutdown  = shutdown.clone();
+                    join_set.spawn(async move {
+                        process_one_recipient(
+                            &ctx,
+                            &event,
+                            &opts,
+                            &recipient,
+                            &atts,
+                            &cfg,
+                            &shutdown,
+                        )
+                        .await;
+                    });
+                }
+                while let Some(result) = join_set.join_next().await {
+                    if let Err(e) = result {
+                        error!(
+                            event_id = %event.event_id,
+                            error    = %e,
+                            "Individual-retry task panicked during group-send fallback"
+                        );
+                    }
+                }
+                return;
             }
 
             RecipientOutcome::Failed(ref e) => {

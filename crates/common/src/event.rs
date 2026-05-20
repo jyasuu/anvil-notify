@@ -121,6 +121,39 @@ pub enum GroupRetryMode {
     Individual,
 }
 
+/// Controls whether a transient send failure is retried.
+///
+/// Applies to both `SendMode::Individual` and `SendMode::Group`.
+///
+/// `Retry` (default) — the runner retries up to the configured `max_retries`
+/// limit using exponential back-off, consistent with current behaviour.
+///
+/// `NoRetry` — any failure (transient or permanent) is immediately marked
+/// `FAILED` with `exhausted = true`.  The row is visible in status queries
+/// and remains eligible for manual operator retry via the retry API, but the
+/// consumer will not attempt another delivery on its own.
+///
+/// Use `NoRetry` when:
+/// - the event is time-sensitive and a delayed retry would be worse than a
+///   visible failure (e.g. one-time passcodes, time-locked invitations),
+/// - the publisher owns re-delivery and prefers to re-publish rather than
+///   rely on in-process retry,
+/// - you want deterministic failure visibility without waiting for
+///   `max_retries` attempts to exhaust.
+///
+/// Rate-limit failures are treated the same as transient failures under
+/// `NoRetry` — the send is abandoned immediately rather than waiting for a
+/// token.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryPolicy {
+    /// Retry on transient failures up to `max_retries` (default).
+    #[default]
+    Retry,
+    /// Fail immediately on any send error; do not retry automatically.
+    NoRetry,
+}
+
 impl SendMode {
     /// Returns the lowercase string representation used in the database
     /// `send_mode` column and in AMQP payloads.
@@ -156,6 +189,18 @@ pub struct EmailOptions {
     /// See [`GroupRetryMode`] for the full trade-off discussion.
     #[serde(default)]
     pub group_retry_mode: GroupRetryMode,
+
+    /// Controls whether the consumer retries automatically after a transient
+    /// send failure.
+    ///
+    /// `Retry` (default) — retry with exponential back-off up to
+    /// `max_retries`.  `NoRetry` — mark `FAILED` immediately without any
+    /// automatic retry attempt; the row remains eligible for manual operator
+    /// retry via the retry API.
+    ///
+    /// See [`RetryPolicy`] for the full trade-off discussion.
+    #[serde(default)]
+    pub retry_policy: RetryPolicy,
 
     /// One or more TO recipients. Each is processed independently:
     /// a blocked recipient does not prevent others from receiving the email.
