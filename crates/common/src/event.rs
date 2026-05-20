@@ -86,6 +86,41 @@ pub enum SendMode {
     Group,
 }
 
+/// Controls how a failed group send is retried.
+///
+/// `Whole` (default) — the entire group email is retried as a unit.  On
+/// re-delivery the service sends one email to all original recipients again.
+/// Simple, but carries a double-send risk: any recipient whose SMTP delivery
+/// succeeded in a prior partial attempt will receive the message twice.
+///
+/// `Individual` — on retry each recipient is re-processed independently,
+/// using the same individual-send path as `SendMode::Individual`.  The
+/// service inserts an `email_log` row per recipient at the time of the
+/// **first** group send attempt, so re-delivery can skip addresses that
+/// already have a `SENT` row and only re-send to those still `PENDING` or
+/// `FAILED`.
+///
+/// Use `Individual` when:
+/// - recipients partially overlap (some may already be on a suppression list),
+/// - SMTP is unreliable and partial deliveries are common,
+/// - auditing per-address success/failure matters more than the shared `To:`
+///   header semantics of the original group email.
+///
+/// Trade-off: recipients who are retried individually will receive a separate
+/// email — the `To:` header on retry shows only their own address.  If the
+/// shared-`To:` visibility is a product requirement for retries too, use
+/// `Whole` and accept the double-send risk instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupRetryMode {
+    /// Retry the whole group email as a single unit (default).
+    #[default]
+    Whole,
+    /// On retry, fall back to per-recipient individual sends, skipping
+    /// addresses that already have a `SENT` row.
+    Individual,
+}
+
 impl SendMode {
     /// Returns the lowercase string representation used in the database
     /// `send_mode` column and in AMQP payloads.
@@ -109,6 +144,18 @@ pub struct EmailOptions {
     /// visible in the `To:` header (`Group`).
     #[serde(default)]
     pub send_mode: SendMode,
+
+    /// Controls how a group send is retried after a transient failure.
+    ///
+    /// Only meaningful when `send_mode` is `Group`; ignored for `Individual`.
+    ///
+    /// `Whole` (default) — retry the whole group email as a unit.
+    /// `Individual` — fall back to per-recipient sends on retry, skipping
+    /// addresses that already have a `SENT` row in `email_log`.
+    ///
+    /// See [`GroupRetryMode`] for the full trade-off discussion.
+    #[serde(default)]
+    pub group_retry_mode: GroupRetryMode,
 
     /// One or more TO recipients. Each is processed independently:
     /// a blocked recipient does not prevent others from receiving the email.
@@ -226,6 +273,7 @@ impl EmailEvent {
                     attachments: self.attachments,
                     sender_account: self.sender_account,
                     send_mode: SendMode::Individual,
+                    group_retry_mode: GroupRetryMode::Whole,
                 }),
             },
         }
