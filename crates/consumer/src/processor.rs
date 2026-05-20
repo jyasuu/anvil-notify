@@ -361,32 +361,61 @@ pub async fn process_group(
         serde_json::to_value(&email_opts.bcc).ok()
     };
 
-    // Helper closure to build InsertPendingArgs for a given recipient.
-    let make_args = |r: &Recipient| InsertPendingArgs {
-        event_id: event.event_id,
-        event_type: &event.event_type,
-        recipient_email: &r.email,
-        recipient_name: r.name.as_deref(),
-        payload: &event.payload,
-        from_override: from_override_json.as_ref(),
-        attachments: attachments_json.as_ref(),
-        sender_account: email_opts.sender_account.as_deref(),
-        cc: cc_json.as_ref(),
-        bcc: bcc_json.as_ref(),
-        send_mode: email_opts.send_mode.as_str(),
-        event_timestamp: event.timestamp,
-    };
+    // Helper function to build InsertPendingArgs for a given recipient.
+    // A closure cannot express the required lifetime relationship
+    // (output borrows from `r` *and* from the other captured references),
+    // so we use an explicit `fn` with named lifetimes instead.
+    #[allow(clippy::too_many_arguments)]
+    fn make_args<'a>(
+        r: &'a Recipient,
+        event: &'a NotificationEvent,
+        email_opts: &'a common::EmailOptions,
+        from_override_json: Option<&'a serde_json::Value>,
+        attachments_json: Option<&'a serde_json::Value>,
+        cc_json: Option<&'a serde_json::Value>,
+        bcc_json: Option<&'a serde_json::Value>,
+    ) -> InsertPendingArgs<'a> {
+        InsertPendingArgs {
+            event_id: event.event_id,
+            event_type: &event.event_type,
+            recipient_email: &r.email,
+            recipient_name: r.name.as_deref(),
+            payload: &event.payload,
+            from_override: from_override_json,
+            attachments: attachments_json,
+            sender_account: email_opts.sender_account.as_deref(),
+            cc: cc_json,
+            bcc: bcc_json,
+            send_mode: email_opts.send_mode.as_str(),
+            event_timestamp: event.timestamp,
+        }
+    }
 
     // Always insert the primary row first.  On conflict the runner uses the
     // returned status to decide whether to skip (already SENT/BLOCKED) or
     // resume (PENDING/FAILED with seeded retry_count).
-    let primary_insert = match ctx.store.insert_pending(make_args(primary)).await {
+    let primary_insert = match ctx
+        .store
+        .insert_pending(make_args(
+            primary,
+            event,
+            email_opts,
+            from_override_json.as_ref(),
+            attachments_json.as_ref(),
+            cc_json.as_ref(),
+            bcc_json.as_ref(),
+        ))
+        .await
+    {
         Ok(r) => r,
         Err(e) => return RecipientOutcome::Failed(e),
     };
 
     match primary_insert {
-        InsertResult::Duplicate { retry_count, ref status } => match status.as_str() {
+        InsertResult::Duplicate {
+            retry_count,
+            ref status,
+        } => match status.as_str() {
             "SENT" | "BLOCKED" => {
                 info!("Group send: skipping already-terminal event");
                 return RecipientOutcome::Skipped;
@@ -406,7 +435,19 @@ pub async fn process_group(
     // them; we do not need their retry_count here.
     if email_opts.group_retry_mode == GroupRetryMode::Individual {
         for r in recipients.iter().skip(1) {
-            if let Err(e) = ctx.store.insert_pending(make_args(r)).await {
+            if let Err(e) = ctx
+                .store
+                .insert_pending(make_args(
+                    r,
+                    event,
+                    email_opts,
+                    from_override_json.as_ref(),
+                    attachments_json.as_ref(),
+                    cc_json.as_ref(),
+                    bcc_json.as_ref(),
+                ))
+                .await
+            {
                 // A DB error here should abort; we cannot guarantee idempotency
                 // without the rows being present.
                 return RecipientOutcome::Failed(e);

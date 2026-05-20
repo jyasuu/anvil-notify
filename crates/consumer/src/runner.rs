@@ -420,9 +420,7 @@ async fn process_one_recipient(
             // treated as immediately exhausted.  Mark FAILED now rather than
             // waiting for back-off cycles.  The row remains visible in status
             // queries and can be replayed via the operator retry API.
-            RecipientOutcome::Failed(ref e)
-                if email_opts.retry_policy == RetryPolicy::NoRetry =>
-            {
+            RecipientOutcome::Failed(ref e) if email_opts.retry_policy == RetryPolicy::NoRetry => {
                 error!(
                     event_id = %event.event_id,
                     email    = %recipient.email,
@@ -487,6 +485,23 @@ async fn process_one_recipient(
                         return;
                     }
                 }
+            }
+
+            // GroupFailedWithIndividualRows is only emitted by the group-send
+            // path in processor.  It should never appear here in the
+            // individual-send loop; treat it as an unexpected error and stop.
+            RecipientOutcome::GroupFailedWithIndividualRows(ref e) => {
+                error!(
+                    event_id = %event.event_id,
+                    email    = %recipient.email,
+                    error    = %e,
+                    "Unexpected GroupFailedWithIndividualRows in individual-send loop — marking FAILED"
+                );
+                let _ = ctx
+                    .store
+                    .mark_failed(event.event_id, &recipient.email, &e.to_string(), true)
+                    .await;
+                return;
             }
 
             // Transient failure — normal exponential backoff
@@ -646,9 +661,7 @@ async fn process_one_group(
             }
 
             // NoRetry policy — fail immediately, same as the individual path.
-            RecipientOutcome::Failed(ref e)
-                if email_opts.retry_policy == RetryPolicy::NoRetry =>
-            {
+            RecipientOutcome::Failed(ref e) if email_opts.retry_policy == RetryPolicy::NoRetry => {
                 error!(
                     event_id = %event.event_id,
                     error    = %e,
@@ -733,21 +746,15 @@ async fn process_one_group(
                 );
                 let mut join_set = tokio::task::JoinSet::new();
                 for recipient in email_opts.recipients.clone() {
-                    let ctx       = ctx.clone();
-                    let event     = event.clone();
-                    let opts      = email_opts.clone();
-                    let atts      = attachments.to_vec();
-                    let cfg       = cfg.clone();
-                    let shutdown  = shutdown.clone();
+                    let ctx = ctx.clone();
+                    let event = event.clone();
+                    let opts = email_opts.clone();
+                    let atts = attachments.to_vec();
+                    let cfg = cfg.clone();
+                    let shutdown = shutdown.clone();
                     join_set.spawn(async move {
                         process_one_recipient(
-                            &ctx,
-                            &event,
-                            &opts,
-                            &recipient,
-                            &atts,
-                            &cfg,
-                            &shutdown,
+                            &ctx, &event, &opts, &recipient, &atts, &cfg, &shutdown,
                         )
                         .await;
                     });

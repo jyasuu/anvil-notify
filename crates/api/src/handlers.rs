@@ -7,7 +7,7 @@ use axum::{
 use chrono::Utc;
 use common::{
     is_valid_email, AppError, AttachmentRef, ChannelOverrides, EmailOptions, EmailStatus,
-    FromOverride, Metadata, NotificationEvent, Recipient,
+    FromOverride, GroupRetryMode, Metadata, NotificationEvent, Recipient, RetryPolicy,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -244,6 +244,8 @@ async fn republish_event(
                 attachments,
                 sender_account,
                 send_mode,
+                group_retry_mode: GroupRetryMode::default(),
+                retry_policy: RetryPolicy::default(),
             }),
         },
     };

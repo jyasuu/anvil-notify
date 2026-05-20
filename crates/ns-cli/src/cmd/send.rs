@@ -1,8 +1,8 @@
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use common::{
-    AttachmentRef, ChannelOverrides, EmailOptions, FromOverride, Metadata, NotificationEvent,
-    Recipient,
+    AttachmentRef, ChannelOverrides, EmailOptions, FromOverride, GroupRetryMode, Metadata,
+    NotificationEvent, Recipient, RetryPolicy,
 };
 use dialoguer::Confirm;
 use lapin::{
@@ -141,6 +141,8 @@ pub async fn run(args: SendArgs, cfg: CliConfig) -> Result<()> {
                 attachments,
                 sender_account: None,
                 send_mode: common::SendMode::Individual,
+                group_retry_mode: GroupRetryMode::default(),
+                retry_policy: RetryPolicy::default(),
             }),
         },
     };

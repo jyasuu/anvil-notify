@@ -319,6 +319,7 @@ impl EmailEvent {
                     sender_account: self.sender_account,
                     send_mode: SendMode::Individual,
                     group_retry_mode: GroupRetryMode::Whole,
+                    retry_policy: RetryPolicy::default(),
                 }),
             },
         }
