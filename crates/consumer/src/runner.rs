@@ -14,6 +14,7 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+use store::NotificationStore;
 use crate::{
     config::ConsumerConfig,
     processor::{
@@ -43,9 +44,9 @@ fn scrub_amqp_url(url: &str) -> String {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-pub async fn run_consumer(
+pub async fn run_consumer<S: NotificationStore>(
     cfg: ConsumerConfig,
-    ctx: ProcessorContext,
+    ctx: ProcessorContext<S>,
     http: Arc<Client>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
@@ -99,9 +100,9 @@ pub async fn run_consumer(
 
 // ── One connection lifetime ───────────────────────────────────────────────────
 
-async fn connect_and_consume(
+async fn connect_and_consume<S: NotificationStore>(
     cfg: &ConsumerConfig,
-    ctx: ProcessorContext,
+    ctx: ProcessorContext<S>,
     semaphore: Arc<Semaphore>,
     http: Arc<Client>,
     shutdown: CancellationToken,
@@ -181,9 +182,9 @@ async fn connect_and_consume(
 /// The AMQP message is ACK'd once ALL recipient tasks have finished.
 /// It is NACK'd (→ DLQ) only if the message cannot be deserialized or if
 /// the event-level attachment fetch fails permanently.
-async fn handle_delivery(
+async fn handle_delivery<S: NotificationStore>(
     delivery: lapin::message::Delivery,
-    ctx: ProcessorContext,
+    ctx: ProcessorContext<S>,
     http: Arc<Client>,
     cfg: ConsumerConfig,
     shutdown: CancellationToken,
@@ -360,8 +361,8 @@ async fn handle_delivery(
 }
 
 /// Drive one recipient through the send loop with per-recipient retry.
-async fn process_one_recipient(
-    ctx: &ProcessorContext,
+async fn process_one_recipient<S: NotificationStore>(
+    ctx: &ProcessorContext<S>,
     event: &NotificationEvent,
     email_opts: &common::EmailOptions,
     recipient: &Recipient,
@@ -608,8 +609,8 @@ mod heartbeat_tests {
 ///
 /// Mirrors `process_one_recipient` but calls `process_group` instead, which
 /// builds one `EmailMessage` with all recipients sharing the `To:` header.
-async fn process_one_group(
-    ctx: &ProcessorContext,
+async fn process_one_group<S: NotificationStore>(
+    ctx: &ProcessorContext<S>,
     event: &NotificationEvent,
     email_opts: &common::EmailOptions,
     attachments: &[mailer::message::ResolvedAttachment],
@@ -722,7 +723,7 @@ async fn process_one_group(
             }
 
             // ── Individual-row fallback ──────────────────────────────────────
-            // `process_group` already wrote an `email_log` row for *every*
+            // `process_group` already wrote a `notification_log` row for *every*
             // recipient (GroupRetryMode::Individual) before the send attempt
             // failed.  Re-sending the whole group email would duplicate
             // recipients who were already delivered to by the SMTP server

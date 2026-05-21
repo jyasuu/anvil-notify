@@ -1,10 +1,10 @@
-use store::{EmailLogStore, TemplateStore};
+use store::{EmailNotificationStore, TemplateStore};
 
 use crate::publisher::Publisher;
 
 #[derive(Clone)]
 pub struct ApiState {
-    pub store: EmailLogStore,
+    pub store: EmailNotificationStore,
     pub template_store: TemplateStore,
     /// Used by retry endpoints to re-enqueue events after resetting DB rows.
     pub publisher: Publisher,

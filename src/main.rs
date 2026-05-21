@@ -15,7 +15,7 @@ use rate_limiter::MailRateLimiter;
 use recipient_filter::RecipientFilter;
 use reqwest::Client;
 use sqlx::postgres::PgPoolOptions;
-use store::{EmailLogStore, TemplateStore};
+use store::{EmailNotificationStore, TemplateStore};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -76,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("Failed to run migrations")?;
 
-    let store = EmailLogStore::new(pool.clone());
+    let store = EmailNotificationStore::new(pool.clone());
     let template_store = TemplateStore::new_with_ttl(
         pool,
         std::time::Duration::from_secs(cfg.template_cache_ttl_secs),

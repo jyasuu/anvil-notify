@@ -44,7 +44,7 @@ impl std::fmt::Display for EmailStatus {
     }
 }
 
-/// Maps 1-to-1 with the `email_log` PostgreSQL table.
+/// Maps 1-to-1 with the `notification_log` + `email_notification_log` PostgreSQL tables.
 ///
 /// Keyed by `(event_id, recipient_email)` — one row per recipient per event.
 #[derive(Debug, Clone, Serialize, Deserialize)]

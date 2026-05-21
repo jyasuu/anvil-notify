@@ -5,7 +5,45 @@ use tracing::instrument;
 use uuid::Uuid;
 
 // ── Re-export so callers don't need to import two modules ─────────────────────
-pub use crate::email_log::{InsertPendingArgs as EmailInsertPendingArgs, InsertResult};
+
+/// Result of an `insert_pending` call.
+#[derive(Debug)]
+pub enum InsertResult {
+    /// A new row was inserted (first attempt for this recipient).
+    Inserted,
+    /// The row already existed; carries the current `retry_count` and `status`
+    /// so the caller can make terminal-state decisions without a second query.
+    Duplicate { retry_count: i32, status: String },
+}
+
+/// Arguments for [`EmailNotificationStore::insert_pending`].
+///
+/// Using a named struct instead of many positional parameters makes call sites
+/// self-documenting and makes future field additions a one-line struct change
+/// rather than a signature change at every call site.
+pub struct InsertPendingArgs<'a> {
+    pub event_id: Uuid,
+    pub event_type: &'a str,
+    pub recipient_email: &'a str,
+    pub recipient_name: Option<&'a str>,
+    pub payload: &'a serde_json::Value,
+    pub from_override: Option<&'a serde_json::Value>,
+    pub attachments: Option<&'a serde_json::Value>,
+    pub sender_account: Option<&'a str>,
+    pub cc: Option<&'a serde_json::Value>,
+    pub bcc: Option<&'a serde_json::Value>,
+    /// Delivery mode of the original event (`"individual"` or `"group"`).
+    /// Stored so `republish_event()` can faithfully replay the original mode
+    /// rather than defaulting every retry to `Individual`.
+    pub send_mode: &'a str,
+    /// The original `NotificationEvent.timestamp` from the business service.
+    /// Stored separately from `created_at` so attachment expiry checks use
+    /// the publication time rather than the consumer processing time.
+    pub event_timestamp: DateTime<Utc>,
+}
+
+// Keep the EmailInsertPendingArgs alias so existing callers need no changes.
+pub use InsertPendingArgs as EmailInsertPendingArgs;
 
 // ── Channel constants ─────────────────────────────────────────────────────────
 
@@ -41,7 +79,7 @@ pub trait NotificationStore: Send + Sync + Clone + 'static {
     /// key `(event_id, channel, recipient_id)` already exists.
     async fn insert_pending(
         &self,
-        args: &EmailInsertPendingArgs<'_>,
+        args: &InsertPendingArgs<'_>,
     ) -> Result<InsertResult, AppError>;
 
     /// Mark a delivery as successfully sent.
@@ -70,6 +108,13 @@ pub trait NotificationStore: Send + Sync + Clone + 'static {
 
     /// Fetch all delivery rows for an event (one per recipient).
     async fn get_by_event_id(&self, event_id: Uuid) -> Result<Vec<EmailLog>, AppError>;
+
+    /// Fetch the row for a single recipient within an event.
+    async fn get_by_event_and_recipient(
+        &self,
+        event_id: Uuid,
+        recipient_id: &str,
+    ) -> Result<EmailLog, AppError>;
 
     /// Reset a single FAILED row to PENDING for manual replay.
     async fn reset_for_retry(
@@ -114,7 +159,7 @@ impl NotificationStore for EmailNotificationStore {
     #[instrument(skip(self, args))]
     async fn insert_pending(
         &self,
-        args: &EmailInsertPendingArgs<'_>,
+        args: &InsertPendingArgs<'_>,
     ) -> Result<InsertResult, AppError> {
         let mut tx = self.pool.begin().await?;
 
@@ -323,6 +368,71 @@ impl NotificationStore for EmailNotificationStore {
                 })
             })
             .collect()
+    }
+
+    #[instrument(skip(self))]
+    async fn get_by_event_and_recipient(
+        &self,
+        event_id: Uuid,
+        recipient_id: &str,
+    ) -> Result<EmailLog, AppError> {
+        let r = sqlx::query!(
+            r#"
+            SELECT
+                n.id,
+                n.event_id,
+                n.event_type,
+                n.status,
+                n.retry_count,
+                n.total_attempts,
+                n.last_error,
+                n.payload,
+                n.event_timestamp,
+                n.created_at,
+                n.updated_at,
+                e.recipient_email,
+                e.recipient_name,
+                e.from_override,
+                e.sender_account,
+                e.send_mode,
+                e.cc,
+                e.bcc,
+                e.attachments
+            FROM notification_log n
+            JOIN email_notification_log e ON e.notification_id = n.id
+            WHERE n.event_id    = $1
+              AND n.channel     = $2
+              AND n.recipient_id = $3
+            "#,
+            event_id,
+            CHANNEL_EMAIL,
+            recipient_id,
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("{event_id}/{recipient_id}")))?;
+
+        Ok(EmailLog {
+            id: r.id,
+            event_id: r.event_id,
+            event_type: r.event_type,
+            recipient_email: r.recipient_email,
+            recipient_name: r.recipient_name,
+            status: EmailStatus::try_from(r.status.as_str())?,
+            retry_count: r.retry_count,
+            total_attempts: r.total_attempts,
+            last_error: r.last_error,
+            payload: r.payload,
+            from_override: r.from_override,
+            attachments: r.attachments,
+            sender_account: r.sender_account,
+            cc: r.cc,
+            bcc: r.bcc,
+            send_mode: r.send_mode,
+            event_timestamp: r.event_timestamp,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        })
     }
 
     #[instrument(skip(self))]

@@ -7,7 +7,7 @@ use sqlx::PgPool;
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument};
 
-/// One template row from the `email_template` table.
+/// One template row from the `notification_template` table.
 #[derive(Debug, Clone)]
 pub struct EmailTemplate {
     pub subject: String,
@@ -32,7 +32,7 @@ struct CacheEntry {
 ///    and returned.
 /// 3. If no active row exists, `AppError::Template` is returned so the consumer
 ///    immediately marks the delivery FAILED (no retries, routes to DLQ).
-///    Add a row to `email_template` to register a new event type.
+///    Add a row to `notification_template` to register a new event type.
 ///
 /// # Cache invalidation
 ///
@@ -42,7 +42,7 @@ struct CacheEntry {
 /// `DELETE /templates/cache` or `DELETE /templates/:event_type/cache` endpoints.
 ///
 /// For most deployments the TTL is short enough that operator edits to the
-/// `email_template` table take effect within minutes automatically.
+/// `notification_template` table take effect within minutes automatically.
 #[derive(Clone)]
 pub struct TemplateStore {
     pool: PgPool,
