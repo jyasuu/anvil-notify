@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT subject, body_html, body_text\n            FROM   notification_template\n            WHERE  type = $1 AND channel = $2 AND active = TRUE\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "subject",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "body_html",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "body_text",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "e38c67b5709b2b39a3bfa8342459b42bc43ee46e158c1bd923cd236827ac9c4a"
+}
