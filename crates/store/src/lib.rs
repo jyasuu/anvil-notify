@@ -7,7 +7,6 @@ pub use notification_log::{
     EmailNotificationStore,
     InsertPendingArgs, // back-compat alias for EmailInsertPendingArgs
     InsertResult,
-    NotificationInsertArgs,
     NotificationStore,
     CHANNEL_EMAIL,
 };

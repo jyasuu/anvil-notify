@@ -11,7 +11,6 @@ use mailer::{
 use metrics::{counter, histogram};
 use rate_limiter::MailRateLimiter;
 use recipient_filter::RecipientFilter;
-use std::sync::Arc;
 use store::{InsertPendingArgs, InsertResult, NotificationStore, TemplateStore, CHANNEL_EMAIL};
 use tracing::{info, instrument, warn};
 

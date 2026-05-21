@@ -16,30 +16,12 @@ pub enum InsertResult {
     Duplicate { retry_count: i32, status: String },
 }
 
-/// Channel-agnostic arguments shared by every `insert_pending` implementation.
-///
-/// Channel-specific stores embed these and add their own fields on top.
-/// This separation means future channels (SMS, push) never need to touch
-/// this struct or the `NotificationStore` trait signature.
-pub struct NotificationInsertArgs<'a> {
-    pub event_id: Uuid,
-    pub event_type: &'a str,
-    /// Channel-native recipient identity (email address, E.164 phone, device token).
-    pub recipient_id: &'a str,
-    pub payload: &'a serde_json::Value,
-    /// The original `NotificationEvent.timestamp` from the business service.
-    /// Stored separately from `created_at` so attachment expiry checks use
-    /// the publication time rather than the consumer processing time.
-    pub event_timestamp: DateTime<Utc>,
-}
-
 /// Email-specific arguments for [`EmailNotificationStore::insert_pending`].
 ///
-/// Contains all the channel-agnostic fields duplicated for ergonomics, plus
-/// every field that is specific to email delivery.  Future channels define
-/// their own `SmsInsertArgs`, `PushInsertArgs`, etc. alongside this — the
-/// `NotificationStore` trait and `NotificationInsertArgs` never grow
-/// email-only fields.
+/// Contains all the channel-agnostic fields plus every field that is specific
+/// to email delivery. Future channels define their own `SmsInsertArgs`,
+/// `PushInsertArgs`, etc. alongside this — the `NotificationStore` trait never
+/// grows email-only fields.
 pub struct EmailInsertPendingArgs<'a> {
     // ── Channel-agnostic core ─────────────────────────────────────────────────
     pub event_id: Uuid,
@@ -75,20 +57,6 @@ pub use EmailInsertPendingArgs as InsertPendingArgs;
 
 pub const CHANNEL_EMAIL: &str = "email";
 
-// ── Channel-agnostic insert args ──────────────────────────────────────────────
-
-/// Arguments that are the same for every channel.
-/// Channel-specific stores embed these and add their own fields.
-pub struct NotificationInsertArgs<'a> {
-    pub event_id: Uuid,
-    pub event_type: &'a str,
-    pub channel: &'a str,
-    /// Channel-native recipient identity (email addr, phone, device token).
-    pub recipient_id: &'a str,
-    pub payload: &'a serde_json::Value,
-    pub event_timestamp: DateTime<Utc>,
-}
-
 // ── NotificationStore trait ───────────────────────────────────────────────────
 
 /// Channel-agnostic interface that every channel store must implement.
@@ -97,16 +65,13 @@ pub struct NotificationInsertArgs<'a> {
 /// touches the underlying tables directly.  This makes adding a new channel
 /// a matter of writing a new implementor — the processor is unchanged.
 #[async_trait::async_trait]
-pub trait NotificationStore: Send + Sync + Clone + 'static {
+pub trait NotificationStore: Send + Sync + 'static {
     /// Insert a PENDING delivery row.
     ///
     /// Returns `InsertResult::Inserted` for a new row, or
     /// `InsertResult::Duplicate { retry_count, status }` when the idempotency
     /// key `(event_id, channel, recipient_id)` already exists.
-    async fn insert_pending(
-        &self,
-        args: &InsertPendingArgs<'_>,
-    ) -> Result<InsertResult, AppError>;
+    async fn insert_pending(&self, args: &InsertPendingArgs<'_>) -> Result<InsertResult, AppError>;
 
     /// Mark a delivery as successfully sent.
     async fn mark_sent(&self, event_id: Uuid, recipient_id: &str) -> Result<(), AppError>;
@@ -143,18 +108,11 @@ pub trait NotificationStore: Send + Sync + Clone + 'static {
     ) -> Result<EmailLog, AppError>;
 
     /// Reset a single FAILED row to PENDING for manual replay.
-    async fn reset_for_retry(
-        &self,
-        event_id: Uuid,
-        recipient_id: &str,
-    ) -> Result<(), AppError>;
+    async fn reset_for_retry(&self, event_id: Uuid, recipient_id: &str) -> Result<(), AppError>;
 
     /// Reset ALL FAILED rows for an event to PENDING, returning the
     /// recipient IDs that were actually reset.
-    async fn reset_all_failed_for_event(
-        &self,
-        event_id: Uuid,
-    ) -> Result<Vec<String>, AppError>;
+    async fn reset_all_failed_for_event(&self, event_id: Uuid) -> Result<Vec<String>, AppError>;
 
     /// Expose the pool for health checks.
     fn pool(&self) -> &PgPool;
@@ -183,10 +141,7 @@ impl EmailNotificationStore {
 #[async_trait::async_trait]
 impl NotificationStore for EmailNotificationStore {
     #[instrument(skip(self, args))]
-    async fn insert_pending(
-        &self,
-        args: &InsertPendingArgs<'_>,
-    ) -> Result<InsertResult, AppError> {
+    async fn insert_pending(&self, args: &InsertPendingArgs<'_>) -> Result<InsertResult, AppError> {
         let mut tx = self.pool.begin().await?;
 
         // ── 1. Upsert into notification_log (channel-agnostic) ────────────────
@@ -381,14 +336,14 @@ impl NotificationStore for EmailNotificationStore {
                     retry_count: r.retry_count,
                     total_attempts: r.total_attempts,
                     last_error: r.last_error,
-                    payload: r.payload,
+                    payload: Some(r.payload),
                     from_override: r.from_override,
                     attachments: r.attachments,
                     sender_account: r.sender_account,
                     cc: r.cc,
                     bcc: r.bcc,
                     send_mode: r.send_mode,
-                    event_timestamp: r.event_timestamp,
+                    event_timestamp: Some(r.event_timestamp),
                     created_at: r.created_at,
                     updated_at: r.updated_at,
                 })
@@ -448,25 +403,21 @@ impl NotificationStore for EmailNotificationStore {
             retry_count: r.retry_count,
             total_attempts: r.total_attempts,
             last_error: r.last_error,
-            payload: r.payload,
+            payload: Some(r.payload),
             from_override: r.from_override,
             attachments: r.attachments,
             sender_account: r.sender_account,
             cc: r.cc,
             bcc: r.bcc,
             send_mode: r.send_mode,
-            event_timestamp: r.event_timestamp,
+            event_timestamp: Some(r.event_timestamp),
             created_at: r.created_at,
             updated_at: r.updated_at,
         })
     }
 
     #[instrument(skip(self))]
-    async fn reset_for_retry(
-        &self,
-        event_id: Uuid,
-        recipient_id: &str,
-    ) -> Result<(), AppError> {
+    async fn reset_for_retry(&self, event_id: Uuid, recipient_id: &str) -> Result<(), AppError> {
         let result = sqlx::query!(
             r#"
             UPDATE notification_log
@@ -495,10 +446,7 @@ impl NotificationStore for EmailNotificationStore {
     }
 
     #[instrument(skip(self))]
-    async fn reset_all_failed_for_event(
-        &self,
-        event_id: Uuid,
-    ) -> Result<Vec<String>, AppError> {
+    async fn reset_all_failed_for_event(&self, event_id: Uuid) -> Result<Vec<String>, AppError> {
         let rows = sqlx::query!(
             r#"
             UPDATE notification_log
