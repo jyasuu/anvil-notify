@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use common::{
     is_valid_email, AppError, FromOverride, GroupRetryMode, MailerKind, NotificationEvent,
-    Recipient,
+    NotificationStatus, Recipient,
 };
 use mailer::message::ResolvedAttachment;
 use mailer::{
@@ -153,12 +153,13 @@ pub async fn process_recipient(
         Ok(InsertResult::Duplicate {
             retry_count,
             status,
-        }) => match status.as_str() {
-            "SENT" | "BLOCKED" => {
+        }) => match NotificationStatus::try_from(status.as_str()) {
+            Ok(NotificationStatus::Sent) | Ok(NotificationStatus::Blocked) => {
                 info!("Skipping already-terminal recipient");
                 return RecipientOutcome::Skipped;
             }
-            _ => return RecipientOutcome::Duplicate { retry_count },
+            Ok(_) => return RecipientOutcome::Duplicate { retry_count },
+            Err(e) => return RecipientOutcome::Failed(e),
         },
         Err(e) => return RecipientOutcome::Failed(e),
     }
@@ -406,14 +407,15 @@ pub async fn process_group(
         InsertResult::Duplicate {
             retry_count,
             ref status,
-        } => match status.as_str() {
-            "SENT" | "BLOCKED" => {
+        } => match NotificationStatus::try_from(status.as_str()) {
+            Ok(NotificationStatus::Sent) | Ok(NotificationStatus::Blocked) => {
                 info!("Group send: skipping already-terminal event");
                 return RecipientOutcome::Skipped;
             }
-            _ => {
+            Ok(_) => {
                 return RecipientOutcome::Duplicate { retry_count };
             }
+            Err(e) => return RecipientOutcome::Failed(e),
         },
         InsertResult::Inserted => {}
     }
