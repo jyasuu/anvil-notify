@@ -180,6 +180,18 @@ async fn main() -> anyhow::Result<()> {
             burst_size = cfg.rate_limit.burst_size,
             "Mail rate limiter active"
         );
+        // Warn operators about a misconfiguration that would silently cap
+        // throughput below the intended steady-state rate.  When burst_size <
+        // emails_per_second the token bucket can never hold enough tokens to
+        // sustain the configured rate; sends will be throttled lower than
+        // expected without any other error signal.
+        if cfg.rate_limit.burst_size < cfg.rate_limit.emails_per_second {
+            tracing::warn!(
+                emails_per_second = cfg.rate_limit.emails_per_second,
+                burst_size = cfg.rate_limit.burst_size,
+                "burst_size is less than emails_per_second; steady-state                  throughput will be capped at burst_size, not emails_per_second.                  Consider setting burst_size >= emails_per_second."
+            );
+        }
     }
 
     // ── Recipient filter ──────────────────────────────────────────────────────

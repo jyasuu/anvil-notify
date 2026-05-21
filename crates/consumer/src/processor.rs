@@ -450,10 +450,21 @@ pub async fn process_group(
                 recipient_count = recipients.len(),
                 "Group send: recipient blocked — dropping entire group delivery"
             );
+            // Always mark the primary row blocked.
             let _ = ctx
                 .store
                 .mark_blocked(event.event_id, &primary.email, &reason)
                 .await;
+            // For Individual mode, rows were inserted for every recipient — mark
+            // them all blocked so no row is left stranded in PENDING forever.
+            if email_opts.group_retry_mode == GroupRetryMode::Individual {
+                for other in recipients.iter().filter(|rec| rec.email != primary.email) {
+                    let _ = ctx
+                        .store
+                        .mark_blocked(event.event_id, &other.email, &reason)
+                        .await;
+                }
+            }
             counter!("emails_blocked_total", "event_type" => event.event_type.clone()).increment(1);
             return RecipientOutcome::Blocked(reason);
         }

@@ -513,7 +513,16 @@ async fn process_one_recipient(
                 // the maximum single delay is ~17 min.  `attempt` may legitimately
                 // exceed 10 when seeded from a high DB retry_count after a restart,
                 // but the delay stays capped at this ceiling regardless.
-                let delay = Duration::from_millis(cfg.retry_base_ms * (1 << attempt.min(10)));
+                //
+                // We additionally clamp the computed delay to 30 minutes so that
+                // a large retry_base_ms (e.g. 5 000 ms × 2^10 ≈ 85 min) does not
+                // strand the un-ACK'd AMQP message beyond any reasonable consumer
+                // timeout.  Operators who need longer hold times should instead
+                // increase max_retries and keep retry_base_ms ≤ 2 000.
+                const MAX_RETRY_DELAY_MS: u64 = 30 * 60 * 1000; // 30 minutes
+                let delay = Duration::from_millis(
+                    (cfg.retry_base_ms * (1 << attempt.min(10))).min(MAX_RETRY_DELAY_MS)
+                );
                 warn!(
                     event_id = %event.event_id,
                     email    = %recipient.email,
@@ -774,7 +783,11 @@ async fn process_one_group(
             RecipientOutcome::Failed(ref e) => {
                 attempt += 1;
                 rl_count = 0;
-                let delay = Duration::from_millis(cfg.retry_base_ms * (1 << attempt.min(10)));
+                // Same cap as process_one_recipient — see comment there.
+                const MAX_RETRY_DELAY_MS: u64 = 30 * 60 * 1000; // 30 minutes
+                let delay = Duration::from_millis(
+                    (cfg.retry_base_ms * (1 << attempt.min(10))).min(MAX_RETRY_DELAY_MS)
+                );
                 warn!(
                     event_id = %event.event_id,
                     attempt,
