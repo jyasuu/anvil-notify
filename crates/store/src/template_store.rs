@@ -65,19 +65,21 @@ impl TemplateStore {
         Self::new_with_ttl(pool, Duration::from_secs(300))
     }
 
-    /// Resolve the template for `event_type`.
+    /// Resolve the template for `event_type` and `channel`.
     ///
-    /// This is the **sole runtime path** for template resolution.  All email
-    /// deliveries go through this method; there is no in-process fallback.
+    /// The cache key is `"{channel}:{event_type}"` so templates for the same
+    /// event type on different channels are cached independently.
     ///
-    /// Returns `AppError::Template` for unknown event types so the message is
-    /// immediately routed to DLQ without wasting retry slots.
-    #[instrument(skip(self), fields(event_type))]
-    pub async fn resolve(&self, event_type: &str) -> Result<EmailTemplate, AppError> {
+    /// Returns `AppError::Template` for unknown (event_type, channel) pairs so
+    /// the message is immediately routed to DLQ without wasting retry slots.
+    #[instrument(skip(self), fields(event_type, channel))]
+    pub async fn resolve(&self, event_type: &str, channel: &str) -> Result<EmailTemplate, AppError> {
+        let cache_key = format!("{channel}:{event_type}");
+
         // ── 1. Cache hit (only when TTL is non-zero and entry is fresh) ───────
         if !self.cache_ttl.is_zero() {
             let cache = self.cache.read().await;
-            if let Some(entry) = cache.get(event_type) {
+            if let Some(entry) = cache.get(&cache_key) {
                 if entry.inserted_at.elapsed() < self.cache_ttl {
                     debug!("Template cache hit");
                     return Ok(entry.template.clone());
@@ -90,10 +92,11 @@ impl TemplateStore {
         let row = sqlx::query!(
             r#"
             SELECT subject, body_html, body_text
-            FROM   email_template
-            WHERE  type = $1 AND active = TRUE
+            FROM   notification_template
+            WHERE  type = $1 AND channel = $2 AND active = TRUE
             "#,
             event_type,
+            channel,
         )
         .fetch_optional(&self.pool)
         .await
@@ -106,7 +109,7 @@ impl TemplateStore {
                 body_text: r.body_text,
             };
             self.cache.write().await.insert(
-                event_type.to_owned(),
+                cache_key.clone(),
                 CacheEntry {
                     template: tpl.clone(),
                     inserted_at: Instant::now(),
@@ -116,33 +119,24 @@ impl TemplateStore {
             return Ok(tpl);
         }
 
-        // No active DB row found.  Check whether a stale cache entry is still
-        // present (i.e. the template was deleted or deactivated while it was
-        // cached).  Warn loudly so operators know the cache is masking the
-        // deletion; the stale entry will expire naturally after `cache_ttl`.
-        // Use DELETE /templates/<event_type>/cache to evict it immediately.
+        // No active DB row found — check for a stale cache entry.
         {
             let cache = self.cache.read().await;
-            if cache.contains_key(event_type) {
+            if cache.contains_key(&cache_key) {
                 tracing::warn!(
                     event_type,
+                    channel,
                     cache_ttl_secs = self.cache_ttl.as_secs(),
-                    "Template '{event_type}' not found in DB but a stale cache entry \
-                     is still active — it will continue to be served until the TTL \
-                     expires or DELETE /templates/{event_type}/cache is called"
+                    "Template '{event_type}' (channel '{channel}') not found in DB but a stale \
+                     cache entry is still active — expires after TTL or call \
+                     DELETE /templates/{event_type}/cache"
                 );
             }
         }
 
-        // No DB row and no fallback — the event type is unknown.
-        // This is a permanent error: the consumer will mark the delivery FAILED
-        // immediately (no retries) so the message does not burn retry slots
-        // or block other recipients.
-        //
-        // To add a new template, INSERT a row into email_template and call
-        // DELETE /templates/<event_type>/cache (or wait for the TTL to expire).
         Err(AppError::Template(format!(
-            "Unknown event type '{event_type}' — add a row to email_template"
+            "Unknown event type '{event_type}' for channel '{channel}' \
+             — add a row to notification_template"
         )))
     }
 
