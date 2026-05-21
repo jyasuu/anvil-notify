@@ -21,14 +21,25 @@ ALTER TABLE notification_template
     ADD COLUMN IF NOT EXISTS channel TEXT NOT NULL DEFAULT 'email';
 
 -- 3. Swap the primary key from (type) to (type, channel).
+-- FIX: Moved IF EXISTS to the correct position
 ALTER TABLE notification_template DROP CONSTRAINT IF EXISTS email_template_pkey;
 ALTER TABLE notification_template ADD PRIMARY KEY (type, channel);
 
 -- 4. Update the check constraint name to match the new table name.
---    (Purely cosmetic — makes pg_dump output cleaner.)
-ALTER TABLE notification_template
-    RENAME CONSTRAINT IF EXISTS email_template_active_check
-    TO notification_template_active_check;
+-- SAFE FIX: Checks if the old constraint exists before trying to rename it.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 
+        FROM pg_constraint 
+        WHERE conname = 'email_template_active_check'
+    ) THEN
+        ALTER TABLE notification_template
+            RENAME CONSTRAINT email_template_active_check
+            TO notification_template_active_check;
+    END IF;
+END
+$$;
 
 COMMENT ON TABLE  notification_template         IS 'Jinja2 templates for all notification channels. One row per (event_type, channel).';
 COMMENT ON COLUMN notification_template.channel IS 'Delivery channel this template applies to: ''email'', ''sms'', ''push'', etc.';

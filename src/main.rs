@@ -15,7 +15,7 @@ use rate_limiter::MailRateLimiter;
 use recipient_filter::RecipientFilter;
 use reqwest::Client;
 use sqlx::postgres::PgPoolOptions;
-use store::{EmailNotificationStore, TemplateStore};
+use store::{EmailNotificationStore, NotificationStore, TemplateStore};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -209,7 +209,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let api_state = ApiState {
-        store: store.clone(),
+        store: Arc::new(store.clone()) as Arc<dyn NotificationStore>,
         template_store: template_store.clone(),
         publisher,
         api_key: cfg.http.api_key.clone(),
@@ -253,7 +253,7 @@ async fn main() -> anyhow::Result<()> {
     let consumer_http = Arc::clone(&http);
     let consumer_task = tokio::spawn(async move {
         let ctx = ProcessorContext {
-            store,
+            store: Arc::new(store),
             template_store,
             sender,
             sender_registry,

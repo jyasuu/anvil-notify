@@ -16,34 +16,60 @@ pub enum InsertResult {
     Duplicate { retry_count: i32, status: String },
 }
 
-/// Arguments for [`EmailNotificationStore::insert_pending`].
+/// Channel-agnostic arguments shared by every `insert_pending` implementation.
 ///
-/// Using a named struct instead of many positional parameters makes call sites
-/// self-documenting and makes future field additions a one-line struct change
-/// rather than a signature change at every call site.
-pub struct InsertPendingArgs<'a> {
+/// Channel-specific stores embed these and add their own fields on top.
+/// This separation means future channels (SMS, push) never need to touch
+/// this struct or the `NotificationStore` trait signature.
+pub struct NotificationInsertArgs<'a> {
     pub event_id: Uuid,
     pub event_type: &'a str,
-    pub recipient_email: &'a str,
-    pub recipient_name: Option<&'a str>,
+    /// Channel-native recipient identity (email address, E.164 phone, device token).
+    pub recipient_id: &'a str,
     pub payload: &'a serde_json::Value,
-    pub from_override: Option<&'a serde_json::Value>,
-    pub attachments: Option<&'a serde_json::Value>,
-    pub sender_account: Option<&'a str>,
-    pub cc: Option<&'a serde_json::Value>,
-    pub bcc: Option<&'a serde_json::Value>,
-    /// Delivery mode of the original event (`"individual"` or `"group"`).
-    /// Stored so `republish_event()` can faithfully replay the original mode
-    /// rather than defaulting every retry to `Individual`.
-    pub send_mode: &'a str,
     /// The original `NotificationEvent.timestamp` from the business service.
     /// Stored separately from `created_at` so attachment expiry checks use
     /// the publication time rather than the consumer processing time.
     pub event_timestamp: DateTime<Utc>,
 }
 
-// Keep the EmailInsertPendingArgs alias so existing callers need no changes.
-pub use InsertPendingArgs as EmailInsertPendingArgs;
+/// Email-specific arguments for [`EmailNotificationStore::insert_pending`].
+///
+/// Contains all the channel-agnostic fields duplicated for ergonomics, plus
+/// every field that is specific to email delivery.  Future channels define
+/// their own `SmsInsertArgs`, `PushInsertArgs`, etc. alongside this — the
+/// `NotificationStore` trait and `NotificationInsertArgs` never grow
+/// email-only fields.
+pub struct EmailInsertPendingArgs<'a> {
+    // ── Channel-agnostic core ─────────────────────────────────────────────────
+    pub event_id: Uuid,
+    pub event_type: &'a str,
+    pub recipient_email: &'a str,
+    pub payload: &'a serde_json::Value,
+    pub event_timestamp: DateTime<Utc>,
+
+    // ── Email-specific ────────────────────────────────────────────────────────
+    /// Optional display name for the recipient (e.g. "Alice Smith").
+    /// Stored so templates using `{{ name }}` render correctly on retry.
+    pub recipient_name: Option<&'a str>,
+    /// Per-event From address override as JSONB: `{"email": "...", "name": "..."}`.
+    pub from_override: Option<&'a serde_json::Value>,
+    /// Attachment URL references as JSONB array.
+    pub attachments: Option<&'a serde_json::Value>,
+    /// Named SMTP sender account key. `None` → use global [mailer] defaults.
+    pub sender_account: Option<&'a str>,
+    /// CC recipients as JSONB array of `{"email": "...", "name": "..."}`.
+    pub cc: Option<&'a serde_json::Value>,
+    /// BCC recipients as JSONB array of `{"email": "...", "name": "..."}`.
+    pub bcc: Option<&'a serde_json::Value>,
+    /// Delivery mode: `"individual"` or `"group"`.
+    /// Stored so `republish_event()` faithfully replays the original mode.
+    pub send_mode: &'a str,
+}
+
+/// Back-compat alias — callers that already use `InsertPendingArgs` by name
+/// continue to compile without changes.
+pub use EmailInsertPendingArgs as InsertPendingArgs;
 
 // ── Channel constants ─────────────────────────────────────────────────────────
 

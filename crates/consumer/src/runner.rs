@@ -14,7 +14,6 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use store::NotificationStore;
 use crate::{
     config::ConsumerConfig,
     processor::{
@@ -44,9 +43,9 @@ fn scrub_amqp_url(url: &str) -> String {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-pub async fn run_consumer<S: NotificationStore>(
+pub async fn run_consumer(
     cfg: ConsumerConfig,
-    ctx: ProcessorContext<S>,
+    ctx: ProcessorContext,
     http: Arc<Client>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
@@ -100,9 +99,9 @@ pub async fn run_consumer<S: NotificationStore>(
 
 // ── One connection lifetime ───────────────────────────────────────────────────
 
-async fn connect_and_consume<S: NotificationStore>(
+async fn connect_and_consume(
     cfg: &ConsumerConfig,
-    ctx: ProcessorContext<S>,
+    ctx: ProcessorContext,
     semaphore: Arc<Semaphore>,
     http: Arc<Client>,
     shutdown: CancellationToken,
@@ -182,9 +181,9 @@ async fn connect_and_consume<S: NotificationStore>(
 /// The AMQP message is ACK'd once ALL recipient tasks have finished.
 /// It is NACK'd (→ DLQ) only if the message cannot be deserialized or if
 /// the event-level attachment fetch fails permanently.
-async fn handle_delivery<S: NotificationStore>(
+async fn handle_delivery(
     delivery: lapin::message::Delivery,
-    ctx: ProcessorContext<S>,
+    ctx: ProcessorContext,
     http: Arc<Client>,
     cfg: ConsumerConfig,
     shutdown: CancellationToken,
@@ -361,8 +360,8 @@ async fn handle_delivery<S: NotificationStore>(
 }
 
 /// Drive one recipient through the send loop with per-recipient retry.
-async fn process_one_recipient<S: NotificationStore>(
-    ctx: &ProcessorContext<S>,
+async fn process_one_recipient(
+    ctx: &ProcessorContext,
     event: &NotificationEvent,
     email_opts: &common::EmailOptions,
     recipient: &Recipient,
@@ -609,8 +608,8 @@ mod heartbeat_tests {
 ///
 /// Mirrors `process_one_recipient` but calls `process_group` instead, which
 /// builds one `EmailMessage` with all recipients sharing the `To:` header.
-async fn process_one_group<S: NotificationStore>(
-    ctx: &ProcessorContext<S>,
+async fn process_one_group(
+    ctx: &ProcessorContext,
     event: &NotificationEvent,
     email_opts: &common::EmailOptions,
     attachments: &[mailer::message::ResolvedAttachment],

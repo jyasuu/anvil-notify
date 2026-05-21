@@ -50,7 +50,8 @@ Email rows store `{"recipient_email":"...", "cc":[...], "sender_account":"..."}`
 
 For your current scale and team size, **Option A is probably the right call for now** — it has zero risk and real new channels are almost always far enough away that you'd rather not pay the migration cost today. The design is already channel-aware at the event level (`NotificationEvent` → `ChannelOverrides`), so the consumer is structurally ready to fan out to new channels; the log table doesn't have to be.
 
-If you do want to invest in Option B, the right time is *before* the second channel ships, not after. The migration would need to:
+If you do want to invest in Option B, the right time is _before_ the second channel ships, not after. The migration would need to:
+
 1. Create `notification_log` and backfill from `email_log`
 2. Create `email_notification_log` with the email-specific columns
 3. Update the store layer to write both tables transactionally
@@ -58,10 +59,7 @@ If you do want to invest in Option B, the right time is *before* the second chan
 
 Would it help to sketch out the Option B schema and migration in more detail, or think through what the store layer API would look like under that design?
 
-
 <img width="1440" height="1160" alt="image" src="https://github.com/user-attachments/assets/4898a7c1-a3c2-4f47-8a21-fb898f250e40" />
-
-
 
 Good call. Let me look at the full schema and store layer before proposing anything concrete.Now I have everything I need. Let me design this properly.Here's the full plan, broken into schema, Rust layer, and migration strategy.
 
@@ -238,12 +236,14 @@ ORDER BY n.created_at
 The tricky part is getting existing `email_log` data into the new tables without downtime. A safe path:
 
 **Migration 0024** — create new tables alongside `email_log` (additive, no risk):
+
 ```sql
 CREATE TABLE notification_log (...);
 CREATE TABLE email_notification_log (...);
 ```
 
 **Migration 0025** — backfill from `email_log` in one statement:
+
 ```sql
 WITH inserted AS (
     INSERT INTO notification_log
@@ -281,16 +281,14 @@ The biggest change is in `api/src/handlers.rs` where `republish_event` reconstru
 
 ## Summary of what you gain
 
-| | Now | After |
-|---|---|---|
-| Add SMS channel | New columns on `email_log` or parallel table, no unified query | New `sms_notification_log` table, all status queries hit `notification_log` |
-| "What happened for event X across all channels?" | Impossible in one query | `SELECT * FROM notification_log WHERE event_id = $1` |
-| Template per channel | `email_template.type` only | `notification_template (type, channel)` PK |
-| Store layer API | `EmailLogStore` (concrete struct) | `NotificationStore` trait, channel-specific impls |
+|                                                  | Now                                                            | After                                                                       |
+| ------------------------------------------------ | -------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| Add SMS channel                                  | New columns on `email_log` or parallel table, no unified query | New `sms_notification_log` table, all status queries hit `notification_log` |
+| "What happened for event X across all channels?" | Impossible in one query                                        | `SELECT * FROM notification_log WHERE event_id = $1`                        |
+| Template per channel                             | `email_template.type` only                                     | `notification_template (type, channel)` PK                                  |
+| Store layer API                                  | `EmailLogStore` (concrete struct)                              | `NotificationStore` trait, channel-specific impls                           |
 
 Want me to write out the full migration SQL and the complete Rust store trait + email implementation?
-
-
 
 ## Refactor plan: `email_log` → multi-channel notification log
 
@@ -312,7 +310,7 @@ Want me to write out the full migration SQL and the complete Rust store trait + 
 - [ ] Implement `EmailNotificationStore` writing both tables in a single transaction
 - [ ] Update `TemplateStore::resolve()` to accept a `channel: &str` parameter
 - [ ] Rename `crates/store/src/email_log.rs` → `notification_log.rs`, expose new types from `lib.rs`
-- [ ] Write unit tests for `EmailNotificationStore` (insert, conflict, mark_* transitions)
+- [ ] Write unit tests for `EmailNotificationStore` (insert, conflict, mark\_\* transitions)
 
 ---
 
@@ -351,3 +349,92 @@ Want me to write out the full migration SQL and the complete Rust store trait + 
 - [ ] Manually retry a FAILED notification through the API end-to-end
 - [ ] Verify Prometheus metrics still emit correctly after cutover
 - [ ] Check `ns-cli` commands (`status`, `retry`, `logs`) still work against new tables
+
+### current compile
+
+```sh
+
+   Compiling common v0.1.0 (/project/workspace/crates/common)
+   Compiling store v0.1.0 (/project/workspace/crates/store)
+   Compiling mailer v0.1.0 (/project/workspace/crates/mailer)
+   Compiling recipient_filter v0.1.0 (/project/workspace/crates/recipient_filter)
+error[E0428]: the name `NotificationInsertArgs` is defined multiple times
+  --> crates/store/src/notification_log.rs:82:1
+   |
+24 | pub struct NotificationInsertArgs<'a> {
+   | ------------------------------------- previous definition of the type `NotificationInsertArgs` here
+...
+82 | pub struct NotificationInsertArgs<'a> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `NotificationInsertArgs` redefined here
+   |
+   = note: `NotificationInsertArgs` must be defined only once in the type namespace of this module
+
+error[E0433]: cannot find module or crate `async_trait` in this scope
+  --> crates/store/src/notification_log.rs:99:3
+   |
+99 | #[async_trait::async_trait]
+   |   ^^^^^^^^^^^ use of unresolved module or unlinked crate `async_trait`
+
+error[E0433]: cannot find module or crate `async_trait` in this scope
+   --> crates/store/src/notification_log.rs:183:3
+    |
+183 | #[async_trait::async_trait]
+    |   ^^^^^^^^^^^ use of unresolved module or unlinked crate `async_trait`
+
+error[E0308]: mismatched types
+   --> crates/store/src/notification_log.rs:384:30
+    |
+384 |                     payload: r.payload,
+    |                              ^^^^^^^^^ expected `Option<Value>`, found `Value`
+    |
+    = note: expected enum `Option<JsonValue>`
+               found enum `JsonValue`
+help: try wrapping the expression in `Some`
+    |
+384 |                     payload: Some(r.payload),
+    |                              +++++         +
+
+error[E0308]: mismatched types
+   --> crates/store/src/notification_log.rs:391:38
+    |
+391 |                     event_timestamp: r.event_timestamp,
+    |                                      ^^^^^^^^^^^^^^^^^ expected `Option<DateTime<Utc>>`, found `DateTime<Utc>`
+    |
+    = note: expected enum `Option<DateTime<_>>`
+             found struct `DateTime<_>`
+help: try wrapping the expression in `Some`
+    |
+391 |                     event_timestamp: Some(r.event_timestamp),
+    |                                      +++++                 +
+
+error[E0308]: mismatched types
+   --> crates/store/src/notification_log.rs:451:22
+    |
+451 |             payload: r.payload,
+    |                      ^^^^^^^^^ expected `Option<Value>`, found `Value`
+    |
+    = note: expected enum `Option<JsonValue>`
+               found enum `JsonValue`
+help: try wrapping the expression in `Some`
+    |
+451 |             payload: Some(r.payload),
+    |                      +++++         +
+
+error[E0308]: mismatched types
+   --> crates/store/src/notification_log.rs:458:30
+    |
+458 |             event_timestamp: r.event_timestamp,
+    |                              ^^^^^^^^^^^^^^^^^ expected `Option<DateTime<Utc>>`, found `DateTime<Utc>`
+    |
+    = note: expected enum `Option<DateTime<_>>`
+             found struct `DateTime<_>`
+help: try wrapping the expression in `Some`
+    |
+458 |             event_timestamp: Some(r.event_timestamp),
+    |                              +++++                 +
+
+Some errors have detailed explanations: E0308, E0428, E0433.
+For more information about an error, try `rustc --explain E0308`.
+error: could not compile `store` (lib) due to 7 previous errors
+warning: build failed, waiting for other jobs to finish...
+```

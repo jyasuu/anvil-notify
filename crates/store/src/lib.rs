@@ -3,7 +3,12 @@ pub mod template_store;
 
 // Core multi-channel store — primary public API.
 pub use notification_log::{
-    EmailInsertPendingArgs, EmailNotificationStore, InsertPendingArgs, InsertResult,
-    NotificationStore, CHANNEL_EMAIL,
+    EmailInsertPendingArgs,
+    EmailNotificationStore,
+    InsertPendingArgs, // back-compat alias for EmailInsertPendingArgs
+    InsertResult,
+    NotificationInsertArgs,
+    NotificationStore,
+    CHANNEL_EMAIL,
 };
 pub use template_store::{EmailTemplate, TemplateStore};

@@ -11,13 +11,14 @@ use mailer::{
 use metrics::{counter, histogram};
 use rate_limiter::MailRateLimiter;
 use recipient_filter::RecipientFilter;
+use std::sync::Arc;
 use store::{InsertPendingArgs, InsertResult, NotificationStore, TemplateStore, CHANNEL_EMAIL};
 use tracing::{info, instrument, warn};
 
 /// Shared, cheaply-cloneable context passed to every per-recipient processor call.
 #[derive(Clone)]
-pub struct ProcessorContext<S: NotificationStore> {
-    pub store: S,
+pub struct ProcessorContext {
+    pub store: Arc<dyn NotificationStore>,
     pub template_store: TemplateStore,
     /// Global default sender (SMTP or webhook) used when no named account matches.
     pub sender: Arc<dyn EmailSender>,
@@ -63,8 +64,8 @@ pub enum RecipientOutcome {
 /// later recipients in the list.
 #[instrument(skip(ctx, event, email_opts, recipient, attachments, shutdown),
              fields(event_id = %event.event_id, email = %recipient.email))]
-pub async fn process_recipient<S: NotificationStore>(
-    ctx: &ProcessorContext<S>,
+pub async fn process_recipient(
+    ctx: &ProcessorContext,
     event: &NotificationEvent,
     email_opts: &common::EmailOptions,
     recipient: &Recipient,
@@ -277,8 +278,8 @@ pub async fn process_recipient<S: NotificationStore>(
 /// visibility of the original group email is not preserved on retry.
 #[instrument(skip(ctx, event, email_opts, attachments, shutdown),
              fields(event_id = %event.event_id, recipient_count = email_opts.recipients.len()))]
-pub async fn process_group<S: NotificationStore>(
-    ctx: &ProcessorContext<S>,
+pub async fn process_group(
+    ctx: &ProcessorContext,
     event: &NotificationEvent,
     email_opts: &common::EmailOptions,
     attachments: &[ResolvedAttachment],

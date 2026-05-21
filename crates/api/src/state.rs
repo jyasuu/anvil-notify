@@ -1,10 +1,12 @@
-use store::{EmailNotificationStore, TemplateStore};
+use std::sync::Arc;
+
+use store::{NotificationStore, TemplateStore};
 
 use crate::publisher::Publisher;
 
 #[derive(Clone)]
 pub struct ApiState {
-    pub store: EmailNotificationStore,
+    pub store: Arc<dyn NotificationStore>,
     pub template_store: TemplateStore,
     /// Used by retry endpoints to re-enqueue events after resetting DB rows.
     pub publisher: Publisher,
