@@ -863,6 +863,13 @@ async fn declare_topology(
             {
                 // Queue does not yet exist — proceed with the normal active declare.
                 // The probe channel is now closed by the broker; we discard it.
+                // NOTE: lapin::channel logs an ERROR internally when the broker
+                // closes the probe channel with 404; that is expected noise on
+                // first boot and can be silenced with RUST_LOG=lapin=warn.
+                tracing::debug!(
+                    queue = queue_name,
+                    "Queue not found on passive probe — will be created by active declare"
+                );
             }
             Err(e) => {
                 // Any other error (e.g. 406 PRECONDITION_FAILED for argument
