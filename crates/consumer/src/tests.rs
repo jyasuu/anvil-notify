@@ -26,6 +26,7 @@ mod processor_tests {
     use rate_limiter::{MailRateLimiter, RateLimitConfig};
     use recipient_filter::{FilterConfig, RecipientFilter};
     use serde_json::json;
+    use tokio_retry::Retry;
     use uuid::Uuid;
 
     use crate::processor::{is_retryable, ProcessorContext};
@@ -103,6 +104,8 @@ mod processor_tests {
                     attachments: vec![],
                     sender_account: None,
                     send_mode: common::SendMode::Individual,
+                    group_retry_mode: common::GroupRetryMode::Individual,
+                    retry_policy: common::RetryPolicy::Retry,
                 }),
             },
         }

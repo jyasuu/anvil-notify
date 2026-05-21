@@ -9,16 +9,19 @@ use tracing::{debug, info, instrument};
 
 /// One template row from the `notification_template` table.
 #[derive(Debug, Clone)]
-pub struct EmailTemplate {
+pub struct NotificationTemplate {
     pub subject: String,
     pub body_html: String,
     pub body_text: String,
 }
 
+// Back-compat alias — callers that still use `EmailTemplate` continue to compile.
+pub use NotificationTemplate as EmailTemplate;
+
 /// A cached template entry together with the instant it was populated.
 #[derive(Debug, Clone)]
 struct CacheEntry {
-    template: EmailTemplate,
+    template: NotificationTemplate,
     inserted_at: Instant,
 }
 
@@ -73,7 +76,11 @@ impl TemplateStore {
     /// Returns `AppError::Template` for unknown (event_type, channel) pairs so
     /// the message is immediately routed to DLQ without wasting retry slots.
     #[instrument(skip(self), fields(event_type, channel))]
-    pub async fn resolve(&self, event_type: &str, channel: &str) -> Result<EmailTemplate, AppError> {
+    pub async fn resolve(
+        &self,
+        event_type: &str,
+        channel: &str,
+    ) -> Result<NotificationTemplate, AppError> {
         let cache_key = format!("{channel}:{event_type}");
 
         // ── 1. Cache hit (only when TTL is non-zero and entry is fresh) ───────
@@ -103,7 +110,7 @@ impl TemplateStore {
         .map_err(AppError::Database)?;
 
         if let Some(r) = row {
-            let tpl = EmailTemplate {
+            let tpl = NotificationTemplate {
                 subject: r.subject,
                 body_html: r.body_html,
                 body_text: r.body_text,

@@ -664,6 +664,8 @@ mod tests {
                     attachments: vec![],
                     sender_account: Some("transactional".into()),
                     send_mode: common::SendMode::Individual,
+                    group_retry_mode: common::GroupRetryMode::Individual,
+                    retry_policy: common::RetryPolicy::Retry,
                 }),
             },
         };

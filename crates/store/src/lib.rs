@@ -10,4 +10,4 @@ pub use notification_log::{
     NotificationStore,
     CHANNEL_EMAIL,
 };
-pub use template_store::{EmailTemplate, TemplateStore};
+pub use template_store::{EmailTemplate, NotificationTemplate, TemplateStore};

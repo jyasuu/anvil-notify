@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use common::{AppError, EmailLog, EmailStatus};
+use common::{AppError, NotificationLog, NotificationStatus};
 use sqlx::PgPool;
 use tracing::instrument;
 use uuid::Uuid;
@@ -98,14 +98,14 @@ pub trait NotificationStore: Send + Sync + 'static {
     ) -> Result<(), AppError>;
 
     /// Fetch all delivery rows for an event (one per recipient).
-    async fn get_by_event_id(&self, event_id: Uuid) -> Result<Vec<EmailLog>, AppError>;
+    async fn get_by_event_id(&self, event_id: Uuid) -> Result<Vec<NotificationLog>, AppError>;
 
     /// Fetch the row for a single recipient within an event.
     async fn get_by_event_and_recipient(
         &self,
         event_id: Uuid,
         recipient_id: &str,
-    ) -> Result<EmailLog, AppError>;
+    ) -> Result<NotificationLog, AppError>;
 
     /// Reset a single FAILED row to PENDING for manual replay.
     async fn reset_for_retry(&self, event_id: Uuid, recipient_id: &str) -> Result<(), AppError>;
@@ -285,7 +285,7 @@ impl NotificationStore for EmailNotificationStore {
     }
 
     #[instrument(skip(self))]
-    async fn get_by_event_id(&self, event_id: Uuid) -> Result<Vec<EmailLog>, AppError> {
+    async fn get_by_event_id(&self, event_id: Uuid) -> Result<Vec<NotificationLog>, AppError> {
         let rows = sqlx::query!(
             r#"
             SELECT
@@ -326,13 +326,13 @@ impl NotificationStore for EmailNotificationStore {
 
         rows.into_iter()
             .map(|r| {
-                Ok(EmailLog {
+                Ok(NotificationLog {
                     id: r.id,
                     event_id: r.event_id,
                     event_type: r.event_type,
                     recipient_email: r.recipient_email,
                     recipient_name: r.recipient_name,
-                    status: EmailStatus::try_from(r.status.as_str())?,
+                    status: NotificationStatus::try_from(r.status.as_str())?,
                     retry_count: r.retry_count,
                     total_attempts: r.total_attempts,
                     last_error: r.last_error,
@@ -356,7 +356,7 @@ impl NotificationStore for EmailNotificationStore {
         &self,
         event_id: Uuid,
         recipient_id: &str,
-    ) -> Result<EmailLog, AppError> {
+    ) -> Result<NotificationLog, AppError> {
         let r = sqlx::query!(
             r#"
             SELECT
@@ -393,13 +393,13 @@ impl NotificationStore for EmailNotificationStore {
         .await?
         .ok_or_else(|| AppError::NotFound(format!("{event_id}/{recipient_id}")))?;
 
-        Ok(EmailLog {
+        Ok(NotificationLog {
             id: r.id,
             event_id: r.event_id,
             event_type: r.event_type,
             recipient_email: r.recipient_email,
             recipient_name: r.recipient_name,
-            status: EmailStatus::try_from(r.status.as_str())?,
+            status: NotificationStatus::try_from(r.status.as_str())?,
             retry_count: r.retry_count,
             total_attempts: r.total_attempts,
             last_error: r.last_error,
