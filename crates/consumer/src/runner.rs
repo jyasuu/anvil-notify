@@ -241,7 +241,7 @@ async fn declare_topology(
     // 406 PRECONDITION_FAILED error here where we can report it clearly before
     // the active declare ever fires.  If the queue does NOT yet exist, the
     // passive declare returns a 404 NOT_FOUND — we detect this by checking
-    // whether the error message contains "404" and proceed with the normal
+    // whether the error message contains "404" or "NOT_FOUND" and proceed with the normal
     // active declare.
     let dlq_name = format!("{}.dlq", cfg.queue);
     let dlx_name = format!("{}.dlx", cfg.exchange);
@@ -270,7 +270,7 @@ async fn declare_topology(
                     "Queue already exists — skipping active declare"
                 );
             }
-            Err(ref e) if e.to_string().contains("404") => {
+            Err(ref e) if { let s = e.to_string(); s.contains("404") || s.contains("NOT_FOUND") } => {
                 // Queue does not exist yet — normal first-run path.
                 //
                 // TODO: replace string-match with a structured lapin error check
