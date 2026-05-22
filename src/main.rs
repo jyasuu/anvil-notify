@@ -15,7 +15,7 @@ use rate_limiter::MailRateLimiter;
 use recipient_filter::RecipientFilter;
 use reqwest::Client;
 use sqlx::postgres::PgPoolOptions;
-use store::{EmailLogStore, TemplateStore};
+use store::{EmailNotificationStore, NotificationStore, TemplateStore};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -76,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("Failed to run migrations")?;
 
-    let store = EmailLogStore::new(pool.clone());
+    let store = EmailNotificationStore::new(pool.clone());
     let template_store = TemplateStore::new_with_ttl(
         pool,
         std::time::Duration::from_secs(cfg.template_cache_ttl_secs),
@@ -180,6 +180,18 @@ async fn main() -> anyhow::Result<()> {
             burst_size = cfg.rate_limit.burst_size,
             "Mail rate limiter active"
         );
+        // Warn operators about a misconfiguration that would silently cap
+        // throughput below the intended steady-state rate.  When burst_size <
+        // emails_per_second the token bucket can never hold enough tokens to
+        // sustain the configured rate; sends will be throttled lower than
+        // expected without any other error signal.
+        if cfg.rate_limit.burst_size < cfg.rate_limit.emails_per_second {
+            tracing::warn!(
+                emails_per_second = cfg.rate_limit.emails_per_second,
+                burst_size = cfg.rate_limit.burst_size,
+                "burst_size is less than emails_per_second; steady-state                  throughput will be capped at burst_size, not emails_per_second.                  Consider setting burst_size >= emails_per_second."
+            );
+        }
     }
 
     // ── Recipient filter ──────────────────────────────────────────────────────
@@ -209,7 +221,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let api_state = ApiState {
-        store: store.clone(),
+        store: Arc::new(store.clone()) as Arc<dyn NotificationStore>,
         template_store: template_store.clone(),
         publisher,
         api_key: cfg.http.api_key.clone(),
@@ -243,6 +255,11 @@ async fn main() -> anyhow::Result<()> {
         routing_key: cfg.amqp.routing_key.clone(),
         max_retries: cfg.amqp.max_retries,
         retry_base_ms: cfg.amqp.retry_base_ms,
+        // Memory note: attachment bytes are held in RAM for each in-flight
+        // message from fetch through SMTP delivery.  Worst-case peak:
+        //   max_concurrency × (attachments per event) × max_attachment_bytes
+        // Ensure your container memory limit accounts for this.
+        // See config/default.toml [amqp] max_concurrency and max_attachment_bytes.
         max_concurrency: cfg.amqp.max_concurrency,
         max_attachment_bytes: cfg.max_attachment_bytes,
         max_rl_waits: cfg.amqp.max_rl_waits,
@@ -253,7 +270,7 @@ async fn main() -> anyhow::Result<()> {
     let consumer_http = Arc::clone(&http);
     let consumer_task = tokio::spawn(async move {
         let ctx = ProcessorContext {
-            store,
+            store: Arc::new(store),
             template_store,
             sender,
             sender_registry,

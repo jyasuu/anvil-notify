@@ -18,6 +18,14 @@ routing_key           = "email.requested"
 max_retries           = 3
 retry_base_ms         = 1000
 max_concurrency       = 10      # max parallel message handlers
+# Memory note: attachment bytes are buffered in RAM for the full lifetime of
+# each in-flight message (from fetch through to SMTP delivery).  Peak memory
+# usage can be as high as:
+#   max_concurrency × (attachments per event) × max_attachment_bytes
+# With the defaults (10 concurrent × 10 MiB per attachment) a single event
+# with 5 attachments holds 50 MiB; 10 concurrent such events hold 500 MiB.
+# Reduce max_concurrency or max_attachment_bytes in memory-constrained
+# environments, and size your pod/container memory limit accordingly.
 # Maximum consecutive rate-limit backoff cycles per recipient before it is
 # permanently marked FAILED.  Each cycle waits up to ~4 minutes total.
 # Increase for providers with long rate-limit cooldown windows (e.g. free-tier
@@ -71,6 +79,7 @@ template_cache_ttl_secs = 300  # 5 minutes
 # Maximum size of a single fetched email attachment in bytes.
 # Attachments larger than this are permanently rejected (no retry).
 # Default: 10 MiB. Override with AN__MAX_ATTACHMENT_BYTES.
+# See also: max_concurrency above for the peak-memory calculation.
 max_attachment_bytes = 10485760  # 10 * 1024 * 1024
 
 # ── Choose one backend ────────────────────────────────────────────────────────

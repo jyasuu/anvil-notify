@@ -67,13 +67,13 @@ pub struct ChannelOverrides {
 /// Controls how multiple TO recipients in a single event are delivered.
 ///
 /// `Individual` (default) — each recipient in `recipients` is delivered as a
-/// completely separate email with its own `email_log` row, retry counter, and
+/// completely separate email with its own `notification_log` row, retry counter, and
 /// independent success / failure state.  Recipients cannot see each other's
 /// addresses.  This is the correct mode for transactional mail.
 ///
 /// `Group` — all recipients share one email.  Every address appears together
 /// in the `To:` header so recipients can see who else received the message.
-/// Only the first address gets an `email_log` row; the delivery is tracked and
+/// Only the first address gets an `notification_log` row; the delivery is tracked and
 /// retried as a unit.  Use for team notifications, shared alerts, or any
 /// context where mutual visibility is intentional.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +84,74 @@ pub enum SendMode {
     Individual,
     /// All recipients share one email; all appear in the To: header.
     Group,
+}
+
+/// Controls how a failed group send is retried.
+///
+/// `Whole` (default) — the entire group email is retried as a unit.  On
+/// re-delivery the service sends one email to all original recipients again.
+/// Simple, but carries a double-send risk: any recipient whose SMTP delivery
+/// succeeded in a prior partial attempt will receive the message twice.
+///
+/// `Individual` — on retry each recipient is re-processed independently,
+/// using the same individual-send path as `SendMode::Individual`.  The
+/// service inserts an `notification_log` row per recipient at the time of the
+/// **first** group send attempt, so re-delivery can skip addresses that
+/// already have a `SENT` row and only re-send to those still `PENDING` or
+/// `FAILED`.
+///
+/// Use `Individual` when:
+/// - recipients partially overlap (some may already be on a suppression list),
+/// - SMTP is unreliable and partial deliveries are common,
+/// - auditing per-address success/failure matters more than the shared `To:`
+///   header semantics of the original group email.
+///
+/// Trade-off: recipients who are retried individually will receive a separate
+/// email — the `To:` header on retry shows only their own address.  If the
+/// shared-`To:` visibility is a product requirement for retries too, use
+/// `Whole` and accept the double-send risk instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupRetryMode {
+    /// Retry the whole group email as a single unit (default).
+    #[default]
+    Whole,
+    /// On retry, fall back to per-recipient individual sends, skipping
+    /// addresses that already have a `SENT` row.
+    Individual,
+}
+
+/// Controls whether a transient send failure is retried.
+///
+/// Applies to both `SendMode::Individual` and `SendMode::Group`.
+///
+/// `Retry` (default) — the runner retries up to the configured `max_retries`
+/// limit using exponential back-off, consistent with current behaviour.
+///
+/// `NoRetry` — any failure (transient or permanent) is immediately marked
+/// `FAILED` with `exhausted = true`.  The row is visible in status queries
+/// and remains eligible for manual operator retry via the retry API, but the
+/// consumer will not attempt another delivery on its own.
+///
+/// Use `NoRetry` when:
+/// - the event is time-sensitive and a delayed retry would be worse than a
+///   visible failure (e.g. one-time passcodes, time-locked invitations),
+/// - the publisher owns re-delivery and prefers to re-publish rather than
+///   rely on in-process retry,
+/// - you want deterministic failure visibility without waiting for
+///   `max_retries` attempts to exhaust.
+///
+/// Rate-limit failures are treated the same as transient failures under
+/// `NoRetry` — the send is abandoned immediately rather than waiting for a
+/// token.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryPolicy {
+    /// Retry on transient failures up to `max_retries` (default).
+    #[default]
+    Retry,
+    /// Fail immediately on any send error; do not retry automatically.
+    NoRetry,
 }
 
 impl SendMode {
@@ -100,7 +168,7 @@ impl SendMode {
 /// All email-specific options for a single event.
 ///
 /// One event can carry **multiple recipients** — the notification service
-/// processes each independently so every delivery has its own `email_log`
+/// processes each independently so every delivery has its own `notification_log`
 /// row, retry counter, and status.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmailOptions {
@@ -109,6 +177,30 @@ pub struct EmailOptions {
     /// visible in the `To:` header (`Group`).
     #[serde(default)]
     pub send_mode: SendMode,
+
+    /// Controls how a group send is retried after a transient failure.
+    ///
+    /// Only meaningful when `send_mode` is `Group`; ignored for `Individual`.
+    ///
+    /// `Whole` (default) — retry the whole group email as a unit.
+    /// `Individual` — fall back to per-recipient sends on retry, skipping
+    /// addresses that already have a `SENT` row in `notification_log`.
+    ///
+    /// See [`GroupRetryMode`] for the full trade-off discussion.
+    #[serde(default)]
+    pub group_retry_mode: GroupRetryMode,
+
+    /// Controls whether the consumer retries automatically after a transient
+    /// send failure.
+    ///
+    /// `Retry` (default) — retry with exponential back-off up to
+    /// `max_retries`.  `NoRetry` — mark `FAILED` immediately without any
+    /// automatic retry attempt; the row remains eligible for manual operator
+    /// retry via the retry API.
+    ///
+    /// See [`RetryPolicy`] for the full trade-off discussion.
+    #[serde(default)]
+    pub retry_policy: RetryPolicy,
 
     /// One or more TO recipients. Each is processed independently:
     /// a blocked recipient does not prevent others from receiving the email.
@@ -128,7 +220,7 @@ pub struct EmailOptions {
     /// Zero or more CC recipients included in every delivery for this event.
     ///
     /// CC addresses are attached as `Cc:` headers and are visible to all
-    /// recipients. They are **not** processed independently: no `email_log`
+    /// recipients. They are **not** processed independently: no `notification_log`
     /// row is created per CC address, they bypass the recipient filter and
     /// rate-limiter, and they are not individually retried.
     ///
@@ -226,6 +318,8 @@ impl EmailEvent {
                     attachments: self.attachments,
                     sender_account: self.sender_account,
                     send_mode: SendMode::Individual,
+                    group_retry_mode: GroupRetryMode::Whole,
+                    retry_policy: RetryPolicy::default(),
                 }),
             },
         }

@@ -1,25 +1,30 @@
+//! AMQP connection loop and queue topology setup.
+//!
+//! This module owns the outermost lifecycle of the consumer:
+//!
+//! * [`run_consumer`] — reconnect loop with exponential back-off.
+//! * `connect_and_consume` — one connection lifetime: declare topology, open
+//!   a channel, pull deliveries, and dispatch each to [`delivery::handle_delivery`].
+//! * `declare_topology` — passive-then-active queue/exchange declarations.
+//! * `append_heartbeat_param` — URL helper that injects the AMQP heartbeat param.
+//!
+//! Per-delivery processing (deserialise, fetch attachments, retry loops) lives
+//! in [`delivery`].  Per-recipient logic (idempotency, template render, send)
+//! lives in [`processor`].
+
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{AppError, NotificationEvent, Recipient, SendMode};
 use futures_lite::StreamExt;
 use lapin::{options::*, types::FieldTable, Channel, Connection, ConnectionProperties};
-use mailer::fetch_attachments_with_limit;
-use mailer::message::ResolvedAttachment;
 use metrics::counter;
 use reqwest::Client;
 use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::{
-    config::ConsumerConfig,
-    processor::{
-        is_retryable, process_group, process_recipient, ProcessorContext, RecipientOutcome,
-    },
-};
+use crate::{config::ConsumerConfig, delivery::handle_delivery, processor::ProcessorContext};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -163,359 +168,6 @@ async fn connect_and_consume(
     }
 }
 
-// ── Per-delivery handler ──────────────────────────────────────────────────────
-
-/// Handle one delivery.
-///
-/// Attachments are fetched ONCE here at the event level, then the resolved
-/// bytes are passed to every recipient task.  This prevents N×M HTTP GETs
-/// and pre-signed URL expiry for recipients processed later in the list.
-///
-/// Recipients are processed **in parallel** via a `JoinSet`: each recipient
-/// gets its own task with its own retry loop.  The semaphore permit is held
-/// for the entire delivery so total in-flight messages stays bounded, but
-/// within a message recipients no longer block each other — a long retry
-/// backoff on one address does not delay sends to other addresses in the
-/// same event.
-///
-/// The AMQP message is ACK'd once ALL recipient tasks have finished.
-/// It is NACK'd (→ DLQ) only if the message cannot be deserialized or if
-/// the event-level attachment fetch fails permanently.
-async fn handle_delivery(
-    delivery: lapin::message::Delivery,
-    ctx: ProcessorContext,
-    http: Arc<Client>,
-    cfg: ConsumerConfig,
-    shutdown: CancellationToken,
-) {
-    // ── Deserialize — try new NotificationEvent shape, fall back to legacy EmailEvent ──
-    //
-    // The canonical shape is `NotificationEvent` (channel-agnostic envelope).
-    // Publishers that still emit the legacy flat `EmailEvent` are promoted
-    // transparently so no Outbox migration is required for existing business systems.
-    //
-    // The first error is logged at debug level before the fallback attempt so
-    // that a genuinely malformed NotificationEvent (not a legacy payload) surfaces
-    // the real field-level error rather than the less-informative EmailEvent error.
-    #[allow(deprecated)]
-    let event: NotificationEvent = {
-        match serde_json::from_slice::<NotificationEvent>(&delivery.data) {
-            Ok(e) => e,
-            Err(first_err) => {
-                tracing::debug!(
-                    error = %first_err,
-                    "NotificationEvent deserialization failed — attempting legacy EmailEvent fallback"
-                );
-                match serde_json::from_slice::<common::EmailEvent>(&delivery.data) {
-                    Ok(legacy) => legacy.into_notification_event(),
-                    Err(e) => {
-                        error!(
-                            notification_event_error = %first_err,
-                            legacy_email_event_error = %e,
-                            "Cannot deserialize event as NotificationEvent or legacy EmailEvent — sending to DLQ"
-                        );
-                        let _ = delivery
-                            .nack(BasicNackOptions {
-                                requeue: false,
-                                ..Default::default()
-                            })
-                            .await;
-                        return;
-                    }
-                }
-            }
-        }
-    };
-
-    // ── Extract email channel options ────────────────────────────────────────
-    // If there are no email options, ACK cleanly so other (future) channels
-    // can still process the event without it being re-queued.
-    let email_opts = match event.channel_overrides.email.as_ref() {
-        Some(opts) => opts.clone(),
-        None => {
-            warn!(event_id = %event.event_id, "Event has no email channel options — ACKing and skipping");
-            let _ = delivery.ack(BasicAckOptions::default()).await;
-            return;
-        }
-    };
-
-    if email_opts.recipients.is_empty() {
-        warn!(event_id = %event.event_id, "Event has no recipients — ACKing and skipping");
-        let _ = delivery.ack(BasicAckOptions::default()).await;
-        return;
-    }
-
-    // Guard against pathologically large recipient lists that would monopolise
-    // the semaphore permit for an unbounded duration and exhaust DB connections.
-    if email_opts.recipients.len() > cfg.max_recipients_per_event {
-        error!(
-            event_id        = %event.event_id,
-            recipient_count = email_opts.recipients.len(),
-            limit           = cfg.max_recipients_per_event,
-            "Event exceeds max_recipients_per_event — sending to DLQ"
-        );
-        let _ = delivery
-            .nack(BasicNackOptions {
-                requeue: false,
-                ..Default::default()
-            })
-            .await;
-        return;
-    }
-
-    // ── Fetch attachments once for the whole event ───────────────────────────
-    let resolved_attachments: Vec<ResolvedAttachment> = if email_opts.attachments.is_empty() {
-        vec![]
-    } else {
-        match fetch_attachments_with_limit(
-            &http,
-            &email_opts.attachments,
-            &event.timestamp,
-            cfg.max_attachment_bytes,
-        )
-        .await
-        {
-            Ok(atts) => atts,
-            Err(ref e) => {
-                let permanent = e.is_permanent_mailer();
-                error!(
-                    event_id  = %event.event_id,
-                    error     = %e,
-                    permanent,
-                    "Attachment fetch failed — NACKing message"
-                );
-                let _ = delivery
-                    .nack(BasicNackOptions {
-                        requeue: !permanent,
-                        ..Default::default()
-                    })
-                    .await;
-                return;
-            }
-        }
-    };
-
-    // ── Dispatch on send_mode ─────────────────────────────────────────────────
-    let attachments = Arc::new(resolved_attachments);
-    let email_opts = Arc::new(email_opts);
-
-    match email_opts.send_mode {
-        // ── Group mode: one email, all To: addresses visible to each other ────
-        SendMode::Group => {
-            let ctx = ctx.clone();
-            let event = event.clone();
-            let email_opts = Arc::clone(&email_opts);
-            let atts = Arc::clone(&attachments);
-            let cfg = cfg.clone();
-            let shutdown = shutdown.clone();
-
-            // Group sends are driven by a single task — no per-recipient
-            // parallelism. The runner's retry loop in process_one_group handles
-            // back-off and max-retry logic identically to individual mode.
-            process_one_group(&ctx, &event, &email_opts, &atts, &cfg, &shutdown).await;
-        }
-
-        // ── Individual mode: separate email per recipient (default) ───────────
-        SendMode::Individual => {
-            let mut join_set = JoinSet::new();
-            for recipient in email_opts.recipients.clone() {
-                let ctx = ctx.clone();
-                let event = event.clone();
-                let email_opts = Arc::clone(&email_opts);
-                let atts = Arc::clone(&attachments);
-                let cfg = cfg.clone();
-                let shutdown = shutdown.clone();
-
-                join_set.spawn(async move {
-                    process_one_recipient(
-                        &ctx,
-                        &event,
-                        &email_opts,
-                        &recipient,
-                        &atts,
-                        &cfg,
-                        &shutdown,
-                    )
-                    .await;
-                });
-            }
-
-            // Wait for every recipient task to finish before ACKing. Task panics
-            // are treated as permanent failures for that recipient — the join
-            // error is logged but does not prevent the ACK, since other
-            // recipients may have delivered successfully.
-            while let Some(result) = join_set.join_next().await {
-                if let Err(e) = result {
-                    error!(
-                        event_id = %event.event_id,
-                        error    = %e,
-                        "Recipient task panicked — treating as permanent failure"
-                    );
-                }
-            }
-        }
-    }
-
-    let _ = delivery.ack(BasicAckOptions::default()).await;
-}
-
-/// Drive one recipient through the send loop with per-recipient retry.
-async fn process_one_recipient(
-    ctx: &ProcessorContext,
-    event: &NotificationEvent,
-    email_opts: &common::EmailOptions,
-    recipient: &Recipient,
-    attachments: &[ResolvedAttachment],
-    cfg: &ConsumerConfig,
-    shutdown: &CancellationToken,
-) {
-    // attempt is seeded from 0 on the first call; if the row already exists
-    // (restart / re-delivery), process_recipient returns Duplicate { retry_count }
-    // on the first iteration and we update attempt here — no separate DB query.
-    let mut attempt: u32 = 0;
-    let mut rl_count: u32 = 0;
-
-    loop {
-        match process_recipient(ctx, event, email_opts, recipient, attachments, shutdown).await {
-            RecipientOutcome::Sent | RecipientOutcome::Blocked(_) | RecipientOutcome::Skipped => {
-                return;
-            }
-
-            // Row existed and is non-terminal — seed attempt counter from DB
-            // value and immediately retry without consuming a retry slot.
-            RecipientOutcome::Duplicate { retry_count } => {
-                attempt = retry_count as u32;
-                continue;
-            }
-
-            RecipientOutcome::Failed(ref e) if !is_retryable(e) => {
-                error!(
-                    event_id = %event.event_id,
-                    email    = %recipient.email,
-                    error    = %e,
-                    "Permanent failure for recipient — marking FAILED"
-                );
-                let _ = ctx
-                    .store
-                    .mark_failed(event.event_id, &recipient.email, &e.to_string(), true)
-                    .await;
-                return;
-            }
-
-            RecipientOutcome::Failed(ref e) if attempt >= cfg.max_retries => {
-                error!(
-                    event_id = %event.event_id,
-                    email    = %recipient.email,
-                    attempt,
-                    "Max retries exhausted for recipient"
-                );
-                let _ = ctx
-                    .store
-                    .mark_failed(event.event_id, &recipient.email, &e.to_string(), true)
-                    .await;
-                return;
-            }
-
-            // Rate-limited — back off without consuming a retry slot,
-            // but cap consecutive rate-limit waits to prevent infinite loops.
-            RecipientOutcome::Failed(AppError::RateLimited(ref msg)) => {
-                rl_count += 1;
-                if rl_count > cfg.max_rl_waits {
-                    error!(
-                        event_id   = %event.event_id,
-                        email      = %recipient.email,
-                        rl_count,
-                        max_rl_waits = cfg.max_rl_waits,
-                        "Rate-limit backoff limit reached — marking FAILED"
-                    );
-                    let _ = ctx
-                        .store
-                        .mark_failed(event.event_id, &recipient.email, msg, true)
-                        .await;
-                    return;
-                }
-                let delay = Duration::from_secs(30 * (1u64 << attempt.min(3)));
-                warn!(
-                    event_id   = %event.event_id,
-                    email      = %recipient.email,
-                    rl_count,
-                    delay_secs = delay.as_secs(),
-                    "Rate-limited — backing off without consuming retry slot"
-                );
-                let _ = ctx
-                    .store
-                    .mark_failed(event.event_id, &recipient.email, msg, false)
-                    .await;
-                tokio::select! {
-                    _ = sleep(delay) => {}
-                    _ = shutdown.cancelled() => {
-                        // Shutdown arrived during backoff. The row is already
-                        // PENDING (mark_failed with exhausted=false above), which
-                        // would leave it stuck with no queue message to pick it up.
-                        // Flip it to FAILED so the operator can see it and use the
-                        // retry API after the service restarts.
-                        warn!(
-                            event_id = %event.event_id,
-                            email    = %recipient.email,
-                            "Shutdown during rate-limit backoff — marking FAILED for manual retry"
-                        );
-                        let _ = ctx
-                            .store
-                            .mark_failed(event.event_id, &recipient.email,
-                                "service shutdown during rate-limit backoff", true)
-                            .await;
-                        return;
-                    }
-                }
-            }
-
-            // Transient failure — normal exponential backoff
-            RecipientOutcome::Failed(ref e) => {
-                attempt += 1;
-                rl_count = 0;
-                // The `.min(10)` caps the *shift* (not `attempt` itself) to prevent
-                // overflow: 1 << 10 = 1024, so with the default retry_base_ms=1000
-                // the maximum single delay is ~17 min.  `attempt` may legitimately
-                // exceed 10 when seeded from a high DB retry_count after a restart,
-                // but the delay stays capped at this ceiling regardless.
-                let delay = Duration::from_millis(cfg.retry_base_ms * (1 << attempt.min(10)));
-                warn!(
-                    event_id = %event.event_id,
-                    email    = %recipient.email,
-                    attempt,
-                    delay_ms = delay.as_millis(),
-                    error    = %e,
-                    "Transient failure — retrying"
-                );
-                let _ = ctx
-                    .store
-                    .mark_failed(event.event_id, &recipient.email, &e.to_string(), false)
-                    .await;
-                tokio::select! {
-                    _ = sleep(delay) => {}
-                    _ = shutdown.cancelled() => {
-                        // Shutdown arrived during retry backoff. The row is already
-                        // PENDING; flip it to FAILED so it is visible and recoverable
-                        // via the retry API after restart.
-                        warn!(
-                            event_id = %event.event_id,
-                            email    = %recipient.email,
-                            attempt,
-                            "Shutdown during retry backoff — marking FAILED for manual retry"
-                        );
-                        let _ = ctx
-                            .store
-                            .mark_failed(event.event_id, &recipient.email,
-                                "service shutdown during retry backoff", true)
-                            .await;
-                        return;
-                    }
-                }
-            }
-        }
-    }
-}
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Append `?heartbeat=<secs>` to an AMQP URL if not already present.
@@ -567,144 +219,6 @@ mod heartbeat_tests {
     }
 }
 
-// ── Group send retry wrapper ─────────────────────────────────────────────────
-
-/// Drive a group send through the retry loop.
-///
-/// Mirrors `process_one_recipient` but calls `process_group` instead, which
-/// builds one `EmailMessage` with all recipients sharing the `To:` header.
-async fn process_one_group(
-    ctx: &ProcessorContext,
-    event: &NotificationEvent,
-    email_opts: &common::EmailOptions,
-    attachments: &[mailer::message::ResolvedAttachment],
-    cfg: &ConsumerConfig,
-    shutdown: &tokio_util::sync::CancellationToken,
-) {
-    let mut attempt: u32 = 0;
-    let mut rl_count: u32 = 0;
-
-    loop {
-        match process_group(ctx, event, email_opts, attachments, shutdown).await {
-            RecipientOutcome::Sent | RecipientOutcome::Blocked(_) | RecipientOutcome::Skipped => {
-                return;
-            }
-
-            RecipientOutcome::Duplicate { retry_count } => {
-                attempt = retry_count as u32;
-                continue;
-            }
-
-            RecipientOutcome::Failed(ref e) if !is_retryable(e) => {
-                error!(
-                    event_id = %event.event_id,
-                    error    = %e,
-                    "Permanent failure for group send — marking FAILED"
-                );
-                if let Some(primary) = email_opts.recipients.first() {
-                    let _ = ctx
-                        .store
-                        .mark_failed(event.event_id, &primary.email, &e.to_string(), true)
-                        .await;
-                }
-                return;
-            }
-
-            RecipientOutcome::Failed(ref e) if attempt >= cfg.max_retries => {
-                error!(
-                    event_id = %event.event_id,
-                    attempt,
-                    "Max retries exhausted for group send"
-                );
-                if let Some(primary) = email_opts.recipients.first() {
-                    let _ = ctx
-                        .store
-                        .mark_failed(event.event_id, &primary.email, &e.to_string(), true)
-                        .await;
-                }
-                return;
-            }
-
-            RecipientOutcome::Failed(AppError::RateLimited(ref msg)) => {
-                rl_count += 1;
-                if rl_count > cfg.max_rl_waits {
-                    error!(
-                        event_id     = %event.event_id,
-                        rl_count,
-                        max_rl_waits = cfg.max_rl_waits,
-                        "Rate-limit backoff limit reached for group send — marking FAILED"
-                    );
-                    if let Some(primary) = email_opts.recipients.first() {
-                        let _ = ctx
-                            .store
-                            .mark_failed(event.event_id, &primary.email, msg, true)
-                            .await;
-                    }
-                    return;
-                }
-                let delay = Duration::from_secs(30 * (1u64 << attempt.min(3)));
-                warn!(
-                    event_id   = %event.event_id,
-                    rl_count,
-                    delay_secs = delay.as_secs(),
-                    "Group send rate-limited — backing off"
-                );
-                if let Some(primary) = email_opts.recipients.first() {
-                    let _ = ctx
-                        .store
-                        .mark_failed(event.event_id, &primary.email, msg, false)
-                        .await;
-                }
-                tokio::select! {
-                    _ = sleep(delay) => {}
-                    _ = shutdown.cancelled() => {
-                        if let Some(primary) = email_opts.recipients.first() {
-                            let _ = ctx
-                                .store
-                                .mark_failed(event.event_id, &primary.email,
-                                    "service shutdown during rate-limit backoff", true)
-                                .await;
-                        }
-                        return;
-                    }
-                }
-            }
-
-            RecipientOutcome::Failed(ref e) => {
-                attempt += 1;
-                rl_count = 0;
-                let delay = Duration::from_millis(cfg.retry_base_ms * (1 << attempt.min(10)));
-                warn!(
-                    event_id = %event.event_id,
-                    attempt,
-                    delay_ms = delay.as_millis(),
-                    error    = %e,
-                    "Group send transient failure — retrying"
-                );
-                if let Some(primary) = email_opts.recipients.first() {
-                    let _ = ctx
-                        .store
-                        .mark_failed(event.event_id, &primary.email, &e.to_string(), false)
-                        .await;
-                }
-                tokio::select! {
-                    _ = sleep(delay) => {}
-                    _ = shutdown.cancelled() => {
-                        if let Some(primary) = email_opts.recipients.first() {
-                            let _ = ctx
-                                .store
-                                .mark_failed(event.event_id, &primary.email,
-                                    "service shutdown during retry backoff", true)
-                                .await;
-                        }
-                        return;
-                    }
-                }
-            }
-        }
-    }
-}
-
 // ── Topology ──────────────────────────────────────────────────────────────────
 
 async fn declare_topology(
@@ -747,49 +261,35 @@ async fn declare_topology(
             .await
         {
             Ok(_) => {
-                // Queue exists and arguments are compatible — active declare is
-                // a no-op, but we still call it below for bind idempotency.
+                // Queue exists — active declare below will be a no-op (same args).
+                info!(
+                    queue = queue_name,
+                    "Queue already exists — skipping active declare"
+                );
             }
-            Err(e)
-                if {
-                    let s = e.to_string().to_lowercase();
-                    s.contains("404")
-                        || s.contains("not found")
-                        || s.contains("not_found")
-                        || s.contains("not-found")
-                        || s.contains("notfound")
-                } =>
-            {
-                // Queue does not yet exist — proceed with the normal active declare.
-                // The probe channel is now closed by the broker; we discard it.
+            Err(ref e) if e.to_string().contains("404") => {
+                // Queue does not exist yet — normal first-run path.
+                info!(
+                    queue = queue_name,
+                    "Queue does not exist yet — will declare"
+                );
             }
             Err(e) => {
-                // Any other error (e.g. 406 PRECONDITION_FAILED for argument
-                // mismatch) is surfaced here with a clear, actionable message
-                // rather than a cryptic "channel closed" from the reconnect loop.
+                // 406 PRECONDITION_FAILED or other error — surface it clearly.
                 return Err(anyhow::anyhow!(
-                    "passive check for queue '{}' failed — \
-                     the broker may have it declared with different arguments \
-                     (check x-dead-letter-exchange, durable flag, etc.): {e}",
+                    "Passive queue check for '{}' failed (possible argument mismatch): {e}",
                     queue_name
                 ));
             }
         }
-        // probe is dropped here; the broker-closed channel is cleaned up.
     }
 
-    channel
-        .exchange_declare(
-            &cfg.exchange,
-            lapin::ExchangeKind::Direct,
-            ExchangeDeclareOptions {
-                durable: true,
-                ..Default::default()
-            },
-            FieldTable::default(),
-        )
-        .await?;
-
+    // ── DLX / DLQ ─────────────────────────────────────────────────────────────
+    // The DLX is a fanout exchange: when RabbitMQ dead-letters a message it
+    // publishes with the original routing key, but fanout ignores the key and
+    // broadcasts to every bound queue (just the DLQ here).  Using Direct would
+    // require an exact routing-key match between the dead-lettered message and
+    // the DLQ binding, which is fragile when queue names change.
     channel
         .exchange_declare(
             &dlx_name,
@@ -812,21 +312,24 @@ async fn declare_topology(
             FieldTable::default(),
         )
         .await?;
+
     channel
         .queue_bind(
             &dlq_name,
             &dlx_name,
-            "",
+            &cfg.queue,
             QueueBindOptions::default(),
             FieldTable::default(),
         )
         .await?;
 
-    let mut args = FieldTable::default();
-    args.insert(
+    // ── Main queue (with DLX argument) ────────────────────────────────────────
+    let mut queue_args = FieldTable::default();
+    queue_args.insert(
         "x-dead-letter-exchange".into(),
-        lapin::types::AMQPValue::LongString(dlx_name.into()),
+        lapin::types::AMQPValue::LongString(dlx_name.clone().into()),
     );
+
     channel
         .queue_declare(
             &cfg.queue,
@@ -834,9 +337,23 @@ async fn declare_topology(
                 durable: true,
                 ..Default::default()
             },
-            args,
+            queue_args,
         )
         .await?;
+
+    // ── Exchange + binding ────────────────────────────────────────────────────
+    channel
+        .exchange_declare(
+            &cfg.exchange,
+            lapin::ExchangeKind::Direct,
+            ExchangeDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await?;
+
     channel
         .queue_bind(
             &cfg.queue,
@@ -847,6 +364,17 @@ async fn declare_topology(
         )
         .await?;
 
-    info!("AMQP topology declared");
+    // Prefetch one message per consumer so the broker doesn't dump the entire
+    // queue onto one instance when multiple replicas are running.
+    channel.basic_qos(1, BasicQosOptions::default()).await?;
+
+    info!(
+        queue    = %cfg.queue,
+        exchange = %cfg.exchange,
+        dlx      = %dlx_name,
+        dlq      = %dlq_name,
+        "AMQP topology declared"
+    );
+
     Ok(())
 }

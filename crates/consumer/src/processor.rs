@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use common::{is_valid_email, AppError, FromOverride, MailerKind, NotificationEvent, Recipient};
+use common::{
+    is_valid_email, AppError, FromOverride, GroupRetryMode, MailerKind, NotificationEvent,
+    NotificationStatus, Recipient,
+};
 use mailer::message::ResolvedAttachment;
 use mailer::{
     render_html_template, render_template, EmailMessage, EmailSender, MailboxRef, SenderRegistry,
@@ -8,13 +11,15 @@ use mailer::{
 use metrics::{counter, histogram};
 use rate_limiter::MailRateLimiter;
 use recipient_filter::RecipientFilter;
-use store::{EmailLogStore, InsertPendingArgs, InsertResult, TemplateStore};
+use store::{
+    EmailInsertPendingArgs, InsertResult, NotificationStore, TemplateStore, CHANNEL_EMAIL,
+};
 use tracing::{info, instrument, warn};
 
 /// Shared, cheaply-cloneable context passed to every per-recipient processor call.
 #[derive(Clone)]
 pub struct ProcessorContext {
-    pub store: EmailLogStore,
+    pub store: Arc<dyn NotificationStore>,
     pub template_store: TemplateStore,
     /// Global default sender (SMTP or webhook) used when no named account matches.
     pub sender: Arc<dyn EmailSender>,
@@ -38,6 +43,11 @@ pub enum RecipientOutcome {
         retry_count: i32,
     },
     Failed(AppError),
+    /// Group send failed after individual `notification_log` rows were already written
+    /// for every recipient (`group_retry_mode = Individual`).  The runner
+    /// should fall back to the individual-send path so only unsent recipients
+    /// are retried, rather than re-sending the whole group email.
+    GroupFailedWithIndividualRows(AppError),
 }
 
 // ── Public entry points ───────────────────────────────────────────────────────
@@ -72,7 +82,11 @@ pub async fn process_recipient(
     }
 
     // ── 1. Template lookup (before DB write) ────────────────────────────────
-    let prefetched_template = match ctx.template_store.resolve(&event.event_type).await {
+    let prefetched_template = match ctx
+        .template_store
+        .resolve(&event.event_type, CHANNEL_EMAIL)
+        .await
+    {
         Ok(t) => t,
         Err(e) => return RecipientOutcome::Failed(e),
     };
@@ -121,7 +135,7 @@ pub async fn process_recipient(
 
     match ctx
         .store
-        .insert_pending(InsertPendingArgs {
+        .insert_pending(&EmailInsertPendingArgs {
             event_id: event.event_id,
             event_type: &event.event_type,
             recipient_email: &recipient.email,
@@ -141,12 +155,13 @@ pub async fn process_recipient(
         Ok(InsertResult::Duplicate {
             retry_count,
             status,
-        }) => match status.as_str() {
-            "SENT" | "BLOCKED" => {
+        }) => match NotificationStatus::try_from(status.as_str()) {
+            Ok(NotificationStatus::Sent) | Ok(NotificationStatus::Blocked) => {
                 info!("Skipping already-terminal recipient");
                 return RecipientOutcome::Skipped;
             }
-            _ => return RecipientOutcome::Duplicate { retry_count },
+            Ok(_) => return RecipientOutcome::Duplicate { retry_count },
+            Err(e) => return RecipientOutcome::Failed(e),
         },
         Err(e) => return RecipientOutcome::Failed(e),
     }
@@ -242,14 +257,40 @@ pub async fn process_recipient(
     }
 }
 
+/// Maximum number of recipients allowed in a single group send.
+///
+/// This is a defence-in-depth guard inside the processor itself.  The primary
+/// enforcement happens in `runner.rs` (`max_recipients_per_event`) before
+/// `process_group` is called, but having the check here ensures the limit is
+/// respected regardless of which call-site invokes this function in the future.
+///
+/// The value intentionally mirrors the runner's default (500) but is not
+/// read from config — it is a hard ceiling baked into the function contract.
+/// If the runner's configured limit is lower (the common case) the runner
+/// guard fires first and this one is never reached.
+pub const MAX_GROUP_RECIPIENTS: usize = 500;
+
 /// Process all recipients as a single group email (group send mode).
 ///
 /// All addresses in `email_opts.recipients` appear together in the `To:`
-/// header of one email. Only the first recipient gets an `email_log` row —
-/// the delivery is tracked and retried as a unit.
+/// header of one email.
 ///
-/// This is the correct path when `email_opts.send_mode == SendMode::Group`.
-/// The runner calls this once per event instead of spawning per-recipient tasks.
+/// ## Idempotency / retry behaviour
+///
+/// The strategy depends on `email_opts.group_retry_mode`:
+///
+/// **`GroupRetryMode::Whole`** (default) — only the primary (first) recipient
+/// gets a `notification_log` row.  On retry the whole group email is re-sent as a
+/// unit.  Simple, but if SMTP accepted the message for some recipients before
+/// the connection dropped, those recipients may receive the email twice.
+///
+/// **`GroupRetryMode::Individual`** — a `notification_log` row is inserted for
+/// **every** recipient before the send attempt.  On failure the function
+/// returns `RecipientOutcome::GroupFailedWithIndividualRows` so the runner
+/// can fall back to `process_one_recipient` for each address, skipping those
+/// that already have a `SENT` row.  Retried recipients receive a separate
+/// email (the `To:` header shows only their own address); the shared-`To:`
+/// visibility of the original group email is not preserved on retry.
 #[instrument(skip(ctx, event, email_opts, attachments, shutdown),
              fields(event_id = %event.event_id, recipient_count = email_opts.recipients.len()))]
 pub async fn process_group(
@@ -261,7 +302,7 @@ pub async fn process_group(
 ) -> RecipientOutcome {
     let recipients = &email_opts.recipients;
 
-    // The primary recipient is used for email_log tracking. We take the first
+    // The primary recipient is used for notification_log tracking. We take the first
     // address; the rest go into to_extra on the EmailMessage.
     let primary = match recipients.first() {
         Some(r) => r,
@@ -272,7 +313,21 @@ pub async fn process_group(
         }
     };
 
-    // ── 0. Validate all To: addresses ────────────────────────────────────────
+    // ── 0a. Recipient count guard (defence-in-depth) ─────────────────────────
+    // The runner enforces `max_recipients_per_event` before calling this
+    // function, so this path is normally unreachable.  The check is duplicated
+    // here so that any future call-site that bypasses the runner guard (e.g. a
+    // test harness, a new code path) still hits a hard ceiling before any
+    // allocations, DB writes, or network calls are made.
+    if recipients.len() > MAX_GROUP_RECIPIENTS {
+        return RecipientOutcome::Failed(AppError::permanent_mailer(format!(
+            "group send: recipient count {} exceeds maximum allowed ({})",
+            recipients.len(),
+            MAX_GROUP_RECIPIENTS,
+        )));
+    }
+
+    // ── 0b. Validate all To: addresses ───────────────────────────────────────
     for r in recipients {
         if !is_valid_email(&r.email) {
             return RecipientOutcome::Failed(AppError::permanent_mailer(format!(
@@ -283,7 +338,11 @@ pub async fn process_group(
     }
 
     // ── 1. Template lookup ───────────────────────────────────────────────────
-    let prefetched_template = match ctx.template_store.resolve(&event.event_type).await {
+    let prefetched_template = match ctx
+        .template_store
+        .resolve(&event.event_type, CHANNEL_EMAIL)
+        .await
+    {
         Ok(t) => t,
         Err(e) => return RecipientOutcome::Failed(e),
     };
@@ -307,7 +366,7 @@ pub async fn process_group(
         }
     }
 
-    // ── 3. Idempotency — track via primary recipient ─────────────────────────
+    // ── 3. Idempotency ───────────────────────────────────────────────────────
     let from_override_json = email_opts
         .from_override
         .as_ref()
@@ -328,53 +387,90 @@ pub async fn process_group(
         serde_json::to_value(&email_opts.bcc).ok()
     };
 
-    match ctx
-        .store
-        .insert_pending(InsertPendingArgs {
+    // Helper function to build EmailInsertPendingArgs for a given recipient.
+    #[allow(clippy::too_many_arguments)]
+    fn make_args<'a>(
+        r: &'a Recipient,
+        event: &'a NotificationEvent,
+        email_opts: &'a common::EmailOptions,
+        from_override_json: Option<&'a serde_json::Value>,
+        attachments_json: Option<&'a serde_json::Value>,
+        cc_json: Option<&'a serde_json::Value>,
+        bcc_json: Option<&'a serde_json::Value>,
+    ) -> EmailInsertPendingArgs<'a> {
+        EmailInsertPendingArgs {
             event_id: event.event_id,
             event_type: &event.event_type,
-            recipient_email: &primary.email,
-            recipient_name: primary.name.as_deref(),
+            recipient_email: &r.email,
+            recipient_name: r.name.as_deref(),
             payload: &event.payload,
-            from_override: from_override_json.as_ref(),
-            attachments: attachments_json.as_ref(),
+            from_override: from_override_json,
+            attachments: attachments_json,
             sender_account: email_opts.sender_account.as_deref(),
-            cc: cc_json.as_ref(),
-            bcc: bcc_json.as_ref(),
+            cc: cc_json,
+            bcc: bcc_json,
             send_mode: email_opts.send_mode.as_str(),
             event_timestamp: event.timestamp,
-        })
+        }
+    }
+
+    // Always insert the primary row first.
+    let primary_insert = match ctx
+        .store
+        .insert_pending(&make_args(
+            primary,
+            event,
+            email_opts,
+            from_override_json.as_ref(),
+            attachments_json.as_ref(),
+            cc_json.as_ref(),
+            bcc_json.as_ref(),
+        ))
         .await
     {
-        Ok(InsertResult::Inserted) => {}
-        Ok(InsertResult::Duplicate {
+        Ok(r) => r,
+        Err(e) => return RecipientOutcome::Failed(e),
+    };
+
+    match primary_insert {
+        InsertResult::Duplicate {
             retry_count,
-            status,
-        }) => match status.as_str() {
-            "SENT" | "BLOCKED" => {
+            ref status,
+        } => match NotificationStatus::try_from(status.as_str()) {
+            Ok(NotificationStatus::Sent) | Ok(NotificationStatus::Blocked) => {
                 info!("Group send: skipping already-terminal event");
                 return RecipientOutcome::Skipped;
             }
-            _ => return RecipientOutcome::Duplicate { retry_count },
+            Ok(_) => {
+                return RecipientOutcome::Duplicate { retry_count };
+            }
+            Err(e) => return RecipientOutcome::Failed(e),
         },
-        Err(e) => return RecipientOutcome::Failed(e),
+        InsertResult::Inserted => {}
+    }
+
+    // For GroupRetryMode::Individual, eagerly insert rows for every secondary recipient.
+    if email_opts.group_retry_mode == GroupRetryMode::Individual {
+        for r in recipients.iter().skip(1) {
+            if let Err(e) = ctx
+                .store
+                .insert_pending(&make_args(
+                    r,
+                    event,
+                    email_opts,
+                    from_override_json.as_ref(),
+                    attachments_json.as_ref(),
+                    cc_json.as_ref(),
+                    bcc_json.as_ref(),
+                ))
+                .await
+            {
+                return RecipientOutcome::Failed(e);
+            }
+        }
     }
 
     // ── 4. Recipient filter — applied to all To: addresses ────────────────────
-    // In group mode all addresses share one email.  A blocked address in any
-    // position would receive that email alongside the unblocked recipients, so
-    // we check every To: address before sending.
-    //
-    // If any address is blocked we drop the *entire* group delivery and mark
-    // the primary log row BLOCKED so the event is visible in status queries.
-    // This matches the semantics of CC/BCC validation (a single bad address
-    // fails the whole delivery) and prevents accidental disclosure: sending a
-    // group email with a blocked address in the To: header would expose that
-    // address to all other recipients.
-    //
-    // Operators who need to send to a mixed list where some addresses may be
-    // blocked should use individual send mode so each recipient is tracked and
-    // filtered independently.
     for r in recipients {
         if let Err(AppError::Blocked(reason)) = ctx.filter.check(&r.email) {
             warn!(
@@ -383,10 +479,21 @@ pub async fn process_group(
                 recipient_count = recipients.len(),
                 "Group send: recipient blocked — dropping entire group delivery"
             );
+            // Always mark the primary row blocked.
             let _ = ctx
                 .store
                 .mark_blocked(event.event_id, &primary.email, &reason)
                 .await;
+            // For Individual mode, rows were inserted for every recipient — mark
+            // them all blocked so no row is left stranded in PENDING forever.
+            if email_opts.group_retry_mode == GroupRetryMode::Individual {
+                for other in recipients.iter().filter(|rec| rec.email != primary.email) {
+                    let _ = ctx
+                        .store
+                        .mark_blocked(event.event_id, &other.email, &reason)
+                        .await;
+                }
+            }
             counter!("emails_blocked_total", "event_type" => event.event_type.clone()).increment(1);
             return RecipientOutcome::Blocked(reason);
         }
@@ -404,7 +511,6 @@ pub async fn process_group(
         }
     };
 
-    // Build to_extra from all recipients beyond the first.
     let to_extra: Vec<MailboxRef> = recipients
         .iter()
         .skip(1)
@@ -461,6 +567,12 @@ pub async fn process_group(
         Ok(()) => {
             let elapsed = send_start.elapsed().as_secs_f64();
             let _ = ctx.store.mark_sent(event.event_id, &primary.email).await;
+            // For GroupRetryMode::Individual, also mark every secondary row SENT.
+            if email_opts.group_retry_mode == GroupRetryMode::Individual {
+                for r in recipients.iter().skip(1) {
+                    let _ = ctx.store.mark_sent(event.event_id, &r.email).await;
+                }
+            }
             counter!("emails_sent_total",
                 "event_type" => event.event_type.clone())
             .increment(1);
@@ -477,7 +589,10 @@ pub async fn process_group(
             )
             .increment(1);
             warn!(error = %e, "Group send failed");
-            RecipientOutcome::Failed(e)
+            match email_opts.group_retry_mode {
+                GroupRetryMode::Individual => RecipientOutcome::GroupFailedWithIndividualRows(e),
+                GroupRetryMode::Whole => RecipientOutcome::Failed(e),
+            }
         }
     }
 }
