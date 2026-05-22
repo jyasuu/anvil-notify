@@ -102,6 +102,12 @@ pub async fn process_recipient(
     }
 
     // ── 2b. CC / BCC address validation and filter check (before DB write) ────
+    // Invalid addresses are still a permanent failure — a malformed address
+    // can never be delivered regardless of retry.
+    // Blocked addresses are silently excluded: the email is still sent to the
+    // remaining (non-blocked) CC/BCC recipients and to all TO recipients.
+    // This mirrors how a blocked TO address is handled in individual mode —
+    // it is dropped and logged rather than aborting the whole delivery.
     for r in email_opts.cc.iter().chain(email_opts.bcc.iter()) {
         if !is_valid_email(&r.email) {
             return RecipientOutcome::Failed(AppError::permanent_mailer(format!(
@@ -109,34 +115,88 @@ pub async fn process_recipient(
                 r.email
             )));
         }
-        if let Err(AppError::Blocked(reason)) = ctx.filter.check(&r.email) {
-            return RecipientOutcome::Failed(AppError::permanent_mailer(format!(
-                "cc/bcc address {} is blocked: {reason}",
-                r.email
-            )));
-        }
     }
+    let effective_cc: Vec<_> = email_opts
+        .cc
+        .iter()
+        .filter(|r| match ctx.filter.check(&r.email) {
+            Ok(()) => true,
+            Err(AppError::Blocked(ref reason)) => {
+                warn!(
+                    event_id = %event.event_id,
+                    email    = %r.email,
+                    reason   = %reason,
+                    "CC address blocked by filter — excluding from delivery"
+                );
+                false
+            }
+            Err(_) => true,
+        })
+        .collect();
+    let effective_bcc: Vec<_> = email_opts
+        .bcc
+        .iter()
+        .filter(|r| match ctx.filter.check(&r.email) {
+            Ok(()) => true,
+            Err(AppError::Blocked(ref reason)) => {
+                warn!(
+                    event_id = %event.event_id,
+                    email    = %r.email,
+                    reason   = %reason,
+                    "BCC address blocked by filter — excluding from delivery"
+                );
+                false
+            }
+            Err(_) => true,
+        })
+        .collect();
 
     // ── 3. Idempotency ───────────────────────────────────────────────────────
-    let from_override_json = email_opts
+    // Use map_err + ? rather than .ok() so that a serialization failure
+    // surfaces as a permanent error instead of silently storing NULL and
+    // losing the from_override / attachments / cc / bcc in the DB row.
+    // In practice serde_json::to_value never fails on these well-typed structs,
+    // but making failures loud protects against future field changes.
+    let from_override_json = match email_opts
         .from_override
         .as_ref()
-        .and_then(|o| serde_json::to_value(o).ok());
+        .map(|o| serde_json::to_value(o))
+        .transpose()
+        .map_err(|e| AppError::permanent_mailer(format!("failed to serialize from_override: {e}")))
+    {
+        Ok(v) => v,
+        Err(e) => return RecipientOutcome::Failed(e),
+    };
     let attachments_json = if email_opts.attachments.is_empty() {
         None
     } else {
-        serde_json::to_value(&email_opts.attachments).ok()
+        match serde_json::to_value(&email_opts.attachments)
+            .map_err(|e| AppError::permanent_mailer(format!("failed to serialize attachments: {e}")))
+        {
+            Ok(v) => Some(v),
+            Err(e) => return RecipientOutcome::Failed(e),
+        }
     };
 
     let cc_json = if email_opts.cc.is_empty() {
         None
     } else {
-        serde_json::to_value(&email_opts.cc).ok()
+        match serde_json::to_value(&email_opts.cc)
+            .map_err(|e| AppError::permanent_mailer(format!("failed to serialize cc: {e}")))
+        {
+            Ok(v) => Some(v),
+            Err(e) => return RecipientOutcome::Failed(e),
+        }
     };
     let bcc_json = if email_opts.bcc.is_empty() {
         None
     } else {
-        serde_json::to_value(&email_opts.bcc).ok()
+        match serde_json::to_value(&email_opts.bcc)
+            .map_err(|e| AppError::permanent_mailer(format!("failed to serialize bcc: {e}")))
+        {
+            Ok(v) => Some(v),
+            Err(e) => return RecipientOutcome::Failed(e),
+        }
     };
 
     match ctx
@@ -206,16 +266,14 @@ pub async fn process_recipient(
         from_email_override,
         from_name_override,
         attachments: attachments.to_vec(),
-        cc: email_opts
-            .cc
+        cc: effective_cc
             .iter()
             .map(|r| MailboxRef {
                 email: r.email.clone(),
                 name: r.name.clone(),
             })
             .collect(),
-        bcc: email_opts
-            .bcc
+        bcc: effective_bcc
             .iter()
             .map(|r| MailboxRef {
                 email: r.email.clone(),
@@ -363,6 +421,9 @@ pub async fn process_group(
             )));
         }
     }
+    // Invalid CC/BCC addresses are a permanent failure.
+    // Blocked addresses are silently excluded — the email proceeds to the
+    // remaining recipients.  Same semantics as process_recipient.
     for r in email_opts.cc.iter().chain(email_opts.bcc.iter()) {
         if !is_valid_email(&r.email) {
             return RecipientOutcome::Failed(AppError::permanent_mailer(format!(
@@ -370,33 +431,84 @@ pub async fn process_group(
                 r.email
             )));
         }
-        if let Err(AppError::Blocked(reason)) = ctx.filter.check(&r.email) {
-            return RecipientOutcome::Failed(AppError::permanent_mailer(format!(
-                "cc/bcc address {} is blocked: {reason}",
-                r.email
-            )));
-        }
     }
+    let effective_cc: Vec<_> = email_opts
+        .cc
+        .iter()
+        .filter(|r| match ctx.filter.check(&r.email) {
+            Ok(()) => true,
+            Err(AppError::Blocked(ref reason)) => {
+                warn!(
+                    event_id = %event.event_id,
+                    email    = %r.email,
+                    reason   = %reason,
+                    "CC address blocked by filter — excluding from group delivery"
+                );
+                false
+            }
+            Err(_) => true,
+        })
+        .collect();
+    let effective_bcc: Vec<_> = email_opts
+        .bcc
+        .iter()
+        .filter(|r| match ctx.filter.check(&r.email) {
+            Ok(()) => true,
+            Err(AppError::Blocked(ref reason)) => {
+                warn!(
+                    event_id = %event.event_id,
+                    email    = %r.email,
+                    reason   = %reason,
+                    "BCC address blocked by filter — excluding from group delivery"
+                );
+                false
+            }
+            Err(_) => true,
+        })
+        .collect();
 
     // ── 3. Idempotency ───────────────────────────────────────────────────────
-    let from_override_json = email_opts
+    // Use map_err + ? for the same reason as in process_recipient: failures
+    // should be loud, not silently stored as NULL.
+    let from_override_json = match email_opts
         .from_override
         .as_ref()
-        .and_then(|o| serde_json::to_value(o).ok());
+        .map(|o| serde_json::to_value(o))
+        .transpose()
+        .map_err(|e| AppError::permanent_mailer(format!("failed to serialize from_override: {e}")))
+    {
+        Ok(v) => v,
+        Err(e) => return RecipientOutcome::Failed(e),
+    };
     let attachments_json = if email_opts.attachments.is_empty() {
         None
     } else {
-        serde_json::to_value(&email_opts.attachments).ok()
+        match serde_json::to_value(&email_opts.attachments)
+            .map_err(|e| AppError::permanent_mailer(format!("failed to serialize attachments: {e}")))
+        {
+            Ok(v) => Some(v),
+            Err(e) => return RecipientOutcome::Failed(e),
+        }
     };
     let cc_json = if email_opts.cc.is_empty() {
         None
     } else {
-        serde_json::to_value(&email_opts.cc).ok()
+        match serde_json::to_value(&email_opts.cc)
+            .map_err(|e| AppError::permanent_mailer(format!("failed to serialize cc: {e}")))
+        {
+            Ok(v) => Some(v),
+            Err(e) => return RecipientOutcome::Failed(e),
+        }
     };
     let bcc_json = if email_opts.bcc.is_empty() {
         None
     } else {
-        serde_json::to_value(&email_opts.bcc).ok()
+        match serde_json::to_value(&email_opts.bcc)
+            .map_err(|e| AppError::permanent_mailer(format!("failed to serialize bcc: {e}")))
+        {
+            Ok(v) => Some(v),
+            Err(e) => return RecipientOutcome::Failed(e),
+        }
     };
 
     // Helper function to build EmailInsertPendingArgs for a given recipient.
@@ -543,16 +655,14 @@ pub async fn process_group(
         from_email_override,
         from_name_override,
         attachments: attachments.to_vec(),
-        cc: email_opts
-            .cc
+        cc: effective_cc
             .iter()
             .map(|r| MailboxRef {
                 email: r.email.clone(),
                 name: r.name.clone(),
             })
             .collect(),
-        bcc: email_opts
-            .bcc
+        bcc: effective_bcc
             .iter()
             .map(|r| MailboxRef {
                 email: r.email.clone(),

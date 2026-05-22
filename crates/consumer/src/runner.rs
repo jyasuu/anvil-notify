@@ -32,8 +32,9 @@ use crate::{config::ConsumerConfig, delivery::handle_delivery, processor::Proces
 ///
 /// Replaces "user:password@" with "[redacted]@" so broker host / vhost are
 /// still visible in logs while credentials never appear in plaintext.
-/// Falls back to "[redacted]" for any URL that does not match the expected
-/// scheme so credentials are never accidentally surfaced.
+/// When there is no "@" in the URL (no embedded credentials), the URL is
+/// returned as-is — there is nothing to redact and the broker hostname is
+/// useful in logs.
 fn scrub_amqp_url(url: &str) -> String {
     // amqp[s]://user:pass@host:port/vhost  →  amqp[s]://[redacted]@host:port/vhost
     if let Some(at_pos) = url.find('@') {
@@ -43,7 +44,9 @@ fn scrub_amqp_url(url: &str) -> String {
             return format!("{scheme}[redacted]@{after_at}");
         }
     }
-    "[redacted]".to_string()
+    // No "@" means no embedded credentials — return the URL unchanged so the
+    // broker hostname remains visible in logs (e.g. "amqps://broker.example.com:5671").
+    url.to_owned()
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -368,17 +371,28 @@ async fn declare_topology(
         )
         .await?;
 
-    // Prefetch one message per consumer so the broker doesn't dump the entire
-    // queue onto one instance when multiple replicas are running.
+    // Prefetch exactly max_concurrency messages so the broker queues up as many
+    // messages as the semaphore allows, enabling true parallel message processing.
     //
-    // NOTE: with prefetch=1, the effective concurrency ceiling is
-    // min(1, max_concurrency) = 1, meaning only one AMQP message is in-flight
-    // at a time per process even if max_concurrency is higher. This is
-    // intentional: it prevents memory and DB-connection exhaustion from a burst
-    // of large multi-recipient events. If you want true parallel message
-    // processing, increase prefetch to match max_concurrency and accept the
-    // increased resource pressure during bursts.
-    channel.basic_qos(1, BasicQosOptions::default()).await?;
+    // Previously this was hard-coded to 1, which silently capped throughput to a
+    // single in-flight AMQP message regardless of the max_concurrency setting.
+    // Setting prefetch = max_concurrency means the semaphore in the delivery loop
+    // is the actual back-pressure control: the broker delivers up to
+    // max_concurrency messages, and each is processed concurrently until its
+    // permit is released.
+    //
+    // Trade-off: a burst of max_concurrency large multi-recipient events will
+    // hold max_concurrency semaphore permits simultaneously, so peak memory is:
+    //   max_concurrency × (attachments per event) × max_attachment_bytes
+    // Size your container accordingly (see config/default.toml [amqp]).
+    //
+    // With multiple replicas, each instance independently enforces its own
+    // max_concurrency ceiling via the semaphore; the broker distributes messages
+    // round-robin across consumers.
+    let prefetch = cfg.max_concurrency.min(u16::MAX as usize) as u16;
+    channel
+        .basic_qos(prefetch, BasicQosOptions::default())
+        .await?;
 
     info!(
         queue    = %cfg.queue,

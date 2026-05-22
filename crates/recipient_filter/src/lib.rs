@@ -7,9 +7,20 @@
 //!
 //! For TO recipients a blocked address is recorded as `BLOCKED` in
 //! `notification_log` and the delivery continues for other recipients.
-//! For CC/BCC a blocked address is a permanent failure for the entire
-//! delivery — the event is marked `FAILED` and the operator must fix the
-//! CC/BCC list before retrying.
+//! For CC/BCC a blocked address is silently excluded — it is logged at WARN
+//! level and stripped from the delivery, but does not affect TO recipients
+//! or cause the event to fail.  This keeps CC/BCC semantics consistent
+//! with TO: a blocked address is dropped, not a reason to abort.
+//!
+//! Two operating modes (controlled by config):
+//!
+//! * **Blocklist-only** (default): any address or domain in `blocked_*` is
+//!   dropped; everything else passes.
+//! * **Allowlist mode** (`allowed_emails` or `allowed_domains` is non-empty):
+//!   only addresses that match the allowlist pass; everything else is dropped.
+//!   Useful for staging environments to prevent accidental real sends.
+//!
+//! Both lists are case-insensitive.
 //!
 //! Two operating modes (controlled by config):
 //!

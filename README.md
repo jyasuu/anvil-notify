@@ -265,9 +265,9 @@ SELECT notify_send_email(
 > **CC/BCC semantics:** CC and BCC addresses are included in every delivery for
 > the event but do not get their own `notification_log` rows. They are subject
 > to the same recipient filter (blocklist and allowlist) as TO recipients. A
-> blocked CC or BCC address is a **permanent failure** for the entire delivery —
-> the event is marked `FAILED` and the operator must remove the blocked address
-> before retrying. Per-address retry is not available for CC/BCC.
+> blocked CC or BCC address is **silently excluded** from that delivery — it is
+> logged at WARN level but does not cause the event to fail. TO recipients are
+> unaffected. Per-address retry is not available for CC/BCC.
 
 ## Known limitations
 
