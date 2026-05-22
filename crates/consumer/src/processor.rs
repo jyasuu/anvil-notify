@@ -11,7 +11,9 @@ use mailer::{
 use metrics::{counter, histogram};
 use rate_limiter::MailRateLimiter;
 use recipient_filter::RecipientFilter;
-use store::{InsertPendingArgs, InsertResult, NotificationStore, TemplateStore, CHANNEL_EMAIL};
+use store::{
+    EmailInsertPendingArgs, InsertResult, NotificationStore, TemplateStore, CHANNEL_EMAIL,
+};
 use tracing::{info, instrument, warn};
 
 /// Shared, cheaply-cloneable context passed to every per-recipient processor call.
@@ -133,7 +135,7 @@ pub async fn process_recipient(
 
     match ctx
         .store
-        .insert_pending(&InsertPendingArgs {
+        .insert_pending(&EmailInsertPendingArgs {
             event_id: event.event_id,
             event_type: &event.event_type,
             recipient_email: &recipient.email,
@@ -255,6 +257,19 @@ pub async fn process_recipient(
     }
 }
 
+/// Maximum number of recipients allowed in a single group send.
+///
+/// This is a defence-in-depth guard inside the processor itself.  The primary
+/// enforcement happens in `runner.rs` (`max_recipients_per_event`) before
+/// `process_group` is called, but having the check here ensures the limit is
+/// respected regardless of which call-site invokes this function in the future.
+///
+/// The value intentionally mirrors the runner's default (500) but is not
+/// read from config — it is a hard ceiling baked into the function contract.
+/// If the runner's configured limit is lower (the common case) the runner
+/// guard fires first and this one is never reached.
+pub const MAX_GROUP_RECIPIENTS: usize = 500;
+
 /// Process all recipients as a single group email (group send mode).
 ///
 /// All addresses in `email_opts.recipients` appear together in the `To:`
@@ -298,7 +313,21 @@ pub async fn process_group(
         }
     };
 
-    // ── 0. Validate all To: addresses ────────────────────────────────────────
+    // ── 0a. Recipient count guard (defence-in-depth) ─────────────────────────
+    // The runner enforces `max_recipients_per_event` before calling this
+    // function, so this path is normally unreachable.  The check is duplicated
+    // here so that any future call-site that bypasses the runner guard (e.g. a
+    // test harness, a new code path) still hits a hard ceiling before any
+    // allocations, DB writes, or network calls are made.
+    if recipients.len() > MAX_GROUP_RECIPIENTS {
+        return RecipientOutcome::Failed(AppError::permanent_mailer(format!(
+            "group send: recipient count {} exceeds maximum allowed ({})",
+            recipients.len(),
+            MAX_GROUP_RECIPIENTS,
+        )));
+    }
+
+    // ── 0b. Validate all To: addresses ───────────────────────────────────────
     for r in recipients {
         if !is_valid_email(&r.email) {
             return RecipientOutcome::Failed(AppError::permanent_mailer(format!(
@@ -358,7 +387,7 @@ pub async fn process_group(
         serde_json::to_value(&email_opts.bcc).ok()
     };
 
-    // Helper function to build InsertPendingArgs for a given recipient.
+    // Helper function to build EmailInsertPendingArgs for a given recipient.
     #[allow(clippy::too_many_arguments)]
     fn make_args<'a>(
         r: &'a Recipient,
@@ -368,8 +397,8 @@ pub async fn process_group(
         attachments_json: Option<&'a serde_json::Value>,
         cc_json: Option<&'a serde_json::Value>,
         bcc_json: Option<&'a serde_json::Value>,
-    ) -> InsertPendingArgs<'a> {
-        InsertPendingArgs {
+    ) -> EmailInsertPendingArgs<'a> {
+        EmailInsertPendingArgs {
             event_id: event.event_id,
             event_type: &event.event_type,
             recipient_email: &r.email,

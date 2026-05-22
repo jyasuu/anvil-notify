@@ -255,6 +255,11 @@ async fn main() -> anyhow::Result<()> {
         routing_key: cfg.amqp.routing_key.clone(),
         max_retries: cfg.amqp.max_retries,
         retry_base_ms: cfg.amqp.retry_base_ms,
+        // Memory note: attachment bytes are held in RAM for each in-flight
+        // message from fetch through SMTP delivery.  Worst-case peak:
+        //   max_concurrency × (attachments per event) × max_attachment_bytes
+        // Ensure your container memory limit accounts for this.
+        // See config/default.toml [amqp] max_concurrency and max_attachment_bytes.
         max_concurrency: cfg.amqp.max_concurrency,
         max_attachment_bytes: cfg.max_attachment_bytes,
         max_rl_waits: cfg.amqp.max_rl_waits,

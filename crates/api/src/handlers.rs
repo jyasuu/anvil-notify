@@ -228,6 +228,25 @@ async fn republish_event(
         })
         .unwrap_or(common::SendMode::Individual);
 
+    // Warn when retrying a group-mode event so operators are aware of the
+    // double-send risk.  A group email is retried as a unit: if the original
+    // SMTP delivery accepted the message for some recipients before the
+    // connection dropped, those recipients will receive the email a second time.
+    // This is by design for GroupRetryMode::Whole (the default); Individual mode
+    // avoids it by inserting per-recipient rows and skipping SENT addresses on
+    // re-delivery.  The warning is emitted regardless of group_retry_mode
+    // because the stored value is not persisted (it always restores to the
+    // default on retry), so we cannot distinguish the two modes at this point.
+    if send_mode == common::SendMode::Group {
+        tracing::warn!(
+            %event_id,
+            "Retrying a group-mode event: recipients whose delivery was already \
+             accepted by the SMTP server in a prior attempt may receive a \
+             duplicate email. Consider using group_retry_mode = \"individual\" \
+             in future events to avoid this."
+        );
+    }
+
     // Build the canonical NotificationEvent envelope. Email-specific fields
     // (recipients, attachments, from_override, sender_account, cc, bcc) live
     // inside channel_overrides.email so the envelope stays channel-agnostic.

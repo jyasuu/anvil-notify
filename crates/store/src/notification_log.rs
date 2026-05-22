@@ -51,6 +51,11 @@ pub struct EmailInsertPendingArgs<'a> {
 
 /// Back-compat alias — callers that already use `InsertPendingArgs` by name
 /// continue to compile without changes.
+///
+/// # Deprecated
+/// Prefer [`EmailInsertPendingArgs`] directly. This alias will be removed in a
+/// future release once all call-sites have been updated.
+#[deprecated(since = "0.2.0", note = "use `EmailInsertPendingArgs` directly")]
 pub use EmailInsertPendingArgs as InsertPendingArgs;
 
 // ── Channel constants ─────────────────────────────────────────────────────────

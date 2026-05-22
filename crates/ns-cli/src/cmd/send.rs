@@ -149,7 +149,10 @@ pub async fn run(args: SendArgs, cfg: CliConfig) -> Result<()> {
 
     // ── 7. Confirm ────────────────────────────────────────────────────────────
     // Convenience reference for the preview block below.
-    let email_opts = event.channel_overrides.email.as_ref()
+    let email_opts = event
+        .channel_overrides
+        .email
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("event has no email channel override"))?;
     if !args.yes {
         let to_str: Vec<&str> = recipients.iter().map(|r| r.email.as_str()).collect();
