@@ -220,19 +220,22 @@ pub struct EmailOptions {
     /// Zero or more CC recipients included in every delivery for this event.
     ///
     /// CC addresses are attached as `Cc:` headers and are visible to all
-    /// recipients. They are **not** processed independently: no `notification_log`
-    /// row is created per CC address, they bypass the recipient filter and
-    /// rate-limiter, and they are not individually retried.
+    /// recipients. They are subject to the same recipient filter (blocklist and
+    /// allowlist) as TO recipients. A blocked CC address is a **permanent
+    /// failure** for the entire delivery — the event is marked `FAILED` and the
+    /// operator must remove the blocked address before retrying.
     ///
-    /// Validation (format check) is performed before send; an invalid CC
-    /// address fails the whole delivery permanently.
+    /// CC addresses do not get their own `notification_log` rows and are not
+    /// individually retried. An invalid CC address (format check) also fails the
+    /// whole delivery permanently.
     #[serde(default)]
     pub cc: Vec<Recipient>,
 
     /// Zero or more BCC recipients included in every delivery for this event.
     ///
     /// BCC addresses are passed as `Bcc:` headers and are hidden from other
-    /// recipients. Same processing rules as `cc` apply.
+    /// recipients. The same filter, validation, and failure semantics as `cc`
+    /// apply.
     #[serde(default)]
     pub bcc: Vec<Recipient>,
 

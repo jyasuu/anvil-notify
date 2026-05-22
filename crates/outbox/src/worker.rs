@@ -484,7 +484,8 @@ async fn run_reaper(pool: PgPool, timeout: Duration, shutdown: CancellationToken
             Ok(n)   => tracing::warn!(
                 count = n,
                 timeout_secs = timeout.as_secs(),
-                "Reaper: reset stale IN_PROGRESS rows to PENDING —                  this indicates a previous worker crashed mid-batch"
+                "Reaper: reset stale IN_PROGRESS rows to PENDING — \
+                 this indicates a previous worker crashed mid-batch"
             ),
             Err(e)  => tracing::error!(error = %e, "Reaper: failed to query stale rows"),
         }

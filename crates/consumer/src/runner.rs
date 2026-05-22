@@ -269,6 +269,10 @@ async fn declare_topology(
             }
             Err(ref e) if e.to_string().contains("404") => {
                 // Queue does not exist yet — normal first-run path.
+                //
+                // TODO: replace string-match with a structured lapin error check
+                // when lapin exposes AMQP reply codes directly. The "404" string
+                // is stable in practice but fragile against future lapin changes.
                 info!(
                     queue = queue_name,
                     "Queue does not exist yet — will declare"
@@ -366,6 +370,14 @@ async fn declare_topology(
 
     // Prefetch one message per consumer so the broker doesn't dump the entire
     // queue onto one instance when multiple replicas are running.
+    //
+    // NOTE: with prefetch=1, the effective concurrency ceiling is
+    // min(1, max_concurrency) = 1, meaning only one AMQP message is in-flight
+    // at a time per process even if max_concurrency is higher. This is
+    // intentional: it prevents memory and DB-connection exhaustion from a burst
+    // of large multi-recipient events. If you want true parallel message
+    // processing, increase prefetch to match max_concurrency and accept the
+    // increased resource pressure during bursts.
     channel.basic_qos(1, BasicQosOptions::default()).await?;
 
     info!(

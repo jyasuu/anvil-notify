@@ -188,6 +188,7 @@ dependencies = [
  "chrono",
  "common",
  "lapin",
+ "recipient_filter",
  "serde",
  "serde_json",
  "sqlx",

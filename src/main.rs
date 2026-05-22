@@ -227,6 +227,7 @@ async fn main() -> anyhow::Result<()> {
         template_store: template_store.clone(),
         publisher,
         api_key: cfg.http.api_key.clone(),
+        filter: filter.clone(),
     };
     let router = build_router(api_state);
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.http.port));

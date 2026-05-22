@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-common      = { path = "../common" }
-store       = { path = "../store" }
+common           = { path = "../common" }
+store            = { path = "../store" }
+recipient_filter = { path = "../recipient_filter" }
 
 tokio       = { workspace = true }
 serde       = { workspace = true }

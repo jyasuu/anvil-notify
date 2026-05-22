@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use recipient_filter::RecipientFilter;
 use store::{NotificationStore, TemplateStore};
 
 use crate::publisher::Publisher;
@@ -14,4 +15,8 @@ pub struct ApiState {
     /// Set via `AN__HTTP__API_KEY` env var or `http.api_key` in config.
     /// Leave `None` (default) only when the API is network-isolated.
     pub api_key: Option<String>,
+    /// Recipient filter used to validate CC/BCC addresses before re-enqueuing.
+    /// Prevents the retry API from accepting events that the consumer would
+    /// immediately reject with a permanent CC/BCC-blocked failure.
+    pub filter: RecipientFilter,
 }

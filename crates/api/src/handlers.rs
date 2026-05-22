@@ -247,6 +247,20 @@ async fn republish_event(
         );
     }
 
+    // Validate CC/BCC addresses against the recipient filter before re-enqueuing.
+    // Without this, the retry API would accept the request, publish the event,
+    // and the consumer would immediately produce a permanent CC/BCC-blocked failure —
+    // a wasted round-trip and confusing operator experience.
+    for r in cc.iter().chain(bcc.iter()) {
+        if let Err(common::AppError::Blocked(reason)) = state.filter.check(&r.email) {
+            return Err(ApiError(AppError::permanent_mailer(format!(
+                "cc/bcc address {} is blocked: {reason}. \
+                 Remove the blocked address before retrying.",
+                r.email
+            ))));
+        }
+    }
+
     // Build the canonical NotificationEvent envelope. Email-specific fields
     // (recipients, attachments, from_override, sender_account, cc, bcc) live
     // inside channel_overrides.email so the envelope stays channel-agnostic.

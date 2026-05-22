@@ -576,6 +576,8 @@ pub(crate) async fn process_one_group(
                         .await;
                     });
                 }
+                let recipient_count = email_opts.recipients.len();
+                let mut panics = 0usize;
                 while let Some(result) = join_set.join_next().await {
                     if let Err(e) = result {
                         error!(
@@ -583,7 +585,22 @@ pub(crate) async fn process_one_group(
                             error    = %e,
                             "Individual-retry task panicked during group-send fallback"
                         );
+                        panics += 1;
                     }
+                }
+                if panics > 0 {
+                    error!(
+                        event_id        = %event.event_id,
+                        recipient_count,
+                        panics,
+                        "Group-send individual fallback complete — some tasks panicked"
+                    );
+                } else {
+                    tracing::info!(
+                        event_id        = %event.event_id,
+                        recipient_count,
+                        "Group-send individual fallback complete"
+                    );
                 }
                 return;
             }
