@@ -101,11 +101,17 @@ pub async fn process_recipient(
         }
     }
 
-    // ── 2b. CC / BCC address validation (before DB write) ───────────────────
+    // ── 2b. CC / BCC address validation and filter check (before DB write) ────
     for r in email_opts.cc.iter().chain(email_opts.bcc.iter()) {
         if !is_valid_email(&r.email) {
             return RecipientOutcome::Failed(AppError::permanent_mailer(format!(
                 "invalid cc/bcc email address: {}",
+                r.email
+            )));
+        }
+        if let Err(AppError::Blocked(reason)) = ctx.filter.check(&r.email) {
+            return RecipientOutcome::Failed(AppError::permanent_mailer(format!(
+                "cc/bcc address {} is blocked: {reason}",
                 r.email
             )));
         }
@@ -347,7 +353,7 @@ pub async fn process_group(
         Err(e) => return RecipientOutcome::Failed(e),
     };
 
-    // ── 2. from_override + cc/bcc validation ─────────────────────────────────
+    // ── 2. from_override + cc/bcc validation and filter check ────────────────
     let (from_email_override, from_name_override) =
         resolve_from_override(email_opts.from_override.as_ref());
     if let Some(ref addr) = from_email_override {
@@ -361,6 +367,12 @@ pub async fn process_group(
         if !is_valid_email(&r.email) {
             return RecipientOutcome::Failed(AppError::permanent_mailer(format!(
                 "invalid cc/bcc email address: {}",
+                r.email
+            )));
+        }
+        if let Err(AppError::Blocked(reason)) = ctx.filter.check(&r.email) {
+            return RecipientOutcome::Failed(AppError::permanent_mailer(format!(
+                "cc/bcc address {} is blocked: {reason}",
                 r.email
             )));
         }

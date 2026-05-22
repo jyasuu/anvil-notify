@@ -5,7 +5,6 @@ pub mod template_store;
 pub use notification_log::{
     EmailInsertPendingArgs,
     EmailNotificationStore,
-    InsertPendingArgs, // back-compat alias for EmailInsertPendingArgs
     InsertResult,
     NotificationStore,
     CHANNEL_EMAIL,

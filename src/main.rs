@@ -189,7 +189,9 @@ async fn main() -> anyhow::Result<()> {
             tracing::warn!(
                 emails_per_second = cfg.rate_limit.emails_per_second,
                 burst_size = cfg.rate_limit.burst_size,
-                "burst_size is less than emails_per_second; steady-state                  throughput will be capped at burst_size, not emails_per_second.                  Consider setting burst_size >= emails_per_second."
+                "burst_size is less than emails_per_second; \
+                 steady-state throughput will be capped at burst_size, not emails_per_second. \
+                 Consider setting burst_size >= emails_per_second."
             );
         }
     }

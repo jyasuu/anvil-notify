@@ -28,6 +28,7 @@ A production-grade Rust microservice implementing the **Transactional Outbox + N
 | `mailer`   | `EmailSender` trait + SMTP & webhook impls        |
 | `consumer` | RabbitMQ consumer loop with retry/backoff         |
 | `api`      | Axum HTTP API (status, retry, health)             |
+| `ns-cli`   | CLI tool: `send`, `retry`, `status`, `template flush` |
 
 ## Quick start
 
@@ -262,9 +263,11 @@ SELECT notify_send_email(
 |  |  | — | Idempotency key; auto-generated if omitted |
 
 > **CC/BCC semantics:** CC and BCC addresses are included in every delivery for
-> the event but do not get their own  rows. They bypass the recipient
-> filter, the rate-limiter, and per-address retry. An invalid address in either
-> list fails the entire delivery permanently.
+> the event but do not get their own `notification_log` rows. They are subject
+> to the same recipient filter (blocklist and allowlist) as TO recipients. A
+> blocked CC or BCC address is a **permanent failure** for the entire delivery —
+> the event is marked `FAILED` and the operator must remove the blocked address
+> before retrying. Per-address retry is not available for CC/BCC.
 
 ## Known limitations
 

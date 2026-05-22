@@ -49,14 +49,7 @@ pub struct EmailInsertPendingArgs<'a> {
     pub send_mode: &'a str,
 }
 
-/// Back-compat alias — callers that already use `InsertPendingArgs` by name
-/// continue to compile without changes.
-///
-/// # Deprecated
-/// Prefer [`EmailInsertPendingArgs`] directly. This alias will be removed in a
-/// future release once all call-sites have been updated.
-#[deprecated(since = "0.2.0", note = "use `EmailInsertPendingArgs` directly")]
-pub use EmailInsertPendingArgs as InsertPendingArgs;
+
 
 // ── Channel constants ─────────────────────────────────────────────────────────
 
@@ -76,7 +69,7 @@ pub trait NotificationStore: Send + Sync + 'static {
     /// Returns `InsertResult::Inserted` for a new row, or
     /// `InsertResult::Duplicate { retry_count, status }` when the idempotency
     /// key `(event_id, channel, recipient_id)` already exists.
-    async fn insert_pending(&self, args: &InsertPendingArgs<'_>) -> Result<InsertResult, AppError>;
+    async fn insert_pending(&self, args: &EmailInsertPendingArgs<'_>) -> Result<InsertResult, AppError>;
 
     /// Mark a delivery as successfully sent.
     async fn mark_sent(&self, event_id: Uuid, recipient_id: &str) -> Result<(), AppError>;
@@ -146,7 +139,7 @@ impl EmailNotificationStore {
 #[async_trait::async_trait]
 impl NotificationStore for EmailNotificationStore {
     #[instrument(skip(self, args))]
-    async fn insert_pending(&self, args: &InsertPendingArgs<'_>) -> Result<InsertResult, AppError> {
+    async fn insert_pending(&self, args: &EmailInsertPendingArgs<'_>) -> Result<InsertResult, AppError> {
         let mut tx = self.pool.begin().await?;
 
         // ── 1. Upsert into notification_log (channel-agnostic) ────────────────

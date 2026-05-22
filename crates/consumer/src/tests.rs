@@ -332,4 +332,160 @@ mod processor_tests {
         assert!(EmailStatus::try_from("pending").is_err());
         assert!(EmailStatus::try_from("sent").is_err());
     }
+
+    // ── CC/BCC filter enforcement tests ───────────────────────────────────────
+
+    /// Helper: build an event whose CC or BCC contains the given address.
+    fn make_event_with_cc_bcc(
+        recipient_email: &str,
+        cc: Vec<&str>,
+        bcc: Vec<&str>,
+    ) -> NotificationEvent {
+        NotificationEvent {
+            event_id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            event_type: "ORDER_CONFIRMATION".into(),
+            payload: json!({ "orderId": "42", "amount": "9.99", "name": "Test User" }),
+            metadata: Default::default(),
+            channel_overrides: ChannelOverrides {
+                email: Some(EmailOptions {
+                    recipients: vec![Recipient {
+                        email: recipient_email.into(),
+                        name: Some("Test User".into()),
+                    }],
+                    cc: cc
+                        .into_iter()
+                        .map(|e| Recipient { email: e.into(), name: None })
+                        .collect(),
+                    bcc: bcc
+                        .into_iter()
+                        .map(|e| Recipient { email: e.into(), name: None })
+                        .collect(),
+                    from_override: None,
+                    attachments: vec![],
+                    sender_account: None,
+                    send_mode: common::SendMode::Individual,
+                    group_retry_mode: common::GroupRetryMode::Individual,
+                    retry_policy: common::RetryPolicy::Retry,
+                }),
+            },
+        }
+    }
+
+    /// Verifies that a blocked CC address causes the delivery to fail (permanent).
+    #[test]
+    fn blocked_cc_address_is_rejected_by_filter() {
+        use recipient_filter::FilterConfig;
+        let filter = RecipientFilter::new(FilterConfig {
+            blocked_emails: vec!["blocked@example.com".into()],
+            ..Default::default()
+        });
+
+        let event = make_event_with_cc_bcc(
+            "to@example.com",
+            vec!["blocked@example.com"], // CC contains a blocked address
+            vec![],
+        );
+        let email_opts = event
+            .channel_overrides
+            .email
+            .as_ref()
+            .unwrap();
+
+        // Simulate the filter check that processor.rs performs on CC/BCC.
+        let mut hit_blocked = false;
+        for r in email_opts.cc.iter().chain(email_opts.bcc.iter()) {
+            if let Err(common::AppError::Blocked(_)) = filter.check(&r.email) {
+                hit_blocked = true;
+            }
+        }
+        assert!(hit_blocked, "blocked CC address should have been caught by the filter");
+    }
+
+    /// Verifies that a blocked BCC address also causes a filter hit.
+    #[test]
+    fn blocked_bcc_address_is_rejected_by_filter() {
+        use recipient_filter::FilterConfig;
+        let filter = RecipientFilter::new(FilterConfig {
+            blocked_domains: vec!["blocked.io".into()],
+            ..Default::default()
+        });
+
+        let event = make_event_with_cc_bcc(
+            "to@safe.com",
+            vec![],
+            vec!["audit@blocked.io"], // BCC domain is blocked
+        );
+        let email_opts = event
+            .channel_overrides
+            .email
+            .as_ref()
+            .unwrap();
+
+        let mut hit_blocked = false;
+        for r in email_opts.cc.iter().chain(email_opts.bcc.iter()) {
+            if let Err(common::AppError::Blocked(_)) = filter.check(&r.email) {
+                hit_blocked = true;
+            }
+        }
+        assert!(hit_blocked, "blocked BCC domain address should have been caught by the filter");
+    }
+
+    /// Verifies that allowlist mode also blocks CC/BCC addresses not on the list.
+    #[test]
+    fn allowlist_mode_blocks_unlisted_cc_address() {
+        use recipient_filter::FilterConfig;
+        let filter = RecipientFilter::new(FilterConfig {
+            allowed_domains: vec!["mycompany.com".into()],
+            ..Default::default()
+        });
+
+        let event = make_event_with_cc_bcc(
+            "employee@mycompany.com",
+            vec!["external@other.com"], // CC is not on the allowlist
+            vec![],
+        );
+        let email_opts = event
+            .channel_overrides
+            .email
+            .as_ref()
+            .unwrap();
+
+        let mut hit_blocked = false;
+        for r in email_opts.cc.iter().chain(email_opts.bcc.iter()) {
+            if let Err(common::AppError::Blocked(_)) = filter.check(&r.email) {
+                hit_blocked = true;
+            }
+        }
+        assert!(hit_blocked, "CC address outside allowlist should be blocked");
+    }
+
+    /// Verifies that a clean (non-blocked) CC address passes through the filter.
+    #[test]
+    fn clean_cc_address_passes_filter() {
+        use recipient_filter::FilterConfig;
+        let filter = RecipientFilter::new(FilterConfig {
+            blocked_emails: vec!["blocked@example.com".into()],
+            ..Default::default()
+        });
+
+        let event = make_event_with_cc_bcc(
+            "to@example.com",
+            vec!["safe@example.com"],
+            vec!["also-safe@example.com"],
+        );
+        let email_opts = event
+            .channel_overrides
+            .email
+            .as_ref()
+            .unwrap();
+
+        for r in email_opts.cc.iter().chain(email_opts.bcc.iter()) {
+            assert!(
+                filter.check(&r.email).is_ok(),
+                "clean CC/BCC address {} should pass the filter",
+                r.email
+            );
+        }
+    }
 }
