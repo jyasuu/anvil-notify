@@ -101,7 +101,15 @@ pub async fn process_recipient(
         }
     }
 
-    // ── 2b. CC / BCC address validation (before DB write) ───────────────────
+    // ── 2b. CC / BCC address validation and filter check (before DB write) ────
+    // Invalid addresses are still a permanent failure — a malformed address
+    // can never be delivered regardless of retry.
+    // Blocked addresses are excluded and logged at WARN level; delivery
+    // continues for the remaining CC/BCC recipients and all TO recipients.
+    // NOTE: blocked CC/BCC addresses do NOT get a notification_log row — only
+    // the WARN log line below serves as the audit record.  If per-address
+    // CC/BCC audit trails are required, consult the structured logs for
+    // events with field email=<address> and message="CC address blocked".
     for r in email_opts.cc.iter().chain(email_opts.bcc.iter()) {
         if !is_valid_email(&r.email) {
             return RecipientOutcome::Failed(AppError::permanent_mailer(format!(
@@ -110,27 +118,105 @@ pub async fn process_recipient(
             )));
         }
     }
+    let effective_cc: Vec<_> = email_opts
+        .cc
+        .iter()
+        .filter(|r| match ctx.filter.check(&r.email) {
+            Ok(()) => true,
+            Err(AppError::Blocked(ref reason)) => {
+                warn!(
+                    event_id = %event.event_id,
+                    email    = %r.email,
+                    reason   = %reason,
+                    "CC address blocked by filter — excluding from delivery"
+                );
+                false
+            }
+            // Unexpected non-Blocked errors are treated as pass-through (fail-open):
+            // an unknown filter error should never silently drop a CC recipient.
+            Err(_) => true,
+        })
+        .collect();
+    let effective_bcc: Vec<_> = email_opts
+        .bcc
+        .iter()
+        .filter(|r| match ctx.filter.check(&r.email) {
+            Ok(()) => true,
+            Err(AppError::Blocked(ref reason)) => {
+                warn!(
+                    event_id = %event.event_id,
+                    email    = %r.email,
+                    reason   = %reason,
+                    "BCC address blocked by filter — excluding from delivery"
+                );
+                false
+            }
+            // Unexpected non-Blocked errors are treated as pass-through (fail-open):
+            // an unknown filter error should never silently drop a BCC recipient.
+            Err(_) => true,
+        })
+        .collect();
 
     // ── 3. Idempotency ───────────────────────────────────────────────────────
-    let from_override_json = email_opts
+    // Use map_err + ? rather than .ok() so that a serialization failure
+    // surfaces as a permanent error instead of silently storing NULL and
+    // losing the from_override / attachments / cc / bcc in the DB row.
+    // In practice serde_json::to_value never fails on these well-typed structs,
+    // but making failures loud protects against future field changes.
+    let from_override_json = match email_opts
         .from_override
         .as_ref()
-        .and_then(|o| serde_json::to_value(o).ok());
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|e| AppError::permanent_mailer(format!("failed to serialize from_override: {e}")))
+    {
+        Ok(v) => v,
+        Err(e) => return RecipientOutcome::Failed(e),
+    };
     let attachments_json = if email_opts.attachments.is_empty() {
         None
     } else {
-        serde_json::to_value(&email_opts.attachments).ok()
+        match serde_json::to_value(&email_opts.attachments).map_err(|e| {
+            AppError::permanent_mailer(format!("failed to serialize attachments: {e}"))
+        }) {
+            Ok(v) => Some(v),
+            Err(e) => return RecipientOutcome::Failed(e),
+        }
     };
 
-    let cc_json = if email_opts.cc.is_empty() {
+    // Serialize the post-filter (effective) CC/BCC lists so the DB record
+    // accurately reflects what was actually delivered, not the raw unfiltered
+    // input.  Storing pre-filter lists would show addresses that were never
+    // delivered to, and would waste a filter cycle on every retry.
+    let cc_json = if effective_cc.is_empty() {
         None
     } else {
-        serde_json::to_value(&email_opts.cc).ok()
+        match serde_json::to_value(
+            effective_cc
+                .iter()
+                .map(|r| serde_json::json!({"email": r.email, "name": r.name}))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| AppError::permanent_mailer(format!("failed to serialize cc: {e}")))
+        {
+            Ok(v) => Some(v),
+            Err(e) => return RecipientOutcome::Failed(e),
+        }
     };
-    let bcc_json = if email_opts.bcc.is_empty() {
+    let bcc_json = if effective_bcc.is_empty() {
         None
     } else {
-        serde_json::to_value(&email_opts.bcc).ok()
+        match serde_json::to_value(
+            effective_bcc
+                .iter()
+                .map(|r| serde_json::json!({"email": r.email, "name": r.name}))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| AppError::permanent_mailer(format!("failed to serialize bcc: {e}")))
+        {
+            Ok(v) => Some(v),
+            Err(e) => return RecipientOutcome::Failed(e),
+        }
     };
 
     match ctx
@@ -147,6 +233,7 @@ pub async fn process_recipient(
             cc: cc_json.as_ref(),
             bcc: bcc_json.as_ref(),
             send_mode: email_opts.send_mode.as_str(),
+            group_retry_mode: None, // individual mode — group_retry_mode is not applicable
             event_timestamp: event.timestamp,
         })
         .await
@@ -200,16 +287,14 @@ pub async fn process_recipient(
         from_email_override,
         from_name_override,
         attachments: attachments.to_vec(),
-        cc: email_opts
-            .cc
+        cc: effective_cc
             .iter()
             .map(|r| MailboxRef {
                 email: r.email.clone(),
                 name: r.name.clone(),
             })
             .collect(),
-        bcc: email_opts
-            .bcc
+        bcc: effective_bcc
             .iter()
             .map(|r| MailboxRef {
                 email: r.email.clone(),
@@ -219,6 +304,11 @@ pub async fn process_recipient(
     };
 
     // ── 6. Rate-limit token ──────────────────────────────────────────────────
+    // Increment a counter each time we must wait so operators have a Prometheus
+    // signal to alert on when the service is being throttled.
+    counter!("email_rate_limit_waits_total",
+        "event_type" => event.event_type.clone())
+    .increment(1);
     if !ctx.rate_limiter.wait_for_token(shutdown).await {
         return RecipientOutcome::Failed(AppError::Queue(
             "service shutdown during rate-limit wait".into(),
@@ -235,7 +325,20 @@ pub async fn process_recipient(
     match sender.send(&msg).await {
         Ok(()) => {
             let elapsed = send_start.elapsed().as_secs_f64();
-            let _ = ctx.store.mark_sent(event.event_id, &recipient.email).await;
+            // IMPORTANT: mark_sent failure after a successful SMTP send means
+            // the email was delivered but the row stays PENDING.  On AMQP
+            // re-delivery the idempotency check will see PENDING (Duplicate)
+            // and re-send, producing a duplicate.  Log at WARN so the operator
+            // can inspect and manually mark the row SENT if needed.
+            if let Err(e) = ctx.store.mark_sent(event.event_id, &recipient.email).await {
+                warn!(
+                    event_id = %event.event_id,
+                    email    = %recipient.email,
+                    error    = %e,
+                    "Email delivered but mark_sent DB write failed — \
+                     row remains PENDING; re-delivery will attempt to re-send"
+                );
+            }
             counter!("emails_sent_total",
                 "event_type" => event.event_type.clone())
             .increment(1);
@@ -347,7 +450,7 @@ pub async fn process_group(
         Err(e) => return RecipientOutcome::Failed(e),
     };
 
-    // ── 2. from_override + cc/bcc validation ─────────────────────────────────
+    // ── 2. from_override + cc/bcc validation and filter check ────────────────
     let (from_email_override, from_name_override) =
         resolve_from_override(email_opts.from_override.as_ref());
     if let Some(ref addr) = from_email_override {
@@ -357,6 +460,12 @@ pub async fn process_group(
             )));
         }
     }
+    // Invalid CC/BCC addresses are a permanent failure.
+    // Blocked addresses are excluded and logged at WARN level; delivery
+    // continues for the remaining CC/BCC recipients and all allowed TO
+    // recipients.  Same semantics as process_recipient.  Blocked CC/BCC do
+    // NOT get notification_log rows; consult structured logs
+    // (email=<addr>, message="CC address blocked") for the audit trail.
     for r in email_opts.cc.iter().chain(email_opts.bcc.iter()) {
         if !is_valid_email(&r.email) {
             return RecipientOutcome::Failed(AppError::permanent_mailer(format!(
@@ -365,26 +474,105 @@ pub async fn process_group(
             )));
         }
     }
+    let effective_cc: Vec<_> = email_opts
+        .cc
+        .iter()
+        .filter(|r| match ctx.filter.check(&r.email) {
+            Ok(()) => true,
+            Err(AppError::Blocked(ref reason)) => {
+                warn!(
+                    event_id = %event.event_id,
+                    email    = %r.email,
+                    reason   = %reason,
+                    "CC address blocked by filter — excluding from group delivery"
+                );
+                false
+            }
+            // Unexpected non-Blocked errors are treated as pass-through (fail-open):
+            // an unknown filter error should never silently drop a CC recipient.
+            Err(_) => true,
+        })
+        .collect();
+    let effective_bcc: Vec<_> = email_opts
+        .bcc
+        .iter()
+        .filter(|r| match ctx.filter.check(&r.email) {
+            Ok(()) => true,
+            Err(AppError::Blocked(ref reason)) => {
+                warn!(
+                    event_id = %event.event_id,
+                    email    = %r.email,
+                    reason   = %reason,
+                    "BCC address blocked by filter — excluding from group delivery"
+                );
+                false
+            }
+            // Unexpected non-Blocked errors are treated as pass-through (fail-open):
+            // an unknown filter error should never silently drop a BCC recipient.
+            Err(_) => true,
+        })
+        .collect();
 
     // ── 3. Idempotency ───────────────────────────────────────────────────────
-    let from_override_json = email_opts
+    // Use map_err + ? for the same reason as in process_recipient: failures
+    // should be loud, not silently stored as NULL.
+    let from_override_json = match email_opts
         .from_override
         .as_ref()
-        .and_then(|o| serde_json::to_value(o).ok());
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|e| AppError::permanent_mailer(format!("failed to serialize from_override: {e}")))
+    {
+        Ok(v) => v,
+        Err(e) => return RecipientOutcome::Failed(e),
+    };
     let attachments_json = if email_opts.attachments.is_empty() {
         None
     } else {
-        serde_json::to_value(&email_opts.attachments).ok()
+        match serde_json::to_value(&email_opts.attachments).map_err(|e| {
+            AppError::permanent_mailer(format!("failed to serialize attachments: {e}"))
+        }) {
+            Ok(v) => Some(v),
+            Err(e) => return RecipientOutcome::Failed(e),
+        }
     };
-    let cc_json = if email_opts.cc.is_empty() {
+    // Serialize the post-filter (effective) CC/BCC lists so the DB record
+    // accurately reflects what was actually delivered, not the raw unfiltered
+    // input.  Storing pre-filter lists would show addresses that were never
+    // delivered to, and would waste a filter cycle on every retry.
+    let cc_json = if effective_cc.is_empty() {
         None
     } else {
-        serde_json::to_value(&email_opts.cc).ok()
+        match serde_json::to_value(
+            effective_cc
+                .iter()
+                .map(|r| serde_json::json!({"email": r.email, "name": r.name}))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| AppError::permanent_mailer(format!("failed to serialize cc: {e}")))
+        {
+            Ok(v) => Some(v),
+            Err(e) => return RecipientOutcome::Failed(e),
+        }
     };
-    let bcc_json = if email_opts.bcc.is_empty() {
+    let bcc_json = if effective_bcc.is_empty() {
         None
     } else {
-        serde_json::to_value(&email_opts.bcc).ok()
+        match serde_json::to_value(
+            effective_bcc
+                .iter()
+                .map(|r| serde_json::json!({"email": r.email, "name": r.name}))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| AppError::permanent_mailer(format!("failed to serialize bcc: {e}")))
+        {
+            Ok(v) => Some(v),
+            Err(e) => return RecipientOutcome::Failed(e),
+        }
+    };
+    let group_retry_mode_str = match email_opts.group_retry_mode {
+        GroupRetryMode::Whole => "whole",
+        GroupRetryMode::Individual => "individual",
     };
 
     // Helper function to build EmailInsertPendingArgs for a given recipient.
@@ -397,6 +585,7 @@ pub async fn process_group(
         attachments_json: Option<&'a serde_json::Value>,
         cc_json: Option<&'a serde_json::Value>,
         bcc_json: Option<&'a serde_json::Value>,
+        group_retry_mode_str: &'a str,
     ) -> EmailInsertPendingArgs<'a> {
         EmailInsertPendingArgs {
             event_id: event.event_id,
@@ -410,6 +599,7 @@ pub async fn process_group(
             cc: cc_json,
             bcc: bcc_json,
             send_mode: email_opts.send_mode.as_str(),
+            group_retry_mode: Some(group_retry_mode_str),
             event_timestamp: event.timestamp,
         }
     }
@@ -425,6 +615,7 @@ pub async fn process_group(
             attachments_json.as_ref(),
             cc_json.as_ref(),
             bcc_json.as_ref(),
+            group_retry_mode_str,
         ))
         .await
     {
@@ -462,6 +653,7 @@ pub async fn process_group(
                     attachments_json.as_ref(),
                     cc_json.as_ref(),
                     bcc_json.as_ref(),
+                    group_retry_mode_str,
                 ))
                 .await
             {
@@ -470,34 +662,56 @@ pub async fn process_group(
         }
     }
 
-    // ── 4. Recipient filter — applied to all To: addresses ────────────────────
+    // ── 4. Recipient filter — partition To: addresses into allowed / blocked ───
+    // Design note — TO vs CC/BCC asymmetry:
+    //   • Blocked TO recipients are excluded from the delivery; if *all* TO
+    //     addresses are blocked the entire group send is dropped.  If only *some*
+    //     are blocked, the mail is delivered to the remaining (allowed) addresses
+    //     and the blocked ones are marked BLOCKED in the DB.
+    //   • Blocked CC/BCC addresses (step 2 above) are silently excluded and
+    //     delivery always continues — silencing a whole delivery for one unwanted
+    //     copy recipient would be disproportionate.
+    //   Operators: to recover from an all-blocked drop, remove the blocked TO
+    //   addresses from the event payload and re-publish, or update the blocklist.
+    let mut allowed_recipients: Vec<&Recipient> = Vec::with_capacity(recipients.len());
     for r in recipients {
-        if let Err(AppError::Blocked(reason)) = ctx.filter.check(&r.email) {
-            warn!(
-                blocked_email = %r.email,
-                reason = %reason,
-                recipient_count = recipients.len(),
-                "Group send: recipient blocked — dropping entire group delivery"
-            );
-            // Always mark the primary row blocked.
-            let _ = ctx
-                .store
-                .mark_blocked(event.event_id, &primary.email, &reason)
-                .await;
-            // For Individual mode, rows were inserted for every recipient — mark
-            // them all blocked so no row is left stranded in PENDING forever.
-            if email_opts.group_retry_mode == GroupRetryMode::Individual {
-                for other in recipients.iter().filter(|rec| rec.email != primary.email) {
-                    let _ = ctx
-                        .store
-                        .mark_blocked(event.event_id, &other.email, &reason)
-                        .await;
-                }
+        match ctx.filter.check(&r.email) {
+            Ok(()) => allowed_recipients.push(r),
+            Err(AppError::Blocked(ref reason)) => {
+                warn!(
+                    blocked_email = %r.email,
+                    reason = %reason,
+                    recipient_count = recipients.len(),
+                    "Group send: TO recipient blocked — excluding from delivery"
+                );
+                let _ = ctx
+                    .store
+                    .mark_blocked(event.event_id, &r.email, reason)
+                    .await;
+                counter!("emails_blocked_total", "event_type" => event.event_type.clone())
+                    .increment(1);
             }
-            counter!("emails_blocked_total", "event_type" => event.event_type.clone()).increment(1);
-            return RecipientOutcome::Blocked(reason);
+            // Non-Blocked filter errors are treated as pass-through (fail-open)
+            // so an unexpected filter error never silently drops a recipient.
+            Err(_) => allowed_recipients.push(r),
         }
     }
+
+    // If every TO address was blocked there is nothing left to send.
+    if allowed_recipients.is_empty() {
+        // The primary row was already marked BLOCKED in the loop above.
+        // For Individual mode, all other rows were also marked there.
+        warn!(
+            event_id = %event.event_id,
+            "Group send: all TO recipients blocked — dropping delivery"
+        );
+        return RecipientOutcome::Blocked("all TO recipients blocked by filter".into());
+    }
+
+    // Shadow `recipients` so the rest of the function operates only on the
+    // allowed subset — template rendering, EmailMessage construction, DB
+    // mark_sent calls, and the `to_count` log field all stay consistent.
+    let recipients = allowed_recipients;
 
     // ── 5. Template rendering ────────────────────────────────────────────────
     let (subject, body_html, body_text) = match (
@@ -531,16 +745,14 @@ pub async fn process_group(
         from_email_override,
         from_name_override,
         attachments: attachments.to_vec(),
-        cc: email_opts
-            .cc
+        cc: effective_cc
             .iter()
             .map(|r| MailboxRef {
                 email: r.email.clone(),
                 name: r.name.clone(),
             })
             .collect(),
-        bcc: email_opts
-            .bcc
+        bcc: effective_bcc
             .iter()
             .map(|r| MailboxRef {
                 email: r.email.clone(),
@@ -550,6 +762,11 @@ pub async fn process_group(
     };
 
     // ── 6. Rate-limit token ──────────────────────────────────────────────────
+    // Increment a counter each time we must wait so operators have a Prometheus
+    // signal to alert on when the service is being throttled.
+    counter!("email_rate_limit_waits_total",
+        "event_type" => event.event_type.clone())
+    .increment(1);
     if !ctx.rate_limiter.wait_for_token(shutdown).await {
         return RecipientOutcome::Failed(AppError::Queue(
             "service shutdown during rate-limit wait".into(),
@@ -566,11 +783,32 @@ pub async fn process_group(
     match sender.send(&msg).await {
         Ok(()) => {
             let elapsed = send_start.elapsed().as_secs_f64();
-            let _ = ctx.store.mark_sent(event.event_id, &primary.email).await;
+            // IMPORTANT: mark_sent failure after a successful SMTP send means
+            // the email was delivered but the row stays PENDING.  On AMQP
+            // re-delivery the idempotency check will see PENDING (Duplicate)
+            // and re-send, producing a duplicate.  Log at WARN so the operator
+            // can inspect and manually mark the row SENT if needed.
+            if let Err(e) = ctx.store.mark_sent(event.event_id, &primary.email).await {
+                warn!(
+                    event_id = %event.event_id,
+                    email    = %primary.email,
+                    error    = %e,
+                    "Group email delivered but mark_sent DB write failed for primary — \
+                     row remains PENDING; re-delivery will attempt to re-send"
+                );
+            }
             // For GroupRetryMode::Individual, also mark every secondary row SENT.
             if email_opts.group_retry_mode == GroupRetryMode::Individual {
                 for r in recipients.iter().skip(1) {
-                    let _ = ctx.store.mark_sent(event.event_id, &r.email).await;
+                    if let Err(e) = ctx.store.mark_sent(event.event_id, &r.email).await {
+                        warn!(
+                            event_id = %event.event_id,
+                            email    = %r.email,
+                            error    = %e,
+                            "Group email delivered but mark_sent DB write failed for secondary recipient — \
+                             row remains PENDING; re-delivery will attempt to re-send"
+                        );
+                    }
                 }
             }
             counter!("emails_sent_total",

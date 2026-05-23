@@ -318,6 +318,52 @@ impl AppConfig {
             bail!("amqp.max_recipients_per_event must be at least 1");
         }
 
+        // Warn when the configured retry_base_ms is so large that even the
+        // *first* retry hits the 30-minute in-process cap.  In that case the
+        // AMQP consumer-timeout deadline becomes the binding constraint, the
+        // un-ACK'd message may be re-queued by the broker, and max_retries
+        // has no practical effect.  The check uses the same cap constant as
+        // delivery.rs (30 min = 1_800_000 ms) so they stay in sync.
+        const MAX_RETRY_DELAY_MS: u64 = 30 * 60 * 1_000;
+        // First retry delay = retry_base_ms * 2^1
+        let first_retry_ms = self
+            .amqp
+            .retry_base_ms
+            .saturating_mul(2)
+            .min(MAX_RETRY_DELAY_MS);
+        if first_retry_ms >= MAX_RETRY_DELAY_MS {
+            bail!(
+                "amqp.retry_base_ms ({}) is so large that the first retry delay \
+                 ({} ms) already hits the 30-minute cap; max_retries has no \
+                 practical effect. Reduce retry_base_ms or keep it ≤ 900_000 ms.",
+                self.amqp.retry_base_ms,
+                first_retry_ms,
+            );
+        }
+        // Also warn (but don't fail) when max_retries * retry_base_ms would
+        // require more than 30 minutes total, since that bounds how long an
+        // un-ACK'd AMQP message can be held.  Operators who need longer hold
+        // times should use an external scheduler rather than in-process retry.
+        let max_total_delay_ms: u64 = (1..=self.amqp.max_retries)
+            .map(|i| {
+                self.amqp
+                    .retry_base_ms
+                    .saturating_mul(1u64 << (i as u64).min(10))
+                    .min(MAX_RETRY_DELAY_MS)
+            })
+            .sum();
+        if max_total_delay_ms > MAX_RETRY_DELAY_MS {
+            // anyhow::bail! would abort startup; this is just a heads-up.
+            tracing::warn!(
+                retry_base_ms = self.amqp.retry_base_ms,
+                max_retries = self.amqp.max_retries,
+                max_total_delay_secs = max_total_delay_ms / 1_000,
+                "amqp.retry_base_ms * 2^max_retries exceeds 30 minutes; \
+                 un-ACK'd AMQP messages will be held for up to 30 min per attempt. \
+                 Consider reducing retry_base_ms or max_retries."
+            );
+        }
+
         // Validate every named sender account at startup so a typo in the
         // config fails fast rather than causing a runtime panic later.
         for (name, acct) in &self.sender_accounts {

@@ -147,11 +147,19 @@ impl TemplateStore {
         )))
     }
 
-    /// Remove a single entry from the cache, forcing the next lookup to
-    /// re-fetch from the database. Useful after an operator edits a template row.
+    /// Remove all cache entries for `event_type` across every channel,
+    /// forcing the next lookup to re-fetch from the database.
+    ///
+    /// Cache keys are stored as `"{channel}:{event_type}"`, so a plain
+    /// `remove(event_type)` would silently miss every entry.  This method
+    /// scans all keys and drops those whose suffix matches `:{event_type}`.
     pub async fn invalidate(&self, event_type: &str) {
-        self.cache.write().await.remove(event_type);
-        info!(event_type, "Template cache entry invalidated");
+        let suffix = format!(":{event_type}");
+        let mut cache = self.cache.write().await;
+        let before = cache.len();
+        cache.retain(|k, _| !k.ends_with(&suffix));
+        let removed = before - cache.len();
+        info!(event_type, removed, "Template cache entries invalidated");
     }
 
     /// Clear the entire cache, forcing all subsequent lookups to hit the DB.

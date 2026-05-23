@@ -107,6 +107,23 @@ pub struct NotificationLog {
     /// `SendMode::Individual` on retry (same default as before group-mode
     /// was introduced).
     pub send_mode: Option<String>,
+
+    /// Retry strategy for group-mode events: `"whole"` or `"individual"`.
+    ///
+    /// `"whole"` — retry the entire group email as a unit.
+    /// `"individual"` — on failure, fall back to per-recipient individual sends,
+    /// skipping addresses that already have a `SENT` row.
+    ///
+    /// Stored so manual retries via the HTTP API use the same retry strategy as
+    /// the original delivery.  Without this, a group event originally published
+    /// with `GroupRetryMode::Individual` (which inserts per-recipient rows and
+    /// skips already-SENT addresses on retry) would be incorrectly retried with
+    /// `GroupRetryMode::Whole` — risking duplicate sends to recipients whose
+    /// delivery was already accepted by the SMTP server.
+    ///
+    /// Nullable for rows written before migration 0028; treated as
+    /// `GroupRetryMode::Whole` on retry (same default as before this column existed).
+    pub group_retry_mode: Option<String>,
     /// The `NotificationEvent.timestamp` written by the business service.
     ///
     /// Distinct from `created_at` (the DB insertion time).  Used by

@@ -319,6 +319,10 @@ pub(crate) async fn process_one_recipient(
                     delay_secs = delay.as_secs(),
                     "Rate-limited — backing off without consuming retry slot"
                 );
+                // mark_failed with exhausted=false sets status to PENDING,
+                // keeping the row recoverable.  The next iteration re-processes
+                // after the backoff delay; on restart the Duplicate path in
+                // process_recipient seeds attempt from the stored retry_count.
                 let _ = ctx
                     .store
                     .mark_failed(event.event_id, &recipient.email, msg, false)
@@ -326,11 +330,11 @@ pub(crate) async fn process_one_recipient(
                 tokio::select! {
                     _ = sleep(delay) => {}
                     _ = shutdown.cancelled() => {
-                        // Shutdown arrived during backoff. The row is already
-                        // PENDING (mark_failed with exhausted=false above), which
-                        // would leave it stuck with no queue message to pick it up.
-                        // Flip it to FAILED so the operator can see it and use the
-                        // retry API after the service restarts.
+                        // Shutdown arrived during backoff.  The row is currently
+                        // PENDING (exhausted=false above), but there is no AMQP
+                        // message left to re-drive it after restart.  Flip it to
+                        // FAILED (exhausted=true) so the operator can see it and
+                        // replay via the retry API.
                         warn!(
                             event_id = %event.event_id,
                             email    = %recipient.email,
@@ -367,20 +371,26 @@ pub(crate) async fn process_one_recipient(
             RecipientOutcome::Failed(ref e) => {
                 attempt += 1;
                 rl_count = 0;
-                // The `.min(10)` caps the *shift* (not `attempt` itself) to prevent
-                // overflow: 1 << 10 = 1024, so with the default retry_base_ms=1000
-                // the maximum single delay is ~17 min.  `attempt` may legitimately
-                // exceed 10 when seeded from a high DB retry_count after a restart,
-                // but the delay stays capped at this ceiling regardless.
+                // The `.min(10)` caps the *shift* (not `attempt` itself) so the
+                // multiplier never exceeds 1024.  `attempt` may legitimately exceed
+                // 10 when seeded from a high DB retry_count after a restart, but
+                // the delay stays capped at this ceiling regardless.
                 //
-                // We additionally clamp the computed delay to 30 minutes so that
-                // a large retry_base_ms (e.g. 5 000 ms × 2^10 ≈ 85 min) does not
-                // strand the un-ACK'd AMQP message beyond any reasonable consumer
-                // timeout.  Operators who need longer hold times should instead
-                // increase max_retries and keep retry_base_ms ≤ 2 000.
+                // saturating_mul prevents silent u64 wrapping when an operator
+                // configures an unusually large retry_base_ms — the product
+                // saturates to u64::MAX and the subsequent MIN clamp brings it back
+                // to MAX_RETRY_DELAY_MS, producing the correct 30-minute ceiling
+                // rather than a wrapped near-zero delay.
+                //
+                // We additionally clamp to 30 minutes so that a large
+                // retry_base_ms does not strand the un-ACK'd AMQP message beyond
+                // any reasonable consumer timeout.  Operators who need longer hold
+                // times should increase max_retries and keep retry_base_ms ≤ 2 000.
                 const MAX_RETRY_DELAY_MS: u64 = 30 * 60 * 1000; // 30 minutes
                 let delay = Duration::from_millis(
-                    (cfg.retry_base_ms * (1 << attempt.min(10))).min(MAX_RETRY_DELAY_MS),
+                    cfg.retry_base_ms
+                        .saturating_mul(1u64 << attempt.min(10))
+                        .min(MAX_RETRY_DELAY_MS),
                 );
                 warn!(
                     event_id = %event.event_id,
@@ -576,6 +586,8 @@ pub(crate) async fn process_one_group(
                         .await;
                     });
                 }
+                let recipient_count = email_opts.recipients.len();
+                let mut panics = 0usize;
                 while let Some(result) = join_set.join_next().await {
                     if let Err(e) = result {
                         error!(
@@ -583,7 +595,22 @@ pub(crate) async fn process_one_group(
                             error    = %e,
                             "Individual-retry task panicked during group-send fallback"
                         );
+                        panics += 1;
                     }
+                }
+                if panics > 0 {
+                    error!(
+                        event_id        = %event.event_id,
+                        recipient_count,
+                        panics,
+                        "Group-send individual fallback complete — some tasks panicked"
+                    );
+                } else {
+                    tracing::info!(
+                        event_id        = %event.event_id,
+                        recipient_count,
+                        "Group-send individual fallback complete"
+                    );
                 }
                 return;
             }
@@ -591,10 +618,12 @@ pub(crate) async fn process_one_group(
             RecipientOutcome::Failed(ref e) => {
                 attempt += 1;
                 rl_count = 0;
-                // Same cap as process_one_recipient — see comment there.
+                // Same cap and saturating_mul as process_one_recipient — see comment there.
                 const MAX_RETRY_DELAY_MS: u64 = 30 * 60 * 1000; // 30 minutes
                 let delay = Duration::from_millis(
-                    (cfg.retry_base_ms * (1 << attempt.min(10))).min(MAX_RETRY_DELAY_MS),
+                    cfg.retry_base_ms
+                        .saturating_mul(1u64 << attempt.min(10))
+                        .min(MAX_RETRY_DELAY_MS),
                 );
                 warn!(
                     event_id = %event.event_id,

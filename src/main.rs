@@ -189,7 +189,9 @@ async fn main() -> anyhow::Result<()> {
             tracing::warn!(
                 emails_per_second = cfg.rate_limit.emails_per_second,
                 burst_size = cfg.rate_limit.burst_size,
-                "burst_size is less than emails_per_second; steady-state                  throughput will be capped at burst_size, not emails_per_second.                  Consider setting burst_size >= emails_per_second."
+                "burst_size is less than emails_per_second; \
+                 steady-state throughput will be capped at burst_size, not emails_per_second. \
+                 Consider setting burst_size >= emails_per_second."
             );
         }
     }
@@ -225,6 +227,7 @@ async fn main() -> anyhow::Result<()> {
         template_store: template_store.clone(),
         publisher,
         api_key: cfg.http.api_key.clone(),
+        filter: filter.clone(),
     };
     let router = build_router(api_state);
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.http.port));

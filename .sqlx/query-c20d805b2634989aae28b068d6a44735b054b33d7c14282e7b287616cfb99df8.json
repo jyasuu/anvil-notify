@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, event_id, event_type, payload\n        FROM   outbox\n        WHERE  status = 'PENDING'\n        ORDER  BY created_at ASC\n        LIMIT  $1\n        FOR    UPDATE SKIP LOCKED\n        ",
+  "query": "\n        SELECT id, event_id, event_type, payload, created_at\n        FROM   outbox\n        WHERE  status = 'PENDING'\n        ORDER  BY created_at ASC\n        LIMIT  $1\n        FOR    UPDATE SKIP LOCKED\n        ",
   "describe": {
     "columns": [
       {
@@ -22,6 +22,11 @@
         "ordinal": 3,
         "name": "payload",
         "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz"
       }
     ],
     "parameters": {
@@ -33,8 +38,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "689eeff3a46559e375e36c956da67ff6c60733535352b8feecbb2a4d658b87e1"
+  "hash": "c20d805b2634989aae28b068d6a44735b054b33d7c14282e7b287616cfb99df8"
 }

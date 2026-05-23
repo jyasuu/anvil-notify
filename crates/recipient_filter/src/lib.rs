@@ -1,8 +1,16 @@
 //! Recipient block/allow-list filter.
 //!
-//! Called in `processor.rs` between idempotency check and template rendering.
-//! Returns `Ok(())` if the recipient may receive email, or
-//! `Err(AppError::Blocked(...))` if it must be silently dropped.
+//! Called in `processor.rs` for every address that will appear in a delivery:
+//! the primary TO recipient, and every CC and BCC address.
+//! Returns `Ok(())` if the address may receive email, or
+//! `Err(AppError::Blocked(...))` if it must be dropped.
+//!
+//! For TO recipients a blocked address is recorded as `BLOCKED` in
+//! `notification_log` and the delivery continues for other recipients.
+//! For CC/BCC a blocked address is silently excluded — it is logged at WARN
+//! level and stripped from the delivery, but does not affect TO recipients
+//! or cause the event to fail.  This keeps CC/BCC semantics consistent
+//! with TO: a blocked address is dropped, not a reason to abort.
 //!
 //! Two operating modes (controlled by config):
 //!

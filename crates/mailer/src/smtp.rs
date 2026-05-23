@@ -406,15 +406,30 @@ fn format_mailbox(
 
 fn classify_smtp_error(err: lettre::transport::smtp::Error) -> AppError {
     // lettre 0.11 exposes boolean predicate methods on Error; the internal
-    // ErrorKind enum and kind() accessor are private.
+    // ErrorKind enum and kind() accessor are private, so we cannot inspect
+    // the numeric SMTP response code directly.
     if err.is_permanent() {
         // 5xx response: bad recipient, auth failure, policy rejection, etc.
         // Will never succeed on retry — route straight to DLQ.
         AppError::permanent_mailer(format!("SMTP {err}"))
     } else if err.is_transient() {
-        // 4xx response: server busy, quota, greylisting — retry later.
-        warn!(smtp_error = %err, "SMTP 4xx transient — treating as rate-limited");
-        AppError::RateLimited(format!("SMTP transient: {err}"))
+        // 4xx response — covers greylisting, server-busy (421), over-quota,
+        // and true rate-limit (429) responses.  We intentionally use
+        // `transient_mailer` here rather than `RateLimited` because:
+        //
+        //  • `RateLimited` applies the rate-limit backoff schedule with a
+        //    separate counter cap (`max_rl_waits`), which may cause premature
+        //    FAILED for a greylisted message or a transient 421 / 450.
+        //  • Without access to the numeric status code we cannot reliably
+        //    distinguish a confirmed 429 quota response from other 4xx causes.
+        //  • Using `transient_mailer` keeps all 4xx on the normal exponential
+        //    retry schedule, which is the safer default.
+        //
+        // If lettre ever exposes the response code, add a specific branch here:
+        //   code 429 → AppError::RateLimited(...)
+        //   code 421 / 450 / 451 → AppError::transient_mailer(...)
+        warn!(smtp_error = %err, "SMTP 4xx transient — scheduling normal retry");
+        AppError::transient_mailer(format!("SMTP transient: {err}"))
     } else if err.is_timeout() || err.is_tls() {
         // Network-level failures — transient, worth retrying.
         AppError::transient_mailer(err.to_string())

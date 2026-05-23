@@ -47,16 +47,11 @@ pub struct EmailInsertPendingArgs<'a> {
     /// Delivery mode: `"individual"` or `"group"`.
     /// Stored so `republish_event()` faithfully replays the original mode.
     pub send_mode: &'a str,
+    /// Retry strategy for group-mode events: `"whole"` or `"individual"`.
+    /// Stored so `republish_event()` faithfully replays the original retry strategy.
+    /// `None` means the field was absent (pre-0028 rows); treated as `"whole"` on retry.
+    pub group_retry_mode: Option<&'a str>,
 }
-
-/// Back-compat alias — callers that already use `InsertPendingArgs` by name
-/// continue to compile without changes.
-///
-/// # Deprecated
-/// Prefer [`EmailInsertPendingArgs`] directly. This alias will be removed in a
-/// future release once all call-sites have been updated.
-#[deprecated(since = "0.2.0", note = "use `EmailInsertPendingArgs` directly")]
-pub use EmailInsertPendingArgs as InsertPendingArgs;
 
 // ── Channel constants ─────────────────────────────────────────────────────────
 
@@ -76,7 +71,10 @@ pub trait NotificationStore: Send + Sync + 'static {
     /// Returns `InsertResult::Inserted` for a new row, or
     /// `InsertResult::Duplicate { retry_count, status }` when the idempotency
     /// key `(event_id, channel, recipient_id)` already exists.
-    async fn insert_pending(&self, args: &InsertPendingArgs<'_>) -> Result<InsertResult, AppError>;
+    async fn insert_pending(
+        &self,
+        args: &EmailInsertPendingArgs<'_>,
+    ) -> Result<InsertResult, AppError>;
 
     /// Mark a delivery as successfully sent.
     async fn mark_sent(&self, event_id: Uuid, recipient_id: &str) -> Result<(), AppError>;
@@ -112,7 +110,11 @@ pub trait NotificationStore: Send + Sync + 'static {
         recipient_id: &str,
     ) -> Result<NotificationLog, AppError>;
 
-    /// Reset a single FAILED row to PENDING for manual replay.
+    /// Reset a single FAILED or BLOCKED row to PENDING for manual replay.
+    ///
+    /// Accepts both `FAILED` and `BLOCKED` terminal states so operators can
+    /// retry a recipient after removing them from the blocklist — previously
+    /// a `BLOCKED` row had no API path to retry and required manual SQL.
     async fn reset_for_retry(&self, event_id: Uuid, recipient_id: &str) -> Result<(), AppError>;
 
     /// Reset ALL FAILED rows for an event to PENDING, returning the
@@ -146,7 +148,10 @@ impl EmailNotificationStore {
 #[async_trait::async_trait]
 impl NotificationStore for EmailNotificationStore {
     #[instrument(skip(self, args))]
-    async fn insert_pending(&self, args: &InsertPendingArgs<'_>) -> Result<InsertResult, AppError> {
+    async fn insert_pending(
+        &self,
+        args: &EmailInsertPendingArgs<'_>,
+    ) -> Result<InsertResult, AppError> {
         let mut tx = self.pool.begin().await?;
 
         // ── 1. Upsert into notification_log (channel-agnostic) ────────────────
@@ -189,8 +194,9 @@ impl NotificationStore for EmailNotificationStore {
             r#"
             INSERT INTO email_notification_log
                 (notification_id, recipient_email, recipient_name,
-                 from_override, sender_account, send_mode, cc, bcc, attachments)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 from_override, sender_account, send_mode, group_retry_mode,
+                 cc, bcc, attachments)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             "#,
             row.id,
             args.recipient_email,
@@ -198,6 +204,7 @@ impl NotificationStore for EmailNotificationStore {
             args.from_override,
             args.sender_account,
             args.send_mode,
+            args.group_retry_mode,
             args.cc,
             args.bcc,
             args.attachments,
@@ -310,6 +317,7 @@ impl NotificationStore for EmailNotificationStore {
                 e.from_override,
                 e.sender_account,
                 e.send_mode,
+                e.group_retry_mode,
                 e.cc,
                 e.bcc,
                 e.attachments
@@ -348,6 +356,7 @@ impl NotificationStore for EmailNotificationStore {
                     cc: r.cc,
                     bcc: r.bcc,
                     send_mode: r.send_mode,
+                    group_retry_mode: r.group_retry_mode,
                     event_timestamp: Some(r.event_timestamp),
                     created_at: r.created_at,
                     updated_at: r.updated_at,
@@ -381,6 +390,7 @@ impl NotificationStore for EmailNotificationStore {
                 e.from_override,
                 e.sender_account,
                 e.send_mode,
+                e.group_retry_mode,
                 e.cc,
                 e.bcc,
                 e.attachments
@@ -415,6 +425,7 @@ impl NotificationStore for EmailNotificationStore {
             cc: r.cc,
             bcc: r.bcc,
             send_mode: r.send_mode,
+            group_retry_mode: r.group_retry_mode,
             event_timestamp: Some(r.event_timestamp),
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -433,7 +444,7 @@ impl NotificationStore for EmailNotificationStore {
              WHERE event_id     = $1
                AND channel      = $2
                AND recipient_id = $3
-               AND status       = 'FAILED'
+               AND status       IN ('FAILED', 'BLOCKED')
             "#,
             event_id,
             CHANNEL_EMAIL,
@@ -444,7 +455,7 @@ impl NotificationStore for EmailNotificationStore {
 
         if result.rows_affected() == 0 {
             return Err(AppError::NotFound(format!(
-                "No FAILED record for {event_id}/{recipient_id}"
+                "No FAILED or BLOCKED record for {event_id}/{recipient_id}"
             )));
         }
         Ok(())

@@ -220,19 +220,32 @@ pub struct EmailOptions {
     /// Zero or more CC recipients included in every delivery for this event.
     ///
     /// CC addresses are attached as `Cc:` headers and are visible to all
-    /// recipients. They are **not** processed independently: no `notification_log`
-    /// row is created per CC address, they bypass the recipient filter and
-    /// rate-limiter, and they are not individually retried.
+    /// recipients. They are subject to the same recipient filter (blocklist and
+    /// allowlist) as TO recipients.
     ///
-    /// Validation (format check) is performed before send; an invalid CC
-    /// address fails the whole delivery permanently.
+    /// A **blocked** CC address is silently excluded from delivery: the
+    /// consumer logs the exclusion at `WARN` level and continues sending to the
+    /// remaining CC/BCC and all TO recipients. Delivery is never aborted for a
+    /// blocked CC address. To audit which CC addresses were stripped, search
+    /// structured logs for `message="CC address blocked"`.
+    ///
+    /// An **invalid** CC address (format check) is still a permanent failure
+    /// for the entire delivery — a malformed address can never be delivered
+    /// regardless of retry.
+    ///
+    /// CC addresses do not get their own `notification_log` rows and are not
+    /// individually retried. The post-filter (effective) CC list is stored in
+    /// the DB so the audit record reflects what was actually delivered.
     #[serde(default)]
     pub cc: Vec<Recipient>,
 
     /// Zero or more BCC recipients included in every delivery for this event.
     ///
     /// BCC addresses are passed as `Bcc:` headers and are hidden from other
-    /// recipients. Same processing rules as `cc` apply.
+    /// recipients. The same filter, validation, and failure semantics as `cc`
+    /// apply: blocked addresses are silently excluded and logged at WARN;
+    /// invalid addresses (format check) are a permanent failure for the whole
+    /// delivery.
     #[serde(default)]
     pub bcc: Vec<Recipient>,
 
