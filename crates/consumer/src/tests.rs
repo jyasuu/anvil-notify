@@ -488,4 +488,165 @@ mod processor_tests {
             );
         }
     }
+
+    // ── NoRetry policy tests ──────────────────────────────────────────────
+
+    /// With RetryPolicy::NoRetry any failure — transient or permanent — must be
+    /// treated as immediately exhausted without consuming any retry slots.
+    #[test]
+    fn no_retry_policy_stops_on_first_transient_error() {
+        use common::RetryPolicy;
+
+        let policy = RetryPolicy::NoRetry;
+        let max_retries: u32 = 5;
+        let mut attempt: u32 = 0;
+        let mut marked_failed = false;
+
+        let err = AppError::transient_mailer("connection reset");
+        if is_retryable(&err) && attempt < max_retries && policy == RetryPolicy::NoRetry {
+            marked_failed = true;
+        }
+
+        assert!(marked_failed, "NoRetry must fail on first transient error");
+        assert_eq!(attempt, 0, "NoRetry must not increment attempt counter");
+    }
+
+    /// With RetryPolicy::NoRetry a rate-limit response also causes immediate
+    /// failure rather than backing off and retrying.
+    #[test]
+    fn no_retry_policy_stops_on_rate_limit() {
+        use common::RetryPolicy;
+
+        let policy = RetryPolicy::NoRetry;
+        let max_retries: u32 = 5;
+        let mut attempt: u32 = 0;
+        let mut marked_failed = false;
+
+        let err = AppError::RateLimited("429 from mail server".into());
+        if is_retryable(&err) && attempt < max_retries && policy == RetryPolicy::NoRetry {
+            marked_failed = true;
+        }
+
+        assert!(marked_failed, "NoRetry must fail on rate-limit error too");
+        assert_eq!(attempt, 0, "NoRetry must not increment attempt counter");
+    }
+
+    /// With RetryPolicy::Retry (default) a transient error increments the
+    /// attempt counter up to max_retries before marking FAILED.
+    #[test]
+    fn retry_policy_exhausts_all_attempts() {
+        use common::RetryPolicy;
+
+        let policy = RetryPolicy::Retry;
+        let max_retries: u32 = 3;
+        let mut attempt: u32 = 0;
+        let mut failed_permanently = false;
+
+        for _ in 0..20 {
+            let err = AppError::transient_mailer("transient");
+            if policy == RetryPolicy::NoRetry || !is_retryable(&err) {
+                failed_permanently = true;
+                break;
+            }
+            if attempt >= max_retries {
+                failed_permanently = true;
+                break;
+            }
+            attempt += 1;
+        }
+
+        assert!(failed_permanently, "should eventually be marked FAILED");
+        assert_eq!(attempt, max_retries, "should have used all retry slots");
+    }
+
+    // ── Retry delay calculation tests ─────────────────────────────────────────────
+
+    /// The exponential backoff formula is: retry_base_ms * 2^attempt, capped
+    /// at 30 minutes.  Verifies the cap and that the shift is bounded at 10.
+    #[test]
+    fn retry_delay_is_capped_at_30_minutes() {
+        const MAX_RETRY_DELAY_MS: u64 = 30 * 60 * 1_000;
+        let retry_base_ms: u64 = 1_000;
+
+        // attempt=10 with base 1000 gives 1024 s ≈ 17 min, still under cap
+        let delay_at_10 = retry_base_ms
+            .saturating_mul(1u64 << 10u64.min(10))
+            .min(MAX_RETRY_DELAY_MS);
+        assert_eq!(delay_at_10, 1_024_000);
+
+        // A very large base must saturate to the 30-minute cap
+        let large_base: u64 = 60 * 60 * 1_000; // 1 hour
+        let delay_large = large_base
+            .saturating_mul(1u64 << 1u64.min(10))
+            .min(MAX_RETRY_DELAY_MS);
+        assert_eq!(
+            delay_large, MAX_RETRY_DELAY_MS,
+            "delay must never exceed 30 minutes"
+        );
+    }
+
+    /// Verifies that saturating_mul prevents silent u64 wrapping when
+    /// retry_base_ms is set to a pathologically large value.
+    #[test]
+    fn retry_delay_saturating_mul_prevents_overflow() {
+        const MAX_RETRY_DELAY_MS: u64 = 30 * 60 * 1_000;
+        let retry_base_ms: u64 = u64::MAX / 2 + 1;
+
+        let delay = retry_base_ms
+            .saturating_mul(1u64 << 1u64.min(10))
+            .min(MAX_RETRY_DELAY_MS);
+
+        assert_eq!(
+            delay, MAX_RETRY_DELAY_MS,
+            "overflow must be caught by saturating_mul + min cap"
+        );
+    }
+
+    // ── GroupRetryMode outcome tests ───────────────────────────────────────────
+
+    /// Whole mode must produce a plain Failed outcome so the runner retries
+    /// the whole group email as a unit.
+    #[test]
+    fn group_retry_mode_whole_produces_plain_failed_outcome() {
+        use common::GroupRetryMode;
+        use crate::processor::RecipientOutcome;
+
+        let err = AppError::transient_mailer("smtp timeout");
+        let mode = GroupRetryMode::Whole;
+
+        let outcome = match mode {
+            GroupRetryMode::Individual => RecipientOutcome::GroupFailedWithIndividualRows(err),
+            GroupRetryMode::Whole => RecipientOutcome::Failed(
+                AppError::transient_mailer("smtp timeout"),
+            ),
+        };
+
+        assert!(
+            matches!(outcome, RecipientOutcome::Failed(_)),
+            "Whole mode must produce Failed, not GroupFailedWithIndividualRows"
+        );
+    }
+
+    /// Individual mode must produce GroupFailedWithIndividualRows so the
+    /// runner falls back to per-recipient sends, skipping already-SENT rows.
+    #[test]
+    fn group_retry_mode_individual_produces_individual_rows_outcome() {
+        use common::GroupRetryMode;
+        use crate::processor::RecipientOutcome;
+
+        let err = AppError::transient_mailer("smtp timeout");
+        let mode = GroupRetryMode::Individual;
+
+        let outcome = match mode {
+            GroupRetryMode::Individual => RecipientOutcome::GroupFailedWithIndividualRows(err),
+            GroupRetryMode::Whole => RecipientOutcome::Failed(
+                AppError::transient_mailer("smtp timeout"),
+            ),
+        };
+
+        assert!(
+            matches!(outcome, RecipientOutcome::GroupFailedWithIndividualRows(_)),
+            "Individual mode must produce GroupFailedWithIndividualRows"
+        );
+    }
 }

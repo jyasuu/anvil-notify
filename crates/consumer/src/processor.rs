@@ -104,10 +104,12 @@ pub async fn process_recipient(
     // ── 2b. CC / BCC address validation and filter check (before DB write) ────
     // Invalid addresses are still a permanent failure — a malformed address
     // can never be delivered regardless of retry.
-    // Blocked addresses are silently excluded: the email is still sent to the
-    // remaining (non-blocked) CC/BCC recipients and to all TO recipients.
-    // This mirrors how a blocked TO address is handled in individual mode —
-    // it is dropped and logged rather than aborting the whole delivery.
+    // Blocked addresses are excluded and logged at WARN level; delivery
+    // continues for the remaining CC/BCC recipients and all TO recipients.
+    // NOTE: blocked CC/BCC addresses do NOT get a notification_log row — only
+    // the WARN log line below serves as the audit record.  If per-address
+    // CC/BCC audit trails are required, consult the structured logs for
+    // events with field email=<address> and message="CC address blocked".
     for r in email_opts.cc.iter().chain(email_opts.bcc.iter()) {
         if !is_valid_email(&r.email) {
             return RecipientOutcome::Failed(AppError::permanent_mailer(format!(
@@ -422,8 +424,11 @@ pub async fn process_group(
         }
     }
     // Invalid CC/BCC addresses are a permanent failure.
-    // Blocked addresses are silently excluded — the email proceeds to the
-    // remaining recipients.  Same semantics as process_recipient.
+    // Blocked addresses are excluded and logged at WARN level; delivery
+    // continues for the remaining CC/BCC recipients.  Same semantics as
+    // process_recipient.  Blocked CC/BCC do NOT get notification_log rows;
+    // consult structured logs (email=<addr>, message="CC address blocked")
+    // for the audit trail.
     for r in email_opts.cc.iter().chain(email_opts.bcc.iter()) {
         if !is_valid_email(&r.email) {
             return RecipientOutcome::Failed(AppError::permanent_mailer(format!(
@@ -595,6 +600,17 @@ pub async fn process_group(
     }
 
     // ── 4. Recipient filter — applied to all To: addresses ────────────────────
+    // Design note — TO vs CC/BCC asymmetry:
+    //   A blocked TO recipient drops the ENTIRE group delivery (all recipients
+    //   receive nothing).  A blocked CC/BCC address (step 2 above) is silently
+    //   excluded and delivery continues.  This is intentional:
+    //   • TO is the primary audience; a blocked address indicates the business
+    //     service included someone who must not receive this mail — a data-quality
+    //     issue that warrants a visible failure.
+    //   • CC/BCC is secondary; silencing the whole delivery for one unwanted
+    //     copy recipient would be disproportionate.
+    //   Operators: to recover, remove the blocked TO address from the event
+    //   payload and re-publish, or remove the address from the blocklist.
     for r in recipients {
         if let Err(AppError::Blocked(reason)) = ctx.filter.check(&r.email) {
             warn!(

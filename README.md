@@ -138,8 +138,8 @@ is the recommended minimum** for any pre-signed URL referenced in an event.
 
 If a URL expires before the service can fetch it, the delivery is permanently
 marked FAILED (no further retries). The retry API (`POST /emails/{id}/retry`)
-will return a `400` error listing the expired filenames; the business service
-must re-publish the event with fresh URLs before retrying.
+will return a `422 Unprocessable Entity` error listing the expired filenames;
+the business service must re-publish the event with fresh URLs before retrying.
 
 ## Per-recipient FAILED recovery
 
@@ -163,6 +163,13 @@ Both endpoints atomically reset the affected row(s) to `PENDING` and
 re-publish the event to RabbitMQ. The consumer's idempotency guard ensures
 already-`SENT` or `BLOCKED` recipients are skipped on re-delivery; only the
 reset `PENDING` rows are re-processed.
+
+> **Attachment expiry pre-check**: before re-publishing, both retry endpoints
+> inspect stored attachment refs that carry a `max_age_secs` hint. If any are
+> provably expired the endpoint returns `422` immediately with the list of
+> expired filenames, so you learn up-front rather than getting a cryptic
+> permanent failure on the consumer side. Refs without `max_age_secs` are
+> forwarded unconditionally (the fetcher will classify a 4xx as permanent).
 
 For automated recovery, poll `GET /emails/{event_id}` and trigger the retry
 endpoint when `summary.failed > 0`, or set up an alert on the

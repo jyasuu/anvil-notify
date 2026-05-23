@@ -319,6 +319,10 @@ pub(crate) async fn process_one_recipient(
                     delay_secs = delay.as_secs(),
                     "Rate-limited — backing off without consuming retry slot"
                 );
+                // mark_failed with exhausted=false sets status to PENDING,
+                // keeping the row recoverable.  The next iteration re-processes
+                // after the backoff delay; on restart the Duplicate path in
+                // process_recipient seeds attempt from the stored retry_count.
                 let _ = ctx
                     .store
                     .mark_failed(event.event_id, &recipient.email, msg, false)
@@ -326,11 +330,11 @@ pub(crate) async fn process_one_recipient(
                 tokio::select! {
                     _ = sleep(delay) => {}
                     _ = shutdown.cancelled() => {
-                        // Shutdown arrived during backoff. The row is already
-                        // PENDING (mark_failed with exhausted=false above), which
-                        // would leave it stuck with no queue message to pick it up.
-                        // Flip it to FAILED so the operator can see it and use the
-                        // retry API after the service restarts.
+                        // Shutdown arrived during backoff.  The row is currently
+                        // PENDING (exhausted=false above), but there is no AMQP
+                        // message left to re-drive it after restart.  Flip it to
+                        // FAILED (exhausted=true) so the operator can see it and
+                        // replay via the retry API.
                         warn!(
                             event_id = %event.event_id,
                             email    = %recipient.email,
