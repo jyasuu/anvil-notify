@@ -355,11 +355,17 @@ mod processor_tests {
                     }],
                     cc: cc
                         .into_iter()
-                        .map(|e| Recipient { email: e.into(), name: None })
+                        .map(|e| Recipient {
+                            email: e.into(),
+                            name: None,
+                        })
                         .collect(),
                     bcc: bcc
                         .into_iter()
-                        .map(|e| Recipient { email: e.into(), name: None })
+                        .map(|e| Recipient {
+                            email: e.into(),
+                            name: None,
+                        })
                         .collect(),
                     from_override: None,
                     attachments: vec![],
@@ -386,11 +392,7 @@ mod processor_tests {
             vec!["blocked@example.com"], // CC contains a blocked address
             vec![],
         );
-        let email_opts = event
-            .channel_overrides
-            .email
-            .as_ref()
-            .unwrap();
+        let email_opts = event.channel_overrides.email.as_ref().unwrap();
 
         // Simulate the filter check that processor.rs performs on CC/BCC.
         let mut hit_blocked = false;
@@ -399,7 +401,10 @@ mod processor_tests {
                 hit_blocked = true;
             }
         }
-        assert!(hit_blocked, "blocked CC address should have been caught by the filter");
+        assert!(
+            hit_blocked,
+            "blocked CC address should have been caught by the filter"
+        );
     }
 
     /// Verifies that a blocked BCC address also causes a filter hit.
@@ -416,11 +421,7 @@ mod processor_tests {
             vec![],
             vec!["audit@blocked.io"], // BCC domain is blocked
         );
-        let email_opts = event
-            .channel_overrides
-            .email
-            .as_ref()
-            .unwrap();
+        let email_opts = event.channel_overrides.email.as_ref().unwrap();
 
         let mut hit_blocked = false;
         for r in email_opts.cc.iter().chain(email_opts.bcc.iter()) {
@@ -428,7 +429,10 @@ mod processor_tests {
                 hit_blocked = true;
             }
         }
-        assert!(hit_blocked, "blocked BCC domain address should have been caught by the filter");
+        assert!(
+            hit_blocked,
+            "blocked BCC domain address should have been caught by the filter"
+        );
     }
 
     /// Verifies that allowlist mode also blocks CC/BCC addresses not on the list.
@@ -445,11 +449,7 @@ mod processor_tests {
             vec!["external@other.com"], // CC is not on the allowlist
             vec![],
         );
-        let email_opts = event
-            .channel_overrides
-            .email
-            .as_ref()
-            .unwrap();
+        let email_opts = event.channel_overrides.email.as_ref().unwrap();
 
         let mut hit_blocked = false;
         for r in email_opts.cc.iter().chain(email_opts.bcc.iter()) {
@@ -457,7 +457,10 @@ mod processor_tests {
                 hit_blocked = true;
             }
         }
-        assert!(hit_blocked, "CC address outside allowlist should be blocked");
+        assert!(
+            hit_blocked,
+            "CC address outside allowlist should be blocked"
+        );
     }
 
     /// Verifies that a clean (non-blocked) CC address passes through the filter.
@@ -474,11 +477,7 @@ mod processor_tests {
             vec!["safe@example.com"],
             vec!["also-safe@example.com"],
         );
-        let email_opts = event
-            .channel_overrides
-            .email
-            .as_ref()
-            .unwrap();
+        let email_opts = event.channel_overrides.email.as_ref().unwrap();
 
         for r in email_opts.cc.iter().chain(email_opts.bcc.iter()) {
             assert!(
@@ -602,7 +601,6 @@ mod processor_tests {
         );
     }
 
-
     // ── TO recipient filter — end-to-end processor logic tests ───────────────
     //
     // These tests verify the three filter rules for group and individual sends:
@@ -621,15 +619,24 @@ mod processor_tests {
                 email: Some(EmailOptions {
                     recipients: recipients
                         .into_iter()
-                        .map(|e| Recipient { email: e.into(), name: None })
+                        .map(|e| Recipient {
+                            email: e.into(),
+                            name: None,
+                        })
                         .collect(),
                     cc: cc
                         .into_iter()
-                        .map(|e| Recipient { email: e.into(), name: None })
+                        .map(|e| Recipient {
+                            email: e.into(),
+                            name: None,
+                        })
                         .collect(),
                     bcc: bcc
                         .into_iter()
-                        .map(|e| Recipient { email: e.into(), name: None })
+                        .map(|e| Recipient {
+                            email: e.into(),
+                            name: None,
+                        })
                         .collect(),
                     from_override: None,
                     attachments: vec![],
@@ -682,20 +689,33 @@ mod processor_tests {
         });
 
         let event = make_group_event(
-            vec!["ok@example.com", "blocked@example.com", "also-ok@example.com"],
+            vec![
+                "ok@example.com",
+                "blocked@example.com",
+                "also-ok@example.com",
+            ],
             vec![],
             vec![],
         );
         let email_opts = event.channel_overrides.email.as_ref().unwrap();
         let recipients = &email_opts.recipients;
 
-        let allowed: Vec<_> = recipients.iter().filter(|r| filter.check(&r.email).is_ok()).collect();
-        let blocked: Vec<_> = recipients.iter().filter(|r| filter.check(&r.email).is_err()).collect();
+        let allowed: Vec<_> = recipients
+            .iter()
+            .filter(|r| filter.check(&r.email).is_ok())
+            .collect();
+        let blocked: Vec<_> = recipients
+            .iter()
+            .filter(|r| filter.check(&r.email).is_err())
+            .collect();
 
         assert_eq!(allowed.len(), 2, "two TO recipients should pass the filter");
         assert_eq!(blocked.len(), 1, "one TO recipient should be blocked");
         assert_eq!(blocked[0].email, "blocked@example.com");
-        assert!(!allowed.is_empty(), "delivery must proceed to remaining allowed TOs");
+        assert!(
+            !allowed.is_empty(),
+            "delivery must proceed to remaining allowed TOs"
+        );
     }
 
     /// Rule 2 (individual): each TO is processed independently; a blocked
@@ -707,7 +727,11 @@ mod processor_tests {
             ..Default::default()
         });
 
-        let addresses = vec!["ok@example.com", "blocked@example.com", "also-ok@example.com"];
+        let addresses = vec![
+            "ok@example.com",
+            "blocked@example.com",
+            "also-ok@example.com",
+        ];
 
         let mut blocked_count = 0usize;
         let mut allowed_count = 0usize;
@@ -751,7 +775,11 @@ mod processor_tests {
             .iter()
             .filter(|r| filter.check(&r.email).is_ok())
             .collect();
-        assert_eq!(effective_cc.len(), 1, "only the safe CC address should remain");
+        assert_eq!(
+            effective_cc.len(),
+            1,
+            "only the safe CC address should remain"
+        );
         assert_eq!(effective_cc[0].email, "safe-cc@example.com");
     }
 
@@ -776,7 +804,11 @@ mod processor_tests {
             .iter()
             .filter(|r| filter.check(&r.email).is_ok())
             .collect();
-        assert_eq!(effective_bcc.len(), 1, "only the safe BCC address should remain");
+        assert_eq!(
+            effective_bcc.len(),
+            1,
+            "only the safe BCC address should remain"
+        );
         assert_eq!(effective_bcc[0].email, "audit@safe.com");
     }
 
@@ -786,17 +818,17 @@ mod processor_tests {
     /// the whole group email as a unit.
     #[test]
     fn group_retry_mode_whole_produces_plain_failed_outcome() {
-        use common::GroupRetryMode;
         use crate::processor::RecipientOutcome;
+        use common::GroupRetryMode;
 
         let err = AppError::transient_mailer("smtp timeout");
         let mode = GroupRetryMode::Whole;
 
         let outcome = match mode {
             GroupRetryMode::Individual => RecipientOutcome::GroupFailedWithIndividualRows(err),
-            GroupRetryMode::Whole => RecipientOutcome::Failed(
-                AppError::transient_mailer("smtp timeout"),
-            ),
+            GroupRetryMode::Whole => {
+                RecipientOutcome::Failed(AppError::transient_mailer("smtp timeout"))
+            }
         };
 
         assert!(
@@ -809,17 +841,17 @@ mod processor_tests {
     /// runner falls back to per-recipient sends, skipping already-SENT rows.
     #[test]
     fn group_retry_mode_individual_produces_individual_rows_outcome() {
-        use common::GroupRetryMode;
         use crate::processor::RecipientOutcome;
+        use common::GroupRetryMode;
 
         let err = AppError::transient_mailer("smtp timeout");
         let mode = GroupRetryMode::Individual;
 
         let outcome = match mode {
             GroupRetryMode::Individual => RecipientOutcome::GroupFailedWithIndividualRows(err),
-            GroupRetryMode::Whole => RecipientOutcome::Failed(
-                AppError::transient_mailer("smtp timeout"),
-            ),
+            GroupRetryMode::Whole => {
+                RecipientOutcome::Failed(AppError::transient_mailer("smtp timeout"))
+            }
         };
 
         assert!(

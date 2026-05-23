@@ -176,9 +176,9 @@ pub async fn process_recipient(
     let attachments_json = if email_opts.attachments.is_empty() {
         None
     } else {
-        match serde_json::to_value(&email_opts.attachments)
-            .map_err(|e| AppError::permanent_mailer(format!("failed to serialize attachments: {e}")))
-        {
+        match serde_json::to_value(&email_opts.attachments).map_err(|e| {
+            AppError::permanent_mailer(format!("failed to serialize attachments: {e}"))
+        }) {
             Ok(v) => Some(v),
             Err(e) => return RecipientOutcome::Failed(e),
         }
@@ -529,9 +529,9 @@ pub async fn process_group(
     let attachments_json = if email_opts.attachments.is_empty() {
         None
     } else {
-        match serde_json::to_value(&email_opts.attachments)
-            .map_err(|e| AppError::permanent_mailer(format!("failed to serialize attachments: {e}")))
-        {
+        match serde_json::to_value(&email_opts.attachments).map_err(|e| {
+            AppError::permanent_mailer(format!("failed to serialize attachments: {e}"))
+        }) {
             Ok(v) => Some(v),
             Err(e) => return RecipientOutcome::Failed(e),
         }

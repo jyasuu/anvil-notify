@@ -53,8 +53,6 @@ pub struct EmailInsertPendingArgs<'a> {
     pub group_retry_mode: Option<&'a str>,
 }
 
-
-
 // ── Channel constants ─────────────────────────────────────────────────────────
 
 pub const CHANNEL_EMAIL: &str = "email";
@@ -73,7 +71,10 @@ pub trait NotificationStore: Send + Sync + 'static {
     /// Returns `InsertResult::Inserted` for a new row, or
     /// `InsertResult::Duplicate { retry_count, status }` when the idempotency
     /// key `(event_id, channel, recipient_id)` already exists.
-    async fn insert_pending(&self, args: &EmailInsertPendingArgs<'_>) -> Result<InsertResult, AppError>;
+    async fn insert_pending(
+        &self,
+        args: &EmailInsertPendingArgs<'_>,
+    ) -> Result<InsertResult, AppError>;
 
     /// Mark a delivery as successfully sent.
     async fn mark_sent(&self, event_id: Uuid, recipient_id: &str) -> Result<(), AppError>;
@@ -147,7 +148,10 @@ impl EmailNotificationStore {
 #[async_trait::async_trait]
 impl NotificationStore for EmailNotificationStore {
     #[instrument(skip(self, args))]
-    async fn insert_pending(&self, args: &EmailInsertPendingArgs<'_>) -> Result<InsertResult, AppError> {
+    async fn insert_pending(
+        &self,
+        args: &EmailInsertPendingArgs<'_>,
+    ) -> Result<InsertResult, AppError> {
         let mut tx = self.pool.begin().await?;
 
         // ── 1. Upsert into notification_log (channel-agnostic) ────────────────

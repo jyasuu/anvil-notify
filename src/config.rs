@@ -356,7 +356,7 @@ impl AppConfig {
             // anyhow::bail! would abort startup; this is just a heads-up.
             tracing::warn!(
                 retry_base_ms = self.amqp.retry_base_ms,
-                max_retries   = self.amqp.max_retries,
+                max_retries = self.amqp.max_retries,
                 max_total_delay_secs = max_total_delay_ms / 1_000,
                 "amqp.retry_base_ms * 2^max_retries exceeds 30 minutes; \
                  un-ACK'd AMQP messages will be held for up to 30 min per attempt. \

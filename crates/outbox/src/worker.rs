@@ -498,14 +498,14 @@ async fn run_reaper(pool: PgPool, timeout: Duration, shutdown: CancellationToken
             _ = sleep(interval) => {}
         }
         match reap_stale_in_progress(&pool, timeout).await {
-            Ok(0)   => {} // nothing stale — normal
-            Ok(n)   => tracing::warn!(
+            Ok(0) => {} // nothing stale — normal
+            Ok(n) => tracing::warn!(
                 count = n,
                 timeout_secs = timeout.as_secs(),
                 "Reaper: reset stale IN_PROGRESS rows to PENDING — \
                  this indicates a previous worker crashed mid-batch"
             ),
-            Err(e)  => tracing::error!(error = %e, "Reaper: failed to query stale rows"),
+            Err(e) => tracing::error!(error = %e, "Reaper: failed to query stale rows"),
         }
     }
 }

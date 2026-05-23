@@ -270,7 +270,12 @@ async fn declare_topology(
                     "Queue already exists — skipping active declare"
                 );
             }
-            Err(ref e) if { let s = e.to_string(); s.contains("404") || s.contains("NOT_FOUND") } => {
+            Err(ref e)
+                if {
+                    let s = e.to_string();
+                    s.contains("404") || s.contains("NOT_FOUND")
+                } =>
+            {
                 // Queue does not exist yet — normal first-run path.
                 //
                 // TODO: replace string-match with a structured lapin error check
