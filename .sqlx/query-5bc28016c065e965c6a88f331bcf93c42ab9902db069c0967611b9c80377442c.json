@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                n.id,\n                n.event_id,\n                n.event_type,\n                n.status,\n                n.retry_count,\n                n.total_attempts,\n                n.last_error,\n                n.payload,\n                n.event_timestamp,\n                n.created_at,\n                n.updated_at,\n                e.recipient_email,\n                e.recipient_name,\n                e.from_override,\n                e.sender_account,\n                e.send_mode,\n                e.cc,\n                e.bcc,\n                e.attachments\n            FROM notification_log n\n            JOIN email_notification_log e ON e.notification_id = n.id\n            WHERE n.event_id = $1\n              AND n.channel  = $2\n            ORDER BY n.created_at\n            ",
+  "query": "\n            SELECT\n                n.id,\n                n.event_id,\n                n.event_type,\n                n.status,\n                n.retry_count,\n                n.total_attempts,\n                n.last_error,\n                n.payload,\n                n.event_timestamp,\n                n.created_at,\n                n.updated_at,\n                e.recipient_email,\n                e.recipient_name,\n                e.from_override,\n                e.sender_account,\n                e.send_mode,\n                e.group_retry_mode,\n                e.cc,\n                e.bcc,\n                e.attachments\n            FROM notification_log n\n            JOIN email_notification_log e ON e.notification_id = n.id\n            WHERE n.event_id = $1\n              AND n.channel  = $2\n            ORDER BY n.created_at\n            ",
   "describe": {
     "columns": [
       {
@@ -85,16 +85,21 @@
       },
       {
         "ordinal": 16,
+        "name": "group_retry_mode",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 17,
         "name": "cc",
         "type_info": "Jsonb"
       },
       {
-        "ordinal": 17,
+        "ordinal": 18,
         "name": "bcc",
         "type_info": "Jsonb"
       },
       {
-        "ordinal": 18,
+        "ordinal": 19,
         "name": "attachments",
         "type_info": "Jsonb"
       }
@@ -124,8 +129,9 @@
       true,
       true,
       true,
+      true,
       true
     ]
   },
-  "hash": "e3b2a496de719b370c7bc87730c0c45ec6961aba8b494328c76b9d3f95e722a0"
+  "hash": "5bc28016c065e965c6a88f331bcf93c42ab9902db069c0967611b9c80377442c"
 }
