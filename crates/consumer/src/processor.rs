@@ -16,6 +16,21 @@ use store::{
 };
 use tracing::{info, instrument, warn};
 
+/// Pre-filtered CC and BCC recipient lists, computed **once per event** before
+/// per-recipient tasks are spawned.
+///
+/// CC/BCC are event-level options shared across every TO recipient.  Computing
+/// the filter result once in `delivery.rs` and passing it in here prevents
+/// N×M filter evaluations (once per TO × per CC/BCC address) and multiplied
+/// log noise for events with many recipients.
+#[derive(Debug, Clone)]
+pub struct EffectiveCcBcc {
+    /// CC recipients that passed the filter (invalid/blocked addresses removed).
+    pub cc: Vec<common::Recipient>,
+    /// BCC recipients that passed the filter.
+    pub bcc: Vec<common::Recipient>,
+}
+
 /// Shared, cheaply-cloneable context passed to every per-recipient processor call.
 #[derive(Clone)]
 pub struct ProcessorContext {
@@ -63,7 +78,7 @@ pub enum RecipientOutcome {
 /// and passed in as resolved bytes. This avoids re-fetching pre-signed URLs
 /// for every recipient, which would waste bandwidth and risk URL expiry for
 /// later recipients in the list.
-#[instrument(skip(ctx, event, email_opts, recipient, attachments, shutdown),
+#[instrument(skip(ctx, event, email_opts, recipient, attachments, cc_bcc, shutdown),
              fields(event_id = %event.event_id, email = %recipient.email))]
 pub async fn process_recipient(
     ctx: &ProcessorContext,
@@ -71,6 +86,7 @@ pub async fn process_recipient(
     email_opts: &common::EmailOptions,
     recipient: &Recipient,
     attachments: &[ResolvedAttachment],
+    cc_bcc: &EffectiveCcBcc,
     shutdown: &tokio_util::sync::CancellationToken,
 ) -> RecipientOutcome {
     // ── 0. Recipient email validation (before DB write) ─────────────────────
@@ -101,61 +117,13 @@ pub async fn process_recipient(
         }
     }
 
-    // ── 2b. CC / BCC address validation and filter check (before DB write) ────
-    // Invalid addresses are still a permanent failure — a malformed address
-    // can never be delivered regardless of retry.
-    // Blocked addresses are excluded and logged at WARN level; delivery
-    // continues for the remaining CC/BCC recipients and all TO recipients.
-    // NOTE: blocked CC/BCC addresses do NOT get a notification_log row — only
-    // the WARN log line below serves as the audit record.  If per-address
-    // CC/BCC audit trails are required, consult the structured logs for
-    // events with field email=<address> and message="CC address blocked".
-    for r in email_opts.cc.iter().chain(email_opts.bcc.iter()) {
-        if !is_valid_email(&r.email) {
-            return RecipientOutcome::Failed(AppError::permanent_mailer(format!(
-                "invalid cc/bcc email address: {}",
-                r.email
-            )));
-        }
-    }
-    let effective_cc: Vec<_> = email_opts
-        .cc
-        .iter()
-        .filter(|r| match ctx.filter.check(&r.email) {
-            Ok(()) => true,
-            Err(AppError::Blocked(ref reason)) => {
-                warn!(
-                    event_id = %event.event_id,
-                    email    = %r.email,
-                    reason   = %reason,
-                    "CC address blocked by filter — excluding from delivery"
-                );
-                false
-            }
-            // Unexpected non-Blocked errors are treated as pass-through (fail-open):
-            // an unknown filter error should never silently drop a CC recipient.
-            Err(_) => true,
-        })
-        .collect();
-    let effective_bcc: Vec<_> = email_opts
-        .bcc
-        .iter()
-        .filter(|r| match ctx.filter.check(&r.email) {
-            Ok(()) => true,
-            Err(AppError::Blocked(ref reason)) => {
-                warn!(
-                    event_id = %event.event_id,
-                    email    = %r.email,
-                    reason   = %reason,
-                    "BCC address blocked by filter — excluding from delivery"
-                );
-                false
-            }
-            // Unexpected non-Blocked errors are treated as pass-through (fail-open):
-            // an unknown filter error should never silently drop a BCC recipient.
-            Err(_) => true,
-        })
-        .collect();
+    // ── 2b. CC / BCC ──────────────────────────────────────────────────────────
+    // Validation and filtering were done once at the delivery level in
+    // `delivery.rs` before per-recipient tasks were spawned.  Use the
+    // pre-filtered lists directly — avoids N×M filter evaluations and log
+    // noise for events with many TO recipients.
+    let effective_cc = &cc_bcc.cc;
+    let effective_bcc = &cc_bcc.bcc;
 
     // ── 3. Idempotency ───────────────────────────────────────────────────────
     // Use map_err + ? rather than .ok() so that a serialization failure

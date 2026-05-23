@@ -57,6 +57,29 @@ pub struct EmailInsertPendingArgs<'a> {
 
 pub const CHANNEL_EMAIL: &str = "email";
 
+// ── EventDeliveryDetail ───────────────────────────────────────────────────────
+
+/// Event-level email replay data returned by [`NotificationStore::get_event_delivery_detail`].
+///
+/// All recipient rows for the same `event_id` carry identical values for these
+/// fields — they are event-level properties, not per-recipient ones.  This
+/// type surfaces them as a single authoritative record so `republish_event()`
+/// can reconstruct the event without fragile `find_map` scanning.
+#[derive(Debug, Clone)]
+pub struct EventDeliveryDetail {
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub event_timestamp: Option<DateTime<Utc>>,
+    pub earliest_created_at: DateTime<Utc>,
+    pub from_override: Option<serde_json::Value>,
+    pub sender_account: Option<String>,
+    pub send_mode: Option<String>,
+    pub group_retry_mode: Option<String>,
+    pub attachments: Option<serde_json::Value>,
+    pub cc: Option<serde_json::Value>,
+    pub bcc: Option<serde_json::Value>,
+}
+
 // ── NotificationStore trait ───────────────────────────────────────────────────
 
 /// Channel-agnostic interface that every channel store must implement.
@@ -120,6 +143,21 @@ pub trait NotificationStore: Send + Sync + 'static {
     /// Reset ALL FAILED rows for an event to PENDING, returning the
     /// recipient IDs that were actually reset.
     async fn reset_all_failed_for_event(&self, event_id: Uuid) -> Result<Vec<String>, AppError>;
+
+    /// Return the authoritative event-level email replay data for `event_id`.
+    ///
+    /// All recipient rows for the same event carry identical values for the
+    /// event-level fields (payload, from_override, attachments, cc, bcc,
+    /// send_mode, group_retry_mode, sender_account).  This method reads them
+    /// from the first row and performs a consistency check in debug builds,
+    /// surfacing data corruption rather than silently picking an arbitrary
+    /// winner with `find_map`.
+    ///
+    /// Returns `AppError::NotFound` when no rows exist for `event_id`.
+    async fn get_event_delivery_detail(
+        &self,
+        event_id: Uuid,
+    ) -> Result<EventDeliveryDetail, AppError>;
 
     /// Expose the pool for health checks.
     fn pool(&self) -> &PgPool;
@@ -482,6 +520,106 @@ impl NotificationStore for EmailNotificationStore {
         .await?;
 
         Ok(rows.into_iter().map(|r| r.recipient_id).collect())
+    }
+
+    #[instrument(skip(self))]
+    async fn get_event_delivery_detail(
+        &self,
+        event_id: Uuid,
+    ) -> Result<EventDeliveryDetail, AppError> {
+        // Fetch every row so we can assert event-level field consistency.
+        // In the normal case this is identical to get_by_event_id but returns
+        // only the fields needed for replay, without per-recipient state.
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                n.event_type,
+                n.payload,
+                n.event_timestamp,
+                n.created_at,
+                e.from_override,
+                e.sender_account,
+                e.send_mode,
+                e.group_retry_mode,
+                e.attachments,
+                e.cc,
+                e.bcc
+            FROM notification_log n
+            JOIN email_notification_log e ON e.notification_id = n.id
+            WHERE n.event_id = $1
+              AND n.channel  = $2
+            ORDER BY n.created_at
+            "#,
+            event_id,
+            CHANNEL_EMAIL,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() {
+            return Err(AppError::NotFound(event_id.to_string()));
+        }
+
+        // The first row is authoritative for all event-level fields.
+        let first = &rows[0];
+
+        // ── Consistency assertion (debug builds) ─────────────────────────────
+        // Event-level fields must be identical across all rows for the same
+        // event_id.  A mismatch indicates data corruption (e.g. manual edits or
+        // a bug that wrote different values per row).  We assert in debug mode
+        // to surface this during development/testing without adding runtime
+        // overhead in production.
+        #[cfg(debug_assertions)]
+        {
+            for row in rows.iter().skip(1) {
+                debug_assert_eq!(
+                    row.event_type, first.event_type,
+                    "event_type mismatch for event_id {event_id}"
+                );
+                debug_assert_eq!(
+                    row.from_override, first.from_override,
+                    "from_override mismatch for event_id {event_id}"
+                );
+                debug_assert_eq!(
+                    row.attachments, first.attachments,
+                    "attachments mismatch for event_id {event_id}"
+                );
+                debug_assert_eq!(row.cc, first.cc, "cc mismatch for event_id {event_id}");
+                debug_assert_eq!(row.bcc, first.bcc, "bcc mismatch for event_id {event_id}");
+                debug_assert_eq!(
+                    row.send_mode, first.send_mode,
+                    "send_mode mismatch for event_id {event_id}"
+                );
+                debug_assert_eq!(
+                    row.group_retry_mode, first.group_retry_mode,
+                    "group_retry_mode mismatch for event_id {event_id}"
+                );
+                debug_assert_eq!(
+                    row.sender_account, first.sender_account,
+                    "sender_account mismatch for event_id {event_id}"
+                );
+            }
+        }
+
+        let earliest_created_at = rows
+            .iter()
+            .map(|r| r.created_at)
+            .min()
+            .unwrap_or(first.created_at);
+
+        Ok(EventDeliveryDetail {
+            event_type: first.event_type.clone(),
+            payload: first.payload.clone(),
+            event_timestamp: Some(first.event_timestamp),
+            earliest_created_at,
+            from_override: first.from_override.clone(),
+            sender_account: first.sender_account.clone(),
+            send_mode: first.send_mode.clone(),
+            group_retry_mode: first.group_retry_mode.clone(),
+            attachments: first.attachments.clone(),
+            cc: first.cc.clone(),
+            bcc: first.bcc.clone(),
+        })
     }
 
     fn pool(&self) -> &PgPool {
