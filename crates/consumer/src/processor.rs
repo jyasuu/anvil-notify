@@ -166,7 +166,7 @@ pub async fn process_recipient(
     let from_override_json = match email_opts
         .from_override
         .as_ref()
-        .map(|o| serde_json::to_value(o))
+        .map(serde_json::to_value)
         .transpose()
         .map_err(|e| AppError::permanent_mailer(format!("failed to serialize from_override: {e}")))
     {
@@ -519,7 +519,7 @@ pub async fn process_group(
     let from_override_json = match email_opts
         .from_override
         .as_ref()
-        .map(|o| serde_json::to_value(o))
+        .map(serde_json::to_value)
         .transpose()
         .map_err(|e| AppError::permanent_mailer(format!("failed to serialize from_override: {e}")))
     {
