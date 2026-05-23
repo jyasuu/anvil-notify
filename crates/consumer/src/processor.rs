@@ -304,6 +304,11 @@ pub async fn process_recipient(
     };
 
     // ── 6. Rate-limit token ──────────────────────────────────────────────────
+    // Increment a counter each time we must wait so operators have a Prometheus
+    // signal to alert on when the service is being throttled.
+    counter!("email_rate_limit_waits_total",
+        "event_type" => event.event_type.clone())
+    .increment(1);
     if !ctx.rate_limiter.wait_for_token(shutdown).await {
         return RecipientOutcome::Failed(AppError::Queue(
             "service shutdown during rate-limit wait".into(),
@@ -648,6 +653,7 @@ pub async fn process_group(
                     attachments_json.as_ref(),
                     cc_json.as_ref(),
                     bcc_json.as_ref(),
+                    group_retry_mode_str,
                 ))
                 .await
             {
@@ -756,6 +762,11 @@ pub async fn process_group(
     };
 
     // ── 6. Rate-limit token ──────────────────────────────────────────────────
+    // Increment a counter each time we must wait so operators have a Prometheus
+    // signal to alert on when the service is being throttled.
+    counter!("email_rate_limit_waits_total",
+        "event_type" => event.event_type.clone())
+    .increment(1);
     if !ctx.rate_limiter.wait_for_token(shutdown).await {
         return RecipientOutcome::Failed(AppError::Queue(
             "service shutdown during rate-limit wait".into(),
@@ -772,11 +783,32 @@ pub async fn process_group(
     match sender.send(&msg).await {
         Ok(()) => {
             let elapsed = send_start.elapsed().as_secs_f64();
-            let _ = ctx.store.mark_sent(event.event_id, &primary.email).await;
+            // IMPORTANT: mark_sent failure after a successful SMTP send means
+            // the email was delivered but the row stays PENDING.  On AMQP
+            // re-delivery the idempotency check will see PENDING (Duplicate)
+            // and re-send, producing a duplicate.  Log at WARN so the operator
+            // can inspect and manually mark the row SENT if needed.
+            if let Err(e) = ctx.store.mark_sent(event.event_id, &primary.email).await {
+                warn!(
+                    event_id = %event.event_id,
+                    email    = %primary.email,
+                    error    = %e,
+                    "Group email delivered but mark_sent DB write failed for primary — \
+                     row remains PENDING; re-delivery will attempt to re-send"
+                );
+            }
             // For GroupRetryMode::Individual, also mark every secondary row SENT.
             if email_opts.group_retry_mode == GroupRetryMode::Individual {
                 for r in recipients.iter().skip(1) {
-                    let _ = ctx.store.mark_sent(event.event_id, &r.email).await;
+                    if let Err(e) = ctx.store.mark_sent(event.event_id, &r.email).await {
+                        warn!(
+                            event_id = %event.event_id,
+                            email    = %r.email,
+                            error    = %e,
+                            "Group email delivered but mark_sent DB write failed for secondary recipient — \
+                             row remains PENDING; re-delivery will attempt to re-send"
+                        );
+                    }
                 }
             }
             counter!("emails_sent_total",

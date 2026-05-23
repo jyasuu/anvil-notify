@@ -21,16 +21,6 @@
 //!   Useful for staging environments to prevent accidental real sends.
 //!
 //! Both lists are case-insensitive.
-//!
-//! Two operating modes (controlled by config):
-//!
-//! * **Blocklist-only** (default): any address or domain in `blocked_*` is
-//!   dropped; everything else passes.
-//! * **Allowlist mode** (`allowed_emails` or `allowed_domains` is non-empty):
-//!   only addresses that match the allowlist pass; everything else is dropped.
-//!   Useful for staging environments to prevent accidental real sends.
-//!
-//! Both lists are case-insensitive.
 
 use common::AppError;
 use serde::{Deserialize, Serialize};

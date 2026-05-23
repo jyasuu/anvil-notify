@@ -236,6 +236,12 @@ struct OutboxRow {
     event_id: Uuid,
     event_type: String,
     payload: serde_json::Value,
+    /// DB insertion time used as the event timestamp so attachment expiry
+    /// checks (`max_age_secs`) are evaluated against when the business event
+    /// was written to the outbox, not when the outbox worker happened to pick
+    /// it up.  Using `Utc::now()` here would shrink the URL validity window
+    /// by any queue or processing lag.
+    created_at: chrono::DateTime<chrono::Utc>,
 }
 
 async fn fetch_pending_batch(pool: &PgPool, limit: i64) -> anyhow::Result<Vec<OutboxRow>> {
@@ -249,7 +255,7 @@ async fn fetch_pending_batch(pool: &PgPool, limit: i64) -> anyhow::Result<Vec<Ou
     let mut tx = pool.begin().await?;
     let rows = sqlx::query!(
         r#"
-        SELECT id, event_id, event_type, payload
+        SELECT id, event_id, event_type, payload, created_at
         FROM   outbox
         WHERE  status = 'PENDING'
         ORDER  BY created_at ASC
@@ -279,6 +285,7 @@ async fn fetch_pending_batch(pool: &PgPool, limit: i64) -> anyhow::Result<Vec<Ou
             event_id: r.event_id,
             event_type: r.event_type,
             payload: r.payload,
+            created_at: r.created_at,
         })
         .collect())
 }
@@ -360,7 +367,18 @@ async fn publish_and_mark(
 
     let event = NotificationEvent {
         event_id: row.event_id,
-        timestamp: chrono::Utc::now(),
+        // Use the outbox row's `created_at` (the time the business event was
+        // written) as the envelope timestamp rather than `Utc::now()`.
+        //
+        // Attachment `max_age_secs` is evaluated relative to this timestamp:
+        // using `Utc::now()` would shrink the validity window by whatever
+        // queue + processing lag occurred between insertion and publication,
+        // potentially causing the consumer to reject URLs that were still live.
+        //
+        // `created_at` is the closest proxy available in the outbox table for
+        // the true business-event time.  If a dedicated `event_timestamp`
+        // column is added in a future migration it should be preferred here.
+        timestamp: row.created_at,
         event_type: row.event_type.clone(),
         payload: template_payload,
         metadata,

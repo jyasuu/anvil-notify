@@ -7,7 +7,7 @@ use axum::{
 use chrono::Utc;
 use common::{
     is_valid_email, AppError, AttachmentRef, ChannelOverrides, EmailOptions, EmailStatus,
-    FromOverride, GroupRetryMode, Metadata, NotificationEvent, Recipient, RetryPolicy,
+    FromOverride, Metadata, NotificationEvent, Recipient, RetryPolicy,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -228,22 +228,32 @@ async fn republish_event(
         })
         .unwrap_or(common::SendMode::Individual);
 
+    // Restore the original group_retry_mode from the stored column (added in
+    // migration 0028).  Pre-0028 rows have NULL; fall back to Whole, which
+    // matches the default that existed before this column was introduced.
+    //
+    // IMPORTANT: without this restore a group event originally published with
+    // GroupRetryMode::Individual (which inserts per-recipient rows and skips
+    // already-SENT addresses on re-delivery) would be retried with
+    // GroupRetryMode::Whole — risking duplicate sends to recipients whose
+    // delivery was already accepted by the SMTP server in the prior attempt.
+    let group_retry_mode = logs
+        .iter()
+        .find_map(|l| l.group_retry_mode.as_deref())
+        .map(|s| match s {
+            "individual" => common::GroupRetryMode::Individual,
+            _ => common::GroupRetryMode::Whole,
+        })
+        .unwrap_or_default();
+
     // Warn when retrying a group-mode event so operators are aware of the
-    // double-send risk.  A group email is retried as a unit: if the original
-    // SMTP delivery accepted the message for some recipients before the
-    // connection dropped, those recipients will receive the email a second time.
-    // This is by design for GroupRetryMode::Whole (the default); Individual mode
-    // avoids it by inserting per-recipient rows and skipping SENT addresses on
-    // re-delivery.  The warning is emitted regardless of group_retry_mode
-    // because the stored value is not persisted (it always restores to the
-    // default on retry), so we cannot distinguish the two modes at this point.
-    if send_mode == common::SendMode::Group {
+    // double-send risk under GroupRetryMode::Whole.
+    if send_mode == common::SendMode::Group && group_retry_mode == common::GroupRetryMode::Whole {
         tracing::warn!(
             %event_id,
-            "Retrying a group-mode event: recipients whose delivery was already \
-             accepted by the SMTP server in a prior attempt may receive a \
-             duplicate email. Consider using group_retry_mode = \"individual\" \
-             in future events to avoid this."
+            "Retrying a group-mode event with retry_mode=whole: recipients whose delivery was \
+             already accepted by the SMTP server in a prior attempt may receive a duplicate email. \
+             Consider using group_retry_mode = \"individual\" in future events to avoid this."
         );
     }
 
@@ -258,6 +268,23 @@ async fn republish_event(
                  Remove the blocked address before retrying.",
                 r.email
             ))));
+        }
+    }
+
+    // Validate TO recipients against the filter for the same reason: a blocked
+    // TO address will be immediately marked BLOCKED by the consumer, making the
+    // re-enqueue a no-op at best and a source of confusing log noise at worst.
+    // We warn rather than hard-reject so an operator can still force a retry if
+    // the blocklist has been updated since the original failure.
+    for r in recipients.iter() {
+        if let Err(common::AppError::Blocked(reason)) = state.filter.check(&r.email) {
+            tracing::warn!(
+                %event_id,
+                email = %r.email,
+                %reason,
+                "Retrying event with a blocked TO recipient — consumer will mark it BLOCKED again. \
+                 Remove the address from the blocklist first, or the retry will be a no-op."
+            );
         }
     }
 
@@ -279,7 +306,7 @@ async fn republish_event(
                 attachments,
                 sender_account,
                 send_mode,
-                group_retry_mode: GroupRetryMode::default(),
+                group_retry_mode,
                 retry_policy: RetryPolicy::default(),
             }),
         },

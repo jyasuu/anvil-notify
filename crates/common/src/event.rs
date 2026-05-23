@@ -221,13 +221,21 @@ pub struct EmailOptions {
     ///
     /// CC addresses are attached as `Cc:` headers and are visible to all
     /// recipients. They are subject to the same recipient filter (blocklist and
-    /// allowlist) as TO recipients. A blocked CC address is a **permanent
-    /// failure** for the entire delivery — the event is marked `FAILED` and the
-    /// operator must remove the blocked address before retrying.
+    /// allowlist) as TO recipients.
+    ///
+    /// A **blocked** CC address is silently excluded from delivery: the
+    /// consumer logs the exclusion at `WARN` level and continues sending to the
+    /// remaining CC/BCC and all TO recipients. Delivery is never aborted for a
+    /// blocked CC address. To audit which CC addresses were stripped, search
+    /// structured logs for `message="CC address blocked"`.
+    ///
+    /// An **invalid** CC address (format check) is still a permanent failure
+    /// for the entire delivery — a malformed address can never be delivered
+    /// regardless of retry.
     ///
     /// CC addresses do not get their own `notification_log` rows and are not
-    /// individually retried. An invalid CC address (format check) also fails the
-    /// whole delivery permanently.
+    /// individually retried. The post-filter (effective) CC list is stored in
+    /// the DB so the audit record reflects what was actually delivered.
     #[serde(default)]
     pub cc: Vec<Recipient>,
 
@@ -235,7 +243,9 @@ pub struct EmailOptions {
     ///
     /// BCC addresses are passed as `Bcc:` headers and are hidden from other
     /// recipients. The same filter, validation, and failure semantics as `cc`
-    /// apply.
+    /// apply: blocked addresses are silently excluded and logged at WARN;
+    /// invalid addresses (format check) are a permanent failure for the whole
+    /// delivery.
     #[serde(default)]
     pub bcc: Vec<Recipient>,
 
