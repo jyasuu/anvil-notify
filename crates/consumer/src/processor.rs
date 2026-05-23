@@ -184,21 +184,35 @@ pub async fn process_recipient(
         }
     };
 
-    let cc_json = if email_opts.cc.is_empty() {
+    // Serialize the post-filter (effective) CC/BCC lists so the DB record
+    // accurately reflects what was actually delivered, not the raw unfiltered
+    // input.  Storing pre-filter lists would show addresses that were never
+    // delivered to, and would waste a filter cycle on every retry.
+    let cc_json = if effective_cc.is_empty() {
         None
     } else {
-        match serde_json::to_value(&email_opts.cc)
-            .map_err(|e| AppError::permanent_mailer(format!("failed to serialize cc: {e}")))
+        match serde_json::to_value(
+            effective_cc
+                .iter()
+                .map(|r| serde_json::json!({"email": r.email, "name": r.name}))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| AppError::permanent_mailer(format!("failed to serialize cc: {e}")))
         {
             Ok(v) => Some(v),
             Err(e) => return RecipientOutcome::Failed(e),
         }
     };
-    let bcc_json = if email_opts.bcc.is_empty() {
+    let bcc_json = if effective_bcc.is_empty() {
         None
     } else {
-        match serde_json::to_value(&email_opts.bcc)
-            .map_err(|e| AppError::permanent_mailer(format!("failed to serialize bcc: {e}")))
+        match serde_json::to_value(
+            effective_bcc
+                .iter()
+                .map(|r| serde_json::json!({"email": r.email, "name": r.name}))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| AppError::permanent_mailer(format!("failed to serialize bcc: {e}")))
         {
             Ok(v) => Some(v),
             Err(e) => return RecipientOutcome::Failed(e),
@@ -219,6 +233,7 @@ pub async fn process_recipient(
             cc: cc_json.as_ref(),
             bcc: bcc_json.as_ref(),
             send_mode: email_opts.send_mode.as_str(),
+            group_retry_mode: None, // individual mode — group_retry_mode is not applicable
             event_timestamp: event.timestamp,
         })
         .await
@@ -305,7 +320,20 @@ pub async fn process_recipient(
     match sender.send(&msg).await {
         Ok(()) => {
             let elapsed = send_start.elapsed().as_secs_f64();
-            let _ = ctx.store.mark_sent(event.event_id, &recipient.email).await;
+            // IMPORTANT: mark_sent failure after a successful SMTP send means
+            // the email was delivered but the row stays PENDING.  On AMQP
+            // re-delivery the idempotency check will see PENDING (Duplicate)
+            // and re-send, producing a duplicate.  Log at WARN so the operator
+            // can inspect and manually mark the row SENT if needed.
+            if let Err(e) = ctx.store.mark_sent(event.event_id, &recipient.email).await {
+                warn!(
+                    event_id = %event.event_id,
+                    email    = %recipient.email,
+                    error    = %e,
+                    "Email delivered but mark_sent DB write failed — \
+                     row remains PENDING; re-delivery will attempt to re-send"
+                );
+            }
             counter!("emails_sent_total",
                 "event_type" => event.event_type.clone())
             .increment(1);
@@ -503,25 +531,43 @@ pub async fn process_group(
             Err(e) => return RecipientOutcome::Failed(e),
         }
     };
-    let cc_json = if email_opts.cc.is_empty() {
+    // Serialize the post-filter (effective) CC/BCC lists so the DB record
+    // accurately reflects what was actually delivered, not the raw unfiltered
+    // input.  Storing pre-filter lists would show addresses that were never
+    // delivered to, and would waste a filter cycle on every retry.
+    let cc_json = if effective_cc.is_empty() {
         None
     } else {
-        match serde_json::to_value(&email_opts.cc)
-            .map_err(|e| AppError::permanent_mailer(format!("failed to serialize cc: {e}")))
+        match serde_json::to_value(
+            effective_cc
+                .iter()
+                .map(|r| serde_json::json!({"email": r.email, "name": r.name}))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| AppError::permanent_mailer(format!("failed to serialize cc: {e}")))
         {
             Ok(v) => Some(v),
             Err(e) => return RecipientOutcome::Failed(e),
         }
     };
-    let bcc_json = if email_opts.bcc.is_empty() {
+    let bcc_json = if effective_bcc.is_empty() {
         None
     } else {
-        match serde_json::to_value(&email_opts.bcc)
-            .map_err(|e| AppError::permanent_mailer(format!("failed to serialize bcc: {e}")))
+        match serde_json::to_value(
+            effective_bcc
+                .iter()
+                .map(|r| serde_json::json!({"email": r.email, "name": r.name}))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| AppError::permanent_mailer(format!("failed to serialize bcc: {e}")))
         {
             Ok(v) => Some(v),
             Err(e) => return RecipientOutcome::Failed(e),
         }
+    };
+    let group_retry_mode_str = match email_opts.group_retry_mode {
+        GroupRetryMode::Whole => "whole",
+        GroupRetryMode::Individual => "individual",
     };
 
     // Helper function to build EmailInsertPendingArgs for a given recipient.
@@ -534,6 +580,7 @@ pub async fn process_group(
         attachments_json: Option<&'a serde_json::Value>,
         cc_json: Option<&'a serde_json::Value>,
         bcc_json: Option<&'a serde_json::Value>,
+        group_retry_mode_str: &'a str,
     ) -> EmailInsertPendingArgs<'a> {
         EmailInsertPendingArgs {
             event_id: event.event_id,
@@ -547,6 +594,7 @@ pub async fn process_group(
             cc: cc_json,
             bcc: bcc_json,
             send_mode: email_opts.send_mode.as_str(),
+            group_retry_mode: Some(group_retry_mode_str),
             event_timestamp: event.timestamp,
         }
     }
@@ -562,6 +610,7 @@ pub async fn process_group(
             attachments_json.as_ref(),
             cc_json.as_ref(),
             bcc_json.as_ref(),
+            group_retry_mode_str,
         ))
         .await
     {
