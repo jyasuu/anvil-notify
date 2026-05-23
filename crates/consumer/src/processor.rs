@@ -132,6 +132,8 @@ pub async fn process_recipient(
                 );
                 false
             }
+            // Unexpected non-Blocked errors are treated as pass-through (fail-open):
+            // an unknown filter error should never silently drop a CC recipient.
             Err(_) => true,
         })
         .collect();
@@ -149,6 +151,8 @@ pub async fn process_recipient(
                 );
                 false
             }
+            // Unexpected non-Blocked errors are treated as pass-through (fail-open):
+            // an unknown filter error should never silently drop a BCC recipient.
             Err(_) => true,
         })
         .collect();
@@ -425,10 +429,10 @@ pub async fn process_group(
     }
     // Invalid CC/BCC addresses are a permanent failure.
     // Blocked addresses are excluded and logged at WARN level; delivery
-    // continues for the remaining CC/BCC recipients.  Same semantics as
-    // process_recipient.  Blocked CC/BCC do NOT get notification_log rows;
-    // consult structured logs (email=<addr>, message="CC address blocked")
-    // for the audit trail.
+    // continues for the remaining CC/BCC recipients and all allowed TO
+    // recipients.  Same semantics as process_recipient.  Blocked CC/BCC do
+    // NOT get notification_log rows; consult structured logs
+    // (email=<addr>, message="CC address blocked") for the audit trail.
     for r in email_opts.cc.iter().chain(email_opts.bcc.iter()) {
         if !is_valid_email(&r.email) {
             return RecipientOutcome::Failed(AppError::permanent_mailer(format!(
@@ -451,6 +455,8 @@ pub async fn process_group(
                 );
                 false
             }
+            // Unexpected non-Blocked errors are treated as pass-through (fail-open):
+            // an unknown filter error should never silently drop a CC recipient.
             Err(_) => true,
         })
         .collect();
@@ -468,6 +474,8 @@ pub async fn process_group(
                 );
                 false
             }
+            // Unexpected non-Blocked errors are treated as pass-through (fail-open):
+            // an unknown filter error should never silently drop a BCC recipient.
             Err(_) => true,
         })
         .collect();
@@ -599,45 +607,56 @@ pub async fn process_group(
         }
     }
 
-    // ── 4. Recipient filter — applied to all To: addresses ────────────────────
+    // ── 4. Recipient filter — partition To: addresses into allowed / blocked ───
     // Design note — TO vs CC/BCC asymmetry:
-    //   A blocked TO recipient drops the ENTIRE group delivery (all recipients
-    //   receive nothing).  A blocked CC/BCC address (step 2 above) is silently
-    //   excluded and delivery continues.  This is intentional:
-    //   • TO is the primary audience; a blocked address indicates the business
-    //     service included someone who must not receive this mail — a data-quality
-    //     issue that warrants a visible failure.
-    //   • CC/BCC is secondary; silencing the whole delivery for one unwanted
+    //   • Blocked TO recipients are excluded from the delivery; if *all* TO
+    //     addresses are blocked the entire group send is dropped.  If only *some*
+    //     are blocked, the mail is delivered to the remaining (allowed) addresses
+    //     and the blocked ones are marked BLOCKED in the DB.
+    //   • Blocked CC/BCC addresses (step 2 above) are silently excluded and
+    //     delivery always continues — silencing a whole delivery for one unwanted
     //     copy recipient would be disproportionate.
-    //   Operators: to recover, remove the blocked TO address from the event
-    //   payload and re-publish, or remove the address from the blocklist.
+    //   Operators: to recover from an all-blocked drop, remove the blocked TO
+    //   addresses from the event payload and re-publish, or update the blocklist.
+    let mut allowed_recipients: Vec<&Recipient> = Vec::with_capacity(recipients.len());
     for r in recipients {
-        if let Err(AppError::Blocked(reason)) = ctx.filter.check(&r.email) {
-            warn!(
-                blocked_email = %r.email,
-                reason = %reason,
-                recipient_count = recipients.len(),
-                "Group send: recipient blocked — dropping entire group delivery"
-            );
-            // Always mark the primary row blocked.
-            let _ = ctx
-                .store
-                .mark_blocked(event.event_id, &primary.email, &reason)
-                .await;
-            // For Individual mode, rows were inserted for every recipient — mark
-            // them all blocked so no row is left stranded in PENDING forever.
-            if email_opts.group_retry_mode == GroupRetryMode::Individual {
-                for other in recipients.iter().filter(|rec| rec.email != primary.email) {
-                    let _ = ctx
-                        .store
-                        .mark_blocked(event.event_id, &other.email, &reason)
-                        .await;
-                }
+        match ctx.filter.check(&r.email) {
+            Ok(()) => allowed_recipients.push(r),
+            Err(AppError::Blocked(ref reason)) => {
+                warn!(
+                    blocked_email = %r.email,
+                    reason = %reason,
+                    recipient_count = recipients.len(),
+                    "Group send: TO recipient blocked — excluding from delivery"
+                );
+                let _ = ctx
+                    .store
+                    .mark_blocked(event.event_id, &r.email, reason)
+                    .await;
+                counter!("emails_blocked_total", "event_type" => event.event_type.clone())
+                    .increment(1);
             }
-            counter!("emails_blocked_total", "event_type" => event.event_type.clone()).increment(1);
-            return RecipientOutcome::Blocked(reason);
+            // Non-Blocked filter errors are treated as pass-through (fail-open)
+            // so an unexpected filter error never silently drops a recipient.
+            Err(_) => allowed_recipients.push(r),
         }
     }
+
+    // If every TO address was blocked there is nothing left to send.
+    if allowed_recipients.is_empty() {
+        // The primary row was already marked BLOCKED in the loop above.
+        // For Individual mode, all other rows were also marked there.
+        warn!(
+            event_id = %event.event_id,
+            "Group send: all TO recipients blocked — dropping delivery"
+        );
+        return RecipientOutcome::Blocked("all TO recipients blocked by filter".into());
+    }
+
+    // Shadow `recipients` so the rest of the function operates only on the
+    // allowed subset — template rendering, EmailMessage construction, DB
+    // mark_sent calls, and the `to_count` log field all stay consistent.
+    let recipients = allowed_recipients;
 
     // ── 5. Template rendering ────────────────────────────────────────────────
     let (subject, body_html, body_text) = match (

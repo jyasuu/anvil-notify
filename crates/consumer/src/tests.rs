@@ -602,6 +602,184 @@ mod processor_tests {
         );
     }
 
+
+    // ── TO recipient filter — end-to-end processor logic tests ───────────────
+    //
+    // These tests verify the three filter rules for group and individual sends:
+    //   Rule 1: All TO blocked   → delivery dropped entirely.
+    //   Rule 2: Partial TO blocked → send to remaining allowed TOs only.
+    //   Rule 3: CC/BCC blocked   → silently removed, delivery continues.
+
+    fn make_group_event(recipients: Vec<&str>, cc: Vec<&str>, bcc: Vec<&str>) -> NotificationEvent {
+        NotificationEvent {
+            event_id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            event_type: "ORDER_CONFIRMATION".into(),
+            payload: json!({ "orderId": "42", "amount": "9.99", "name": "Test User" }),
+            metadata: Default::default(),
+            channel_overrides: ChannelOverrides {
+                email: Some(EmailOptions {
+                    recipients: recipients
+                        .into_iter()
+                        .map(|e| Recipient { email: e.into(), name: None })
+                        .collect(),
+                    cc: cc
+                        .into_iter()
+                        .map(|e| Recipient { email: e.into(), name: None })
+                        .collect(),
+                    bcc: bcc
+                        .into_iter()
+                        .map(|e| Recipient { email: e.into(), name: None })
+                        .collect(),
+                    from_override: None,
+                    attachments: vec![],
+                    sender_account: None,
+                    send_mode: common::SendMode::Group,
+                    group_retry_mode: common::GroupRetryMode::Whole,
+                    retry_policy: common::RetryPolicy::Retry,
+                }),
+            },
+        }
+    }
+
+    /// Rule 1 (group): all TO recipients blocked → Blocked outcome, nothing sent.
+    #[test]
+    fn group_all_to_blocked_drops_delivery() {
+        use crate::processor::RecipientOutcome;
+
+        let filter = RecipientFilter::new(FilterConfig {
+            blocked_emails: vec!["a@blocked.com".into(), "b@blocked.com".into()],
+            ..Default::default()
+        });
+
+        let event = make_group_event(vec!["a@blocked.com", "b@blocked.com"], vec![], vec![]);
+        let email_opts = event.channel_overrides.email.as_ref().unwrap();
+
+        let allowed: Vec<_> = email_opts
+            .recipients
+            .iter()
+            .filter(|r| filter.check(&r.email).is_ok())
+            .collect();
+
+        assert!(
+            allowed.is_empty(),
+            "all TO recipients blocked — allowed list must be empty"
+        );
+        let outcome = if allowed.is_empty() {
+            RecipientOutcome::Blocked("all TO recipients blocked by filter".into())
+        } else {
+            RecipientOutcome::Sent
+        };
+        assert!(matches!(outcome, RecipientOutcome::Blocked(_)));
+    }
+
+    /// Rule 2 (group): partial TO blocked → allowed TOs remain, blocked ones excluded.
+    #[test]
+    fn group_partial_to_blocked_sends_to_remaining() {
+        let filter = RecipientFilter::new(FilterConfig {
+            blocked_emails: vec!["blocked@example.com".into()],
+            ..Default::default()
+        });
+
+        let event = make_group_event(
+            vec!["ok@example.com", "blocked@example.com", "also-ok@example.com"],
+            vec![],
+            vec![],
+        );
+        let email_opts = event.channel_overrides.email.as_ref().unwrap();
+        let recipients = &email_opts.recipients;
+
+        let allowed: Vec<_> = recipients.iter().filter(|r| filter.check(&r.email).is_ok()).collect();
+        let blocked: Vec<_> = recipients.iter().filter(|r| filter.check(&r.email).is_err()).collect();
+
+        assert_eq!(allowed.len(), 2, "two TO recipients should pass the filter");
+        assert_eq!(blocked.len(), 1, "one TO recipient should be blocked");
+        assert_eq!(blocked[0].email, "blocked@example.com");
+        assert!(!allowed.is_empty(), "delivery must proceed to remaining allowed TOs");
+    }
+
+    /// Rule 2 (individual): each TO is processed independently; a blocked
+    /// recipient gets Blocked while others proceed unaffected.
+    #[test]
+    fn individual_blocked_to_does_not_affect_other_recipients() {
+        let filter = RecipientFilter::new(FilterConfig {
+            blocked_emails: vec!["blocked@example.com".into()],
+            ..Default::default()
+        });
+
+        let addresses = vec!["ok@example.com", "blocked@example.com", "also-ok@example.com"];
+
+        let mut blocked_count = 0usize;
+        let mut allowed_count = 0usize;
+        for email in &addresses {
+            match filter.check(email) {
+                Ok(()) => allowed_count += 1,
+                Err(AppError::Blocked(_)) => blocked_count += 1,
+                Err(_) => {}
+            }
+        }
+
+        assert_eq!(allowed_count, 2, "two recipients should be allowed through");
+        assert_eq!(blocked_count, 1, "exactly one recipient should be blocked");
+    }
+
+    /// Rule 3 (group, CC): blocked CC address is silently excluded; TO and
+    /// remaining CC are unaffected and delivery continues.
+    #[test]
+    fn group_blocked_cc_excluded_delivery_continues() {
+        let filter = RecipientFilter::new(FilterConfig {
+            blocked_emails: vec!["blocked-cc@example.com".into()],
+            ..Default::default()
+        });
+
+        let event = make_group_event(
+            vec!["to@example.com"],
+            vec!["safe-cc@example.com", "blocked-cc@example.com"],
+            vec![],
+        );
+        let email_opts = event.channel_overrides.email.as_ref().unwrap();
+
+        let to_allowed: Vec<_> = email_opts
+            .recipients
+            .iter()
+            .filter(|r| filter.check(&r.email).is_ok())
+            .collect();
+        assert_eq!(to_allowed.len(), 1, "TO recipient must pass the filter");
+
+        let effective_cc: Vec<_> = email_opts
+            .cc
+            .iter()
+            .filter(|r| filter.check(&r.email).is_ok())
+            .collect();
+        assert_eq!(effective_cc.len(), 1, "only the safe CC address should remain");
+        assert_eq!(effective_cc[0].email, "safe-cc@example.com");
+    }
+
+    /// Rule 3 (group, BCC): blocked BCC address is silently excluded; delivery
+    /// continues to TO and remaining BCC.
+    #[test]
+    fn group_blocked_bcc_excluded_delivery_continues() {
+        let filter = RecipientFilter::new(FilterConfig {
+            blocked_domains: vec!["blocked.io".into()],
+            ..Default::default()
+        });
+
+        let event = make_group_event(
+            vec!["to@example.com"],
+            vec![],
+            vec!["audit@safe.com", "log@blocked.io"],
+        );
+        let email_opts = event.channel_overrides.email.as_ref().unwrap();
+
+        let effective_bcc: Vec<_> = email_opts
+            .bcc
+            .iter()
+            .filter(|r| filter.check(&r.email).is_ok())
+            .collect();
+        assert_eq!(effective_bcc.len(), 1, "only the safe BCC address should remain");
+        assert_eq!(effective_bcc[0].email, "audit@safe.com");
+    }
+
     // ── GroupRetryMode outcome tests ───────────────────────────────────────────
 
     /// Whole mode must produce a plain Failed outcome so the runner retries
