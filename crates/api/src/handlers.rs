@@ -43,48 +43,23 @@ async fn republish_event(
     event_id: Uuid,
     only_emails: Option<&[String]>,
 ) -> Result<(), ApiError> {
+    // ── 1. Fetch per-recipient rows (for recipient list reconstruction) ───────
     let logs = state.store.get_by_event_id(event_id).await?;
-    if logs.is_empty() {
-        return Err(ApiError(AppError::NotFound(event_id.to_string())));
-    }
 
-    // Invariant: all rows for the same event_id must share the same
-    // event_type. This is guaranteed by the consumer (one event → one
-    // event_type) and by the DB schema (event_type is stored per-row for
-    // query convenience, not as an independent source of truth). If rows
-    // disagree it indicates data corruption; surface a 500 rather than
-    // silently picking an arbitrary winner.
-    let event_type = {
-        let first = logs[0].event_type.clone();
-        let mismatch = logs.iter().any(|l| l.event_type != first);
-        if mismatch {
-            let types: Vec<_> = logs.iter().map(|l| l.event_type.as_str()).collect();
-            tracing::error!(
-                event_id = %event_id,
-                types = ?types,
-                "Data integrity violation: rows for the same event_id have different event_types"
-            );
-            return Err(ApiError(AppError::Queue(format!(
-                "event {event_id} has inconsistent event_types in notification_log — \
-                 this indicates data corruption; inspect the rows before retrying"
-            ))));
-        }
-        first
-    };
+    // ── 2. Fetch the authoritative event-level detail (single source of truth) ─
+    //
+    // All rows for the same event_id share identical event-level fields
+    // (payload, from_override, attachments, cc, bcc, send_mode,
+    // group_retry_mode, sender_account).  `get_event_delivery_detail` reads
+    // them from the first row and asserts consistency in debug builds,
+    // replacing the previous `find_map` scatter that would silently pick
+    // whichever row happened to be first if rows diverged after data repair.
+    let detail = state.store.get_event_delivery_detail(event_id).await?;
 
-    // All recipients of the same event share the same template payload,
-    // from_override, and attachments — use the first non-null value found.
-    let template_payload = logs
-        .iter()
-        .find_map(|l| l.payload.clone())
-        .unwrap_or(serde_json::Value::Object(Default::default()));
-
-    let from_override = logs.iter().find_map(|l| l.from_override.clone());
-
-    // Validate the from_override email address before re-enqueuing so a stored
-    // bad address is rejected here (400) rather than causing a guaranteed
-    // permanent failure on the consumer side for every retry attempt.
-    if let Some(ref ov) = from_override {
+    // ── 3. Validate stored from_override address ──────────────────────────────
+    // Reject before re-enqueuing so a stored bad address surfaces as a 400
+    // here rather than a guaranteed permanent failure on every consumer retry.
+    if let Some(ref ov) = detail.from_override {
         if let Some(email) = ov.get("email").and_then(|v| v.as_str()) {
             if !is_valid_email(email) {
                 return Err(ApiError(AppError::permanent_mailer(format!(
@@ -95,44 +70,24 @@ async fn republish_event(
         }
     }
 
-    let attachments = logs
-        .iter()
-        .find_map(|l| l.attachments.clone())
+    // ── 4. Determine original timestamp ──────────────────────────────────────
+    //
+    // Use the stored event_timestamp (the NotificationEvent.timestamp written
+    // by the business service).  This ensures attachment expiry checks use the
+    // publication time, not the consumer processing time.
+    //
+    // For pre-0023 rows where event_timestamp is NULL, fall back to the
+    // earliest created_at across all rows — the same proxy used before the
+    // column existed.
+    let original_timestamp = detail.event_timestamp.unwrap_or(detail.earliest_created_at);
+
+    // ── 5. Attachment expiry check ────────────────────────────────────────────
+    let attachments_raw = detail
+        .attachments
+        .clone()
         .unwrap_or(serde_json::Value::Array(vec![]));
 
-    // Use the stored event_timestamp (the original NotificationEvent.timestamp
-    // written by the business service) as the envelope timestamp.  This is
-    // distinct from created_at (the DB insertion time, i.e. when the consumer
-    // first processed the event).
-    //
-    // Using event_timestamp ensures attachment expiry checks (max_age_secs)
-    // are evaluated against the publication time, which matches what the
-    // business service intended when it set the URL's TTL.  Using created_at
-    // or Utc::now() instead would:
-    //   • created_at: shift the reference point by queue and processing lag,
-    //     causing fresh URLs to appear older than they are.
-    //   • Utc::now(): reset the clock entirely, allowing already-expired URLs
-    //     to slip past validation on retry.
-    //
-    // For rows written before migration 0023 (event_timestamp column absent),
-    // fall back to the minimum created_at across all log rows — the same proxy
-    // that was used before this fix, which preserves backward compatibility.
-    let original_timestamp = logs
-        .iter()
-        .find_map(|l| l.event_timestamp)
-        .unwrap_or_else(|| {
-            logs.iter()
-                .map(|l| l.created_at)
-                .min()
-                .unwrap_or_else(Utc::now)
-        });
-
-    // Warn callers when stored attachment URLs are provably expired so they
-    // learn upfront rather than getting a cryptic permanent-failure on the
-    // consumer side.  We only check refs that carry a `max_age_secs` hint;
-    // pre-signed URLs without the hint are forwarded unconditionally (the
-    // fetcher will classify a 4xx response as a permanent error).
-    if let Some(refs) = attachments.as_array() {
+    if let Some(refs) = attachments_raw.as_array() {
         let age_secs = Utc::now()
             .signed_duration_since(original_timestamp)
             .num_seconds()
@@ -161,11 +116,10 @@ async fn republish_event(
         }
     }
 
-    // Only include the recipients that were actually reset. For single-recipient
-    // retry this is just the one email; for bulk retry it is all reset addresses.
-    // This avoids publishing already-terminal (SENT/BLOCKED) recipients into the
-    // queue, which would cause unnecessary AMQP round-trips and consumer log noise
-    // (even though the idempotency guard would skip them on re-delivery).
+    // ── 6. Reconstruct recipient list ─────────────────────────────────────────
+    // Only include the recipients that were actually reset (the caller
+    // supplies the subset).  Avoids re-enqueuing already-terminal
+    // (SENT/BLOCKED) addresses and the AMQP round-trips they would cause.
     let recipients: Vec<Recipient> = logs
         .iter()
         .filter(|l| {
@@ -175,79 +129,49 @@ async fn republish_event(
         })
         .map(|l| Recipient {
             email: l.recipient_email.clone(),
-            // Preserve the original display name so templates that use {{name}}
-            // render correctly on retried deliveries (pre-0011 rows have NULL
-            // which is omitted, matching the original behaviour).
+            // Preserve display name so {{name}} renders correctly on retry.
             name: l.recipient_name.clone(),
         })
         .collect();
 
-    // Recover the sender_account name used for the original delivery so the
-    // retry uses the same SMTP account and From address (fix: pre-0014 rows
-    // have NULL here, which causes the consumer to fall back to the global
-    // [mailer] default — acceptable for legacy rows).
-    let sender_account = logs.iter().find_map(|l| l.sender_account.clone());
-
-    // Deserialize the stored from_override JSON back into the typed struct so
-    // the retry envelope is always built through NotificationEvent — guaranteeing
-    // the serialized field names match what the consumer deserializes.
-    let from_override: Option<FromOverride> = from_override
+    // ── 7. Deserialize typed fields from the detail ───────────────────────────
+    let from_override: Option<FromOverride> = detail
+        .from_override
         .as_ref()
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
-    // Deserialize stored attachment refs back to typed structs for the same
-    // reason — field names are guaranteed consistent with NotificationEvent.
-    let attachments: Vec<AttachmentRef> = serde_json::from_value(attachments).unwrap_or_default();
+    let attachments: Vec<AttachmentRef> =
+        serde_json::from_value(attachments_raw).unwrap_or_default();
 
-    // Restore CC/BCC recipients from the stored JSONB columns (added in
-    // migration 0020). Pre-0020 rows have NULL here and fall back to empty
-    // lists, preserving the behaviour that existed before CC/BCC storage was
-    // introduced. The first non-null value across all log rows is used because
-    // CC/BCC are shared across all recipients of the same event.
-    let cc: Vec<Recipient> = logs
-        .iter()
-        .find_map(|l| l.cc.clone())
+    let cc: Vec<Recipient> = detail
+        .cc
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
 
-    let bcc: Vec<Recipient> = logs
-        .iter()
-        .find_map(|l| l.bcc.clone())
+    let bcc: Vec<Recipient> = detail
+        .bcc
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
 
-    // Restore the original send_mode from the stored column (added in migration
-    // 0023).  Pre-0023 rows have NULL; fall back to Individual, which matches
-    // the behaviour that existed before group-mode was introduced.
-    let send_mode = logs
-        .iter()
-        .find_map(|l| l.send_mode.as_deref())
+    let send_mode = detail
+        .send_mode
+        .as_deref()
         .map(|s| match s {
             "group" => common::SendMode::Group,
             _ => common::SendMode::Individual,
         })
         .unwrap_or(common::SendMode::Individual);
 
-    // Restore the original group_retry_mode from the stored column (added in
-    // migration 0028).  Pre-0028 rows have NULL; fall back to Whole, which
-    // matches the default that existed before this column was introduced.
-    //
-    // IMPORTANT: without this restore a group event originally published with
-    // GroupRetryMode::Individual (which inserts per-recipient rows and skips
-    // already-SENT addresses on re-delivery) would be retried with
-    // GroupRetryMode::Whole — risking duplicate sends to recipients whose
-    // delivery was already accepted by the SMTP server in the prior attempt.
-    let group_retry_mode = logs
-        .iter()
-        .find_map(|l| l.group_retry_mode.as_deref())
+    let group_retry_mode = detail
+        .group_retry_mode
+        .as_deref()
         .map(|s| match s {
             "individual" => common::GroupRetryMode::Individual,
             _ => common::GroupRetryMode::Whole,
         })
         .unwrap_or_default();
 
-    // Warn when retrying a group-mode event so operators are aware of the
-    // double-send risk under GroupRetryMode::Whole.
+    // ── 8. Double-send warning for group+whole retries ────────────────────────
     if send_mode == common::SendMode::Group && group_retry_mode == common::GroupRetryMode::Whole {
         tracing::warn!(
             %event_id,
@@ -257,10 +181,9 @@ async fn republish_event(
         );
     }
 
-    // Validate CC/BCC addresses against the recipient filter before re-enqueuing.
-    // Without this, the retry API would accept the request, publish the event,
-    // and the consumer would immediately produce a permanent CC/BCC-blocked failure —
-    // a wasted round-trip and confusing operator experience.
+    // ── 9. Filter validation ──────────────────────────────────────────────────
+    // CC/BCC: hard-reject blocked addresses so the retry doesn't round-trip
+    // to the consumer only to produce an immediate blocked failure.
     for r in cc.iter().chain(bcc.iter()) {
         if let Err(common::AppError::Blocked(reason)) = state.filter.check(&r.email) {
             return Err(ApiError(AppError::permanent_mailer(format!(
@@ -270,12 +193,8 @@ async fn republish_event(
             ))));
         }
     }
-
-    // Validate TO recipients against the filter for the same reason: a blocked
-    // TO address will be immediately marked BLOCKED by the consumer, making the
-    // re-enqueue a no-op at best and a source of confusing log noise at worst.
-    // We warn rather than hard-reject so an operator can still force a retry if
-    // the blocklist has been updated since the original failure.
+    // TO: warn only — the operator may have already updated the blocklist and
+    // wants the consumer to confirm the removal.
     for r in recipients.iter() {
         if let Err(common::AppError::Blocked(reason)) = state.filter.check(&r.email) {
             tracing::warn!(
@@ -288,14 +207,12 @@ async fn republish_event(
         }
     }
 
-    // Build the canonical NotificationEvent envelope. Email-specific fields
-    // (recipients, attachments, from_override, sender_account, cc, bcc) live
-    // inside channel_overrides.email so the envelope stays channel-agnostic.
+    // ── 10. Build and publish the replay envelope ─────────────────────────────
     let event = NotificationEvent {
         event_id,
         timestamp: original_timestamp,
-        event_type,
-        payload: template_payload,
+        event_type: detail.event_type,
+        payload: detail.payload,
         metadata: Metadata { source: None },
         channel_overrides: ChannelOverrides {
             email: Some(EmailOptions {
@@ -304,7 +221,7 @@ async fn republish_event(
                 bcc,
                 from_override,
                 attachments,
-                sender_account,
+                sender_account: detail.sender_account,
                 send_mode,
                 group_retry_mode,
                 retry_policy: RetryPolicy::default(),

@@ -45,97 +45,148 @@ impl std::fmt::Display for NotificationStatus {
     }
 }
 
-// Back-compat alias — callers that still use `EmailStatus` continue to compile.
+// Back-compat alias.
 pub use NotificationStatus as EmailStatus;
 
-/// Channel-agnostic delivery log row.
+// ── Channel-agnostic delivery state ──────────────────────────────────────────
+
+/// The channel-agnostic half of a delivery row.
 ///
-/// Maps 1-to-1 with `notification_log` + `email_notification_log`.
-/// Keyed by `(event_id, recipient_email)` — one row per recipient per event.
+/// Maps 1-to-1 with `notification_log` columns that apply to *every* channel
+/// (email, SMS, push, …).  Channel-specific replay data lives in the sibling
+/// structs (`EmailDeliveryDetail`, and future `SmsDeliveryDetail`, etc.).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NotificationLog {
+pub struct NotificationLogRow {
     pub id: Uuid,
     pub event_id: Uuid,
-    /// The specific recipient this row tracks.
-    pub recipient_email: String,
-    /// Optional display name for the recipient (e.g. "Alice Smith").
-    /// Stored so it can be faithfully re-published on manual retry,
-    /// preventing templates that use {{name}} from rendering the raw
-    /// placeholder on retried deliveries.
-    /// Nullable for rows written before migration 0011.
-    pub recipient_name: Option<String>,
     pub event_type: String,
+    pub channel: String,
+    /// Channel-native recipient identity: email address, E.164 phone, device
+    /// token, etc.
+    pub recipient_id: String,
     pub status: NotificationStatus,
-    /// How many automatic retry attempts have been made in the current attempt
-    /// window.  Reset to 0 when an operator manually retries via the HTTP API
-    /// so the recipient gets a fresh set of automatic retries.
+    /// Resets to 0 on each manual operator retry.
     pub retry_count: i32,
-    /// Lifetime delivery attempt counter — never reset, even on manual retry.
-    /// Useful for auditing and detecting persistently failing addresses.
+    /// Lifetime counter — never reset.
     pub total_attempts: i32,
     pub last_error: Option<String>,
-    /// Original template payload stored for retry reconstruction.
-    /// Nullable for rows written before migration 0007.
+    /// Original template payload forwarded to the renderer.
     pub payload: Option<serde_json::Value>,
-    /// Per-event From address override stored for retry reconstruction.
-    /// Nullable for rows written before migration 0009.
-    pub from_override: Option<serde_json::Value>,
-    /// URL-based attachment references stored for retry reconstruction.
-    /// Nullable for rows written before migration 0009.
-    pub attachments: Option<serde_json::Value>,
-    /// Named SMTP sender account used for the original delivery.
-    /// Stored so manual retries via the HTTP API send from the same account.
-    /// NULL means the global [mailer] default was used.
-    /// Nullable for rows written before migration 0014.
-    pub sender_account: Option<String>,
-    /// CC recipients stored for retry reconstruction.
-    /// JSON array of `{"email": "...", "name": "..."}` objects, or NULL.
-    /// Nullable for rows written before migration 0020.
-    pub cc: Option<serde_json::Value>,
-    /// BCC recipients stored for retry reconstruction.
-    /// JSON array of `{"email": "...", "name": "..."}` objects, or NULL.
-    /// Nullable for rows written before migration 0020.
-    pub bcc: Option<serde_json::Value>,
-    /// Delivery mode of the original event: `"individual"` or `"group"`.
-    ///
-    /// Stored so manual retries via the HTTP API faithfully replay the
-    /// original behaviour.  Without this, group-mode events (all recipients
-    /// share one email) would be incorrectly retried as individual-mode
-    /// (separate email per address), silently changing what recipients see.
-    ///
-    /// Nullable for rows written before migration 0023; treated as
-    /// `SendMode::Individual` on retry (same default as before group-mode
-    /// was introduced).
-    pub send_mode: Option<String>,
-
-    /// Retry strategy for group-mode events: `"whole"` or `"individual"`.
-    ///
-    /// `"whole"` — retry the entire group email as a unit.
-    /// `"individual"` — on failure, fall back to per-recipient individual sends,
-    /// skipping addresses that already have a `SENT` row.
-    ///
-    /// Stored so manual retries via the HTTP API use the same retry strategy as
-    /// the original delivery.  Without this, a group event originally published
-    /// with `GroupRetryMode::Individual` (which inserts per-recipient rows and
-    /// skips already-SENT addresses on retry) would be incorrectly retried with
-    /// `GroupRetryMode::Whole` — risking duplicate sends to recipients whose
-    /// delivery was already accepted by the SMTP server.
-    ///
-    /// Nullable for rows written before migration 0028; treated as
-    /// `GroupRetryMode::Whole` on retry (same default as before this column existed).
-    pub group_retry_mode: Option<String>,
-    /// The `NotificationEvent.timestamp` written by the business service.
-    ///
-    /// Distinct from `created_at` (the DB insertion time).  Used by
-    /// `republish_event()` for attachment expiry checks so the consumer and
-    /// API agree on what "expired" means regardless of queue or processing lag.
-    ///
-    /// Nullable for rows written before migration 0023; `republish_event()`
-    /// falls back to `created_at` as a proxy for those legacy rows.
+    /// The `NotificationEvent.timestamp` from the publishing business service.
+    /// Used for attachment-expiry checks.  Nullable for pre-0023 rows.
     pub event_timestamp: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-// Back-compat alias — callers that still use `EmailLog` continue to compile.
+// ── Email-specific replay data ────────────────────────────────────────────────
+
+/// The email-specific half of a delivery row.
+///
+/// Maps to `email_notification_log`.  All fields here are needed only to
+/// faithfully replay an email on manual retry; they have no meaning for
+/// other channels.
+///
+/// These fields are *event-level* (shared across every recipient row of the
+/// same event) rather than per-recipient.  `republish_event()` reads them
+/// from the first row for the event — they are guaranteed identical across
+/// rows by the consumer write path (one event → one set of options written
+/// to every row it produces).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmailDeliveryDetail {
+    /// The specific email address this row was delivered to.
+    pub recipient_email: String,
+    /// Optional display name for the recipient.
+    pub recipient_name: Option<String>,
+
+    // ── Event-level fields (same across all rows for the same event_id) ──────
+    /// Per-event From address override.  JSONB: `{"email":"…","name":"…"}`.
+    /// NULL → use global [mailer] defaults.
+    pub from_override: Option<serde_json::Value>,
+    /// Named SMTP sender account key.  NULL → use global [mailer] defaults.
+    pub sender_account: Option<String>,
+    /// `"individual"` or `"group"`.
+    pub send_mode: Option<String>,
+    /// `"whole"` or `"individual"` (group retry strategy).
+    pub group_retry_mode: Option<String>,
+    /// Attachment URL references.  JSONB array.
+    pub attachments: Option<serde_json::Value>,
+    /// CC recipients (post-filter).  JSONB array of `{"email":"…","name":"…"}`.
+    pub cc: Option<serde_json::Value>,
+    /// BCC recipients (post-filter).  JSONB array.
+    pub bcc: Option<serde_json::Value>,
+}
+
+// ── Composed view (backwards-compatible flat struct) ─────────────────────────
+
+/// Flat delivery log used by the API handlers and tests.
+///
+/// Composes [`NotificationLogRow`] (channel-agnostic state) with
+/// [`EmailDeliveryDetail`] (email-specific replay data).  Preserving the flat
+/// shape keeps existing call sites unchanged while the two sub-structs can
+/// evolve independently.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationLog {
+    // ── From NotificationLogRow ───────────────────────────────────────────────
+    pub id: Uuid,
+    pub event_id: Uuid,
+    pub event_type: String,
+    pub status: NotificationStatus,
+    pub retry_count: i32,
+    pub total_attempts: i32,
+    pub last_error: Option<String>,
+    pub payload: Option<serde_json::Value>,
+    pub event_timestamp: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+
+    // ── From EmailDeliveryDetail ──────────────────────────────────────────────
+    pub recipient_email: String,
+    pub recipient_name: Option<String>,
+    pub from_override: Option<serde_json::Value>,
+    pub sender_account: Option<String>,
+    pub send_mode: Option<String>,
+    pub group_retry_mode: Option<String>,
+    pub attachments: Option<serde_json::Value>,
+    pub cc: Option<serde_json::Value>,
+    pub bcc: Option<serde_json::Value>,
+}
+
+impl NotificationLog {
+    /// Extract the channel-agnostic state portion.
+    pub fn core(&self) -> NotificationLogRow {
+        NotificationLogRow {
+            id: self.id,
+            event_id: self.event_id,
+            event_type: self.event_type.clone(),
+            channel: "email".into(),
+            recipient_id: self.recipient_email.clone(),
+            status: self.status.clone(),
+            retry_count: self.retry_count,
+            total_attempts: self.total_attempts,
+            last_error: self.last_error.clone(),
+            payload: self.payload.clone(),
+            event_timestamp: self.event_timestamp,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+
+    /// Extract the email-specific replay data.
+    pub fn email_detail(&self) -> EmailDeliveryDetail {
+        EmailDeliveryDetail {
+            recipient_email: self.recipient_email.clone(),
+            recipient_name: self.recipient_name.clone(),
+            from_override: self.from_override.clone(),
+            sender_account: self.sender_account.clone(),
+            send_mode: self.send_mode.clone(),
+            group_retry_mode: self.group_retry_mode.clone(),
+            attachments: self.attachments.clone(),
+            cc: self.cc.clone(),
+            bcc: self.bcc.clone(),
+        }
+    }
+}
+
+// Back-compat alias.
 pub use NotificationLog as EmailLog;

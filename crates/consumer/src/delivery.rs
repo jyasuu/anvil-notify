@@ -20,7 +20,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{AppError, NotificationEvent, Recipient, RetryPolicy, SendMode};
+use common::{is_valid_email, AppError, NotificationEvent, Recipient, RetryPolicy, SendMode};
 use lapin::{message::Delivery, options::*};
 use mailer::fetch_attachments_with_limit;
 use mailer::message::ResolvedAttachment;
@@ -33,7 +33,8 @@ use tracing::{error, warn};
 use crate::{
     config::ConsumerConfig,
     processor::{
-        is_retryable, process_group, process_recipient, ProcessorContext, RecipientOutcome,
+        is_retryable, process_group, process_recipient, EffectiveCcBcc, ProcessorContext,
+        RecipientOutcome,
     },
 };
 
@@ -170,6 +171,67 @@ pub(crate) async fn handle_delivery(
         }
     };
 
+    // ── CC/BCC validation and filtering (once per event) ──────────────────
+    // Invalid CC/BCC addresses are a permanent failure for the whole event.
+    // Blocked CC/BCC addresses are silently excluded — logged at WARN level —
+    // and delivery continues.  This runs once here rather than inside each
+    // per-recipient task to avoid N×M filter evaluations and log noise.
+    for r in email_opts.cc.iter().chain(email_opts.bcc.iter()) {
+        if !is_valid_email(&r.email) {
+            warn!(
+                event_id = %event.event_id,
+                email    = %r.email,
+                "Invalid CC/BCC address — sending to DLQ"
+            );
+            let _ = delivery
+                .nack(BasicNackOptions {
+                    requeue: false,
+                    ..Default::default()
+                })
+                .await;
+            return;
+        }
+    }
+    let cc_bcc = {
+        let cc: Vec<Recipient> = email_opts
+            .cc
+            .iter()
+            .filter(|r| match ctx.filter.check(&r.email) {
+                Ok(()) => true,
+                Err(AppError::Blocked(ref reason)) => {
+                    warn!(
+                        event_id = %event.event_id,
+                        email    = %r.email,
+                        reason   = %reason,
+                        "CC address blocked by filter — excluding from delivery"
+                    );
+                    false
+                }
+                Err(_) => true, // fail-open: unknown filter errors never silently drop
+            })
+            .cloned()
+            .collect();
+        let bcc: Vec<Recipient> = email_opts
+            .bcc
+            .iter()
+            .filter(|r| match ctx.filter.check(&r.email) {
+                Ok(()) => true,
+                Err(AppError::Blocked(ref reason)) => {
+                    warn!(
+                        event_id = %event.event_id,
+                        email    = %r.email,
+                        reason   = %reason,
+                        "BCC address blocked by filter — excluding from delivery"
+                    );
+                    false
+                }
+                Err(_) => true,
+            })
+            .cloned()
+            .collect();
+        Arc::new(EffectiveCcBcc { cc, bcc })
+    };
+
     // ── Dispatch: group send or per-recipient individual sends ───────────────
     if email_opts.send_mode == SendMode::Group {
         process_one_group(
@@ -177,6 +239,7 @@ pub(crate) async fn handle_delivery(
             &event,
             &email_opts,
             &resolved_attachments,
+            cc_bcc,
             &cfg,
             &shutdown,
         )
@@ -193,9 +256,12 @@ pub(crate) async fn handle_delivery(
             let atts = resolved_attachments.clone();
             let cfg = cfg.clone();
             let shutdown = shutdown.clone();
+            let cc_bcc = Arc::clone(&cc_bcc);
             join_set.spawn(async move {
-                process_one_recipient(&ctx, &event, &opts, &recipient, &atts, &cfg, &shutdown)
-                    .await;
+                process_one_recipient(
+                    &ctx, &event, &opts, &recipient, &atts, &cc_bcc, &cfg, &shutdown,
+                )
+                .await;
             });
         }
         while let Some(result) = join_set.join_next().await {
@@ -219,12 +285,14 @@ pub(crate) async fn handle_delivery(
 /// Each call to `process_recipient` produces a `RecipientOutcome`; this
 /// function decides whether to retry, back off, or give up, and keeps
 /// looping until a terminal outcome is reached.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_one_recipient(
     ctx: &ProcessorContext,
     event: &NotificationEvent,
     email_opts: &common::EmailOptions,
     recipient: &Recipient,
     attachments: &[ResolvedAttachment],
+    cc_bcc: &Arc<EffectiveCcBcc>,
     cfg: &ConsumerConfig,
     shutdown: &CancellationToken,
 ) {
@@ -235,7 +303,17 @@ pub(crate) async fn process_one_recipient(
     let mut rl_count: u32 = 0;
 
     loop {
-        match process_recipient(ctx, event, email_opts, recipient, attachments, shutdown).await {
+        match process_recipient(
+            ctx,
+            event,
+            email_opts,
+            recipient,
+            attachments,
+            cc_bcc,
+            shutdown,
+        )
+        .await
+        {
             RecipientOutcome::Sent | RecipientOutcome::Blocked(_) | RecipientOutcome::Skipped => {
                 return;
             }
@@ -440,6 +518,7 @@ pub(crate) async fn process_one_group(
     event: &NotificationEvent,
     email_opts: &common::EmailOptions,
     attachments: &[ResolvedAttachment],
+    cc_bcc: Arc<EffectiveCcBcc>,
     cfg: &ConsumerConfig,
     shutdown: &CancellationToken,
 ) {
@@ -579,9 +658,10 @@ pub(crate) async fn process_one_group(
                     let atts = attachments.to_vec();
                     let cfg = cfg.clone();
                     let shutdown = shutdown.clone();
+                    let cc_bcc = cc_bcc.clone();
                     join_set.spawn(async move {
                         process_one_recipient(
-                            &ctx, &event, &opts, &recipient, &atts, &cfg, &shutdown,
+                            &ctx, &event, &opts, &recipient, &atts, &cc_bcc, &cfg, &shutdown,
                         )
                         .await;
                     });
