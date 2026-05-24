@@ -149,12 +149,11 @@ async fn republish_event(
         })
         .transpose()?;
 
-    let attachments: Vec<AttachmentRef> = serde_json::from_value(attachments_raw)
-        .map_err(|e| {
-            ApiError(AppError::permanent_mailer(format!(
-                "stored attachments JSON is malformed and cannot be deserialized: {e}"
-            )))
-        })?;
+    let attachments: Vec<AttachmentRef> = serde_json::from_value(attachments_raw).map_err(|e| {
+        ApiError(AppError::permanent_mailer(format!(
+            "stored attachments JSON is malformed and cannot be deserialized: {e}"
+        )))
+    })?;
 
     let cc: Vec<Recipient> = detail
         .cc

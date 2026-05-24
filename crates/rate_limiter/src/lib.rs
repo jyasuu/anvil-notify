@@ -111,7 +111,10 @@ impl MailRateLimiter {
     /// being rate-limited, rather than on every send.
     ///
     /// Returns [`TokenResult::Acquired`] immediately when rate limiting is disabled.
-    pub async fn wait_for_token(&self, shutdown: &tokio_util::sync::CancellationToken) -> TokenResult {
+    pub async fn wait_for_token(
+        &self,
+        shutdown: &tokio_util::sync::CancellationToken,
+    ) -> TokenResult {
         let Some(limiter) = &self.inner else {
             return TokenResult::Acquired;
         };

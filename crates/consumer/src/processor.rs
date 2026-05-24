@@ -247,10 +247,20 @@ pub async fn process_recipient(
             // Log every component that failed, then return the first error.
             // The original tuple-match (Err(e), _, _) | (_, Err(e), _) | ...
             // silently discarded the second and third failures.
-            if let Err(ref e) = sr { tracing::warn!(component = "subject",   error = %e, "Template render failed"); }
-            if let Err(ref e) = hr { tracing::warn!(component = "body_html", error = %e, "Template render failed"); }
-            if let Err(ref e) = tr { tracing::warn!(component = "body_text", error = %e, "Template render failed"); }
-            let first_err = sr.err().or(hr.err()).or(tr.err()).expect("at least one Err");
+            if let Err(ref e) = sr {
+                tracing::warn!(component = "subject",   error = %e, "Template render failed");
+            }
+            if let Err(ref e) = hr {
+                tracing::warn!(component = "body_html", error = %e, "Template render failed");
+            }
+            if let Err(ref e) = tr {
+                tracing::warn!(component = "body_text", error = %e, "Template render failed");
+            }
+            let first_err = sr
+                .err()
+                .or(hr.err())
+                .or(tr.err())
+                .expect("at least one Err");
             return RecipientOutcome::Failed(first_err);
         }
     };
@@ -714,10 +724,20 @@ pub async fn process_group(
             // Log every component that failed, then return the first error.
             // The original tuple-match (Err(e), _, _) | (_, Err(e), _) | ...
             // silently discarded the second and third failures.
-            if let Err(ref e) = sr { tracing::warn!(component = "subject",   error = %e, "Template render failed"); }
-            if let Err(ref e) = hr { tracing::warn!(component = "body_html", error = %e, "Template render failed"); }
-            if let Err(ref e) = tr { tracing::warn!(component = "body_text", error = %e, "Template render failed"); }
-            let first_err = sr.err().or(hr.err()).or(tr.err()).expect("at least one Err");
+            if let Err(ref e) = sr {
+                tracing::warn!(component = "subject",   error = %e, "Template render failed");
+            }
+            if let Err(ref e) = hr {
+                tracing::warn!(component = "body_html", error = %e, "Template render failed");
+            }
+            if let Err(ref e) = tr {
+                tracing::warn!(component = "body_text", error = %e, "Template render failed");
+            }
+            let first_err = sr
+                .err()
+                .or(hr.err())
+                .or(tr.err())
+                .expect("at least one Err");
             return RecipientOutcome::Failed(first_err);
         }
     };

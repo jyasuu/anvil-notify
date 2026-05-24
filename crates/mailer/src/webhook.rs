@@ -125,10 +125,7 @@ impl EmailSender for WebhookSender {
 
         // Cap the error body to avoid buffering megabytes from a misbehaving server.
         // 512 bytes is enough for a meaningful error message in logs.
-        let raw_bytes = resp
-            .bytes()
-            .await
-            .unwrap_or_default();
+        let raw_bytes = resp.bytes().await.unwrap_or_default();
         let text = String::from_utf8_lossy(raw_bytes.get(..512).unwrap_or(&raw_bytes)).into_owned();
         let truncated = if raw_bytes.len() > 512 {
             format!("{text}… ({} bytes total)", raw_bytes.len())
@@ -137,7 +134,9 @@ impl EmailSender for WebhookSender {
         };
         if status == StatusCode::TOO_MANY_REQUESTS {
             warn!(http_status = 429, body = %truncated, "Webhook rate-limited");
-            return Err(AppError::RateLimited(format!("webhook HTTP 429: {truncated}")));
+            return Err(AppError::RateLimited(format!(
+                "webhook HTTP 429: {truncated}"
+            )));
         }
         if status.is_client_error() {
             return Err(AppError::permanent_mailer(format!(
