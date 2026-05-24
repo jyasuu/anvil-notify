@@ -157,6 +157,15 @@ pub struct HttpConfig {
     /// Leave unset only when the API is isolated behind a private network.
     /// Override via `AN__HTTP__API_KEY` environment variable.
     pub api_key: Option<String>,
+    /// Set to `true` to explicitly acknowledge that the HTTP API runs without
+    /// authentication.  When `api_key` is absent and this flag is `false`
+    /// (the default), the service refuses to start.
+    ///
+    /// Override via `AN__HTTP__ALLOW_UNAUTHENTICATED=true` or set
+    /// `allow_unauthenticated = true` in `config/local.toml`.  Never set this
+    /// in production — use it only for isolated dev/test environments.
+    #[serde(default)]
+    pub allow_unauthenticated: bool,
 }
 
 /// Which email backend to use.

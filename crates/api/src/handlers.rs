@@ -135,22 +135,49 @@ async fn republish_event(
         .collect();
 
     // ── 7. Deserialize typed fields from the detail ───────────────────────────
+    // Use map_err + ? instead of .ok() so that a malformed stored JSONB value
+    // surfaces as a 500 here rather than silently yielding None/empty and
+    // re-publishing with the wrong sender, no attachments, or missing CC/BCC.
     let from_override: Option<FromOverride> = detail
         .from_override
-        .as_ref()
-        .and_then(|v| serde_json::from_value(v.clone()).ok());
+        .map(|v| {
+            serde_json::from_value(v).map_err(|e| {
+                ApiError(AppError::permanent_mailer(format!(
+                    "stored from_override is malformed and cannot be deserialized: {e}"
+                )))
+            })
+        })
+        .transpose()?;
 
-    let attachments: Vec<AttachmentRef> =
-        serde_json::from_value(attachments_raw).unwrap_or_default();
+    let attachments: Vec<AttachmentRef> = serde_json::from_value(attachments_raw)
+        .map_err(|e| {
+            ApiError(AppError::permanent_mailer(format!(
+                "stored attachments JSON is malformed and cannot be deserialized: {e}"
+            )))
+        })?;
 
     let cc: Vec<Recipient> = detail
         .cc
-        .and_then(|v| serde_json::from_value(v).ok())
+        .map(|v| {
+            serde_json::from_value(v).map_err(|e| {
+                ApiError(AppError::permanent_mailer(format!(
+                    "stored cc JSON is malformed and cannot be deserialized: {e}"
+                )))
+            })
+        })
+        .transpose()?
         .unwrap_or_default();
 
     let bcc: Vec<Recipient> = detail
         .bcc
-        .and_then(|v| serde_json::from_value(v).ok())
+        .map(|v| {
+            serde_json::from_value(v).map_err(|e| {
+                ApiError(AppError::permanent_mailer(format!(
+                    "stored bcc JSON is malformed and cannot be deserialized: {e}"
+                )))
+            })
+        })
+        .transpose()?
         .unwrap_or_default();
 
     let send_mode = detail
