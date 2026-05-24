@@ -233,14 +233,25 @@ pub async fn process_recipient(
     }
 
     // ── 5. Template rendering ────────────────────────────────────────────────
-    let (subject, body_html, body_text) = match (
-        render_template(&prefetched_template.subject, &event.payload),
-        render_html_template(&prefetched_template.body_html, &event.payload),
-        render_template(&prefetched_template.body_text, &event.payload),
-    ) {
+    // Render all three components and collect every error before returning.
+    // The original code surfaced only the first failure in the tuple match,
+    // silently discarding the second and third errors.  Collecting all errors
+    // gives operators a complete picture when triaging a broken template.
+    let subject_result = render_template(&prefetched_template.subject, &event.payload);
+    let html_result = render_html_template(&prefetched_template.body_html, &event.payload);
+    let text_result = render_template(&prefetched_template.body_text, &event.payload);
+
+    let (subject, body_html, body_text) = match (subject_result, html_result, text_result) {
         (Ok(s), Ok(h), Ok(t)) => (s, h, t),
-        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
-            return RecipientOutcome::Failed(e);
+        (sr, hr, tr) => {
+            // Log every component that failed, then return the first error.
+            // The original tuple-match (Err(e), _, _) | (_, Err(e), _) | ...
+            // silently discarded the second and third failures.
+            if let Err(ref e) = sr { tracing::warn!(component = "subject",   error = %e, "Template render failed"); }
+            if let Err(ref e) = hr { tracing::warn!(component = "body_html", error = %e, "Template render failed"); }
+            if let Err(ref e) = tr { tracing::warn!(component = "body_text", error = %e, "Template render failed"); }
+            let first_err = sr.err().or(hr.err()).or(tr.err()).expect("at least one Err");
+            return RecipientOutcome::Failed(first_err);
         }
     };
 
@@ -272,15 +283,22 @@ pub async fn process_recipient(
     };
 
     // ── 6. Rate-limit token ──────────────────────────────────────────────────
-    // Increment a counter each time we must wait so operators have a Prometheus
-    // signal to alert on when the service is being throttled.
-    counter!("email_rate_limit_waits_total",
-        "event_type" => event.event_type.clone())
-    .increment(1);
-    if !ctx.rate_limiter.wait_for_token(shutdown).await {
-        return RecipientOutcome::Failed(AppError::Queue(
-            "service shutdown during rate-limit wait".into(),
-        ));
+    // Only increment the counter when we had to actually wait — i.e. the
+    // service is being throttled.  Incrementing unconditionally (before the
+    // call) inflated the metric even when a token was immediately available,
+    // making it useless as a "we are being throttled" alert signal.
+    match ctx.rate_limiter.wait_for_token(shutdown).await {
+        rate_limiter::TokenResult::Acquired => {}
+        rate_limiter::TokenResult::AcquiredAfterWait => {
+            counter!("email_rate_limit_waits_total",
+                "event_type" => event.event_type.clone())
+            .increment(1);
+        }
+        rate_limiter::TokenResult::Shutdown => {
+            return RecipientOutcome::Failed(AppError::Queue(
+                "service shutdown during rate-limit wait".into(),
+            ));
+        }
     }
 
     // ── 7. Send ───────────────────────────────────────────────────────────────
@@ -682,14 +700,25 @@ pub async fn process_group(
     let recipients = allowed_recipients;
 
     // ── 5. Template rendering ────────────────────────────────────────────────
-    let (subject, body_html, body_text) = match (
-        render_template(&prefetched_template.subject, &event.payload),
-        render_html_template(&prefetched_template.body_html, &event.payload),
-        render_template(&prefetched_template.body_text, &event.payload),
-    ) {
+    // Render all three components and collect every error before returning.
+    // The original code surfaced only the first failure in the tuple match,
+    // silently discarding the second and third errors.  Collecting all errors
+    // gives operators a complete picture when triaging a broken template.
+    let subject_result = render_template(&prefetched_template.subject, &event.payload);
+    let html_result = render_html_template(&prefetched_template.body_html, &event.payload);
+    let text_result = render_template(&prefetched_template.body_text, &event.payload);
+
+    let (subject, body_html, body_text) = match (subject_result, html_result, text_result) {
         (Ok(s), Ok(h), Ok(t)) => (s, h, t),
-        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
-            return RecipientOutcome::Failed(e);
+        (sr, hr, tr) => {
+            // Log every component that failed, then return the first error.
+            // The original tuple-match (Err(e), _, _) | (_, Err(e), _) | ...
+            // silently discarded the second and third failures.
+            if let Err(ref e) = sr { tracing::warn!(component = "subject",   error = %e, "Template render failed"); }
+            if let Err(ref e) = hr { tracing::warn!(component = "body_html", error = %e, "Template render failed"); }
+            if let Err(ref e) = tr { tracing::warn!(component = "body_text", error = %e, "Template render failed"); }
+            let first_err = sr.err().or(hr.err()).or(tr.err()).expect("at least one Err");
+            return RecipientOutcome::Failed(first_err);
         }
     };
 
@@ -730,15 +759,22 @@ pub async fn process_group(
     };
 
     // ── 6. Rate-limit token ──────────────────────────────────────────────────
-    // Increment a counter each time we must wait so operators have a Prometheus
-    // signal to alert on when the service is being throttled.
-    counter!("email_rate_limit_waits_total",
-        "event_type" => event.event_type.clone())
-    .increment(1);
-    if !ctx.rate_limiter.wait_for_token(shutdown).await {
-        return RecipientOutcome::Failed(AppError::Queue(
-            "service shutdown during rate-limit wait".into(),
-        ));
+    // Only increment the counter when we had to actually wait — i.e. the
+    // service is being throttled.  Incrementing unconditionally (before the
+    // call) inflated the metric even when a token was immediately available,
+    // making it useless as a "we are being throttled" alert signal.
+    match ctx.rate_limiter.wait_for_token(shutdown).await {
+        rate_limiter::TokenResult::Acquired => {}
+        rate_limiter::TokenResult::AcquiredAfterWait => {
+            counter!("email_rate_limit_waits_total",
+                "event_type" => event.event_type.clone())
+            .increment(1);
+        }
+        rate_limiter::TokenResult::Shutdown => {
+            return RecipientOutcome::Failed(AppError::Queue(
+                "service shutdown during rate-limit wait".into(),
+            ));
+        }
     }
 
     // ── 7. Send ───────────────────────────────────────────────────────────────
@@ -818,6 +854,12 @@ pub fn is_retryable(err: &AppError) -> bool {
         | AppError::NotFound(_)
         | AppError::Template(_)
         | AppError::Blocked(_) => false,
+        // UnknownStatus is a data-integrity error: the DB row has a status value
+        // this binary doesn't recognise.  Retrying will hit the same row and return
+        // the same unrecognised status indefinitely, burning retry budget and
+        // generating log noise.  Treat it as a permanent failure so it goes to DLQ
+        // where an operator can investigate.
+        AppError::UnknownStatus(_) => false,
         _ if err.is_permanent_mailer() => false,
         _ => true,
     }
@@ -835,6 +877,8 @@ fn error_reason_label(err: &AppError) -> &'static str {
         AppError::Template(_) => "template",
         AppError::Queue(_) => "queue",
         AppError::NotFound(_) => "not_found",
+        AppError::Deserialize(_) => "deserialize",
+        AppError::UnknownStatus(_) => "unknown_status",
         _ => "other",
     }
 }
