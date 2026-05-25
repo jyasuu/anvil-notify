@@ -69,8 +69,8 @@ impl Publisher {
                         Ok(pair) => {
                             info!("Publisher: reconnected to RabbitMQ");
                             *guard = Some(pair);
-                            // SAFETY: we just assigned Some above.
-                            &guard.as_ref().unwrap().1
+                            // SAFETY: assigned Some(pair) on the line above.
+                            &guard.as_ref().expect("just assigned Some above").1
                         }
                         Err(e) => {
                             return Err(AppError::Queue(format!(

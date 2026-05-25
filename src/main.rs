@@ -217,7 +217,7 @@ async fn main() -> anyhow::Result<()> {
     match &cfg.http.api_key {
         Some(_) => {}
         None if cfg.http.allow_unauthenticated => {
-            tracing::warn!(
+            tracing::error!(
                 "HTTP API authentication is DISABLED (allow_unauthenticated = true) — \
                  all /emails/* and /templates/* endpoints are publicly accessible. \
                  Do not use this setting in production."
@@ -319,7 +319,7 @@ async fn main() -> anyhow::Result<()> {
     }
     shutdown.cancel();
 
-    let timeout = tokio::time::Duration::from_secs(30);
+    let timeout = tokio::time::Duration::from_secs(cfg.shutdown_timeout_secs);
     if tokio::time::timeout(timeout, async {
         let _ = api_task.await;
         let _ = consumer_task.await;
@@ -327,7 +327,7 @@ async fn main() -> anyhow::Result<()> {
     .await
     .is_err()
     {
-        tracing::warn!("Graceful shutdown timed out after 30 s — forcing exit");
+        tracing::warn!(shutdown_timeout_secs = cfg.shutdown_timeout_secs, "Graceful shutdown timed out — forcing exit");
     } else {
         info!("Graceful shutdown complete");
     }

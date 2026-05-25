@@ -87,6 +87,12 @@ template_cache_ttl_secs = 300  # 5 minutes
 # See also: max_concurrency above for the peak-memory calculation.
 max_attachment_bytes = 10485760  # 10 * 1024 * 1024
 
+# How long (in seconds) to wait for in-flight tasks during graceful shutdown.
+# Increase if your SMTP server is slow to respond or max_concurrency is high.
+# Un-ACK'd messages are re-queued by the broker once this timeout elapses.
+# Override with AN__SHUTDOWN_TIMEOUT_SECS.
+shutdown_timeout_secs = 30
+
 # ── Choose one backend ────────────────────────────────────────────────────────
 #
 # TLS mode is selected automatically by port (Spring Boot-compatible defaults):

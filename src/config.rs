@@ -24,6 +24,12 @@ pub struct AppConfig {
     /// Maximum size of a single fetched email attachment in bytes.
     #[serde(default = "default_max_attachment_bytes")]
     pub max_attachment_bytes: usize,
+    /// How long (in seconds) to wait for in-flight tasks to finish during graceful shutdown.
+    /// Default: 30 s. Increase if your SMTP server is slow to respond under load,
+    /// or if you run with a high max_concurrency. Un-ACK'd AMQP messages are
+    /// re-queued by the broker when the connection closes after this timeout.
+    #[serde(default = "default_shutdown_timeout_secs")]
+    pub shutdown_timeout_secs: u64,
     /// Named SMTP sender accounts for multi-tenant / multi-brand deployments.
     ///
     /// Each entry gives a business system its own SMTP credentials and From
@@ -99,6 +105,10 @@ impl std::fmt::Debug for SmtpAccountConfig {
             .field("pool_size", &self.pool_size)
             .finish()
     }
+}
+
+fn default_shutdown_timeout_secs() -> u64 {
+    30
 }
 
 fn default_max_rl_waits() -> u32 {
