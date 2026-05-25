@@ -4,6 +4,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use metrics::counter;
 use chrono::Utc;
 use common::{
     is_valid_email, AppError, AttachmentRef, ChannelOverrides, EmailOptions, EmailStatus,
@@ -255,7 +256,30 @@ async fn republish_event(
         },
     };
     let body = serde_json::to_vec(&event).map_err(|e| ApiError(AppError::Queue(e.to_string())))?;
-    state.publisher.publish(body).await.map_err(ApiError)?;
+
+    // ── Atomicity note ────────────────────────────────────────────────────────
+    // The DB rows were already reset to PENDING by the caller before this
+    // function runs. If the AMQP publish below fails, those rows stay PENDING
+    // with no message in the queue to drive them forward — they are "orphaned".
+    //
+    // Recovery: the Prometheus counter `retry_publish_failed_total` fires on
+    // every such failure. Alert on it. An operator can recover by calling the
+    // retry endpoint again once the broker is healthy; the consumer's idempotency
+    // check prevents double-processing if the first publish did succeed.
+    state.publisher.publish(body).await.map_err(|e| {
+        counter!("retry_publish_failed_total",
+            "event_id" => event_id.to_string())
+        .increment(1);
+        tracing::error!(
+            %event_id,
+            error = %e,
+            "AMQP publish failed after DB rows reset to PENDING — \
+             rows are now orphaned (stuck PENDING with no queue message). \
+             Re-call the retry endpoint once the broker recovers. \
+             Monitor `retry_publish_failed_total` to alert on this condition."
+        );
+        ApiError(e)
+    })?;
     Ok(())
 }
 
