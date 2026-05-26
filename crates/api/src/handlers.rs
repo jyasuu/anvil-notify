@@ -297,12 +297,27 @@ pub async fn health() -> impl IntoResponse {
 ///
 /// Readiness probe — verifies the DB pool can acquire a connection.
 /// Docker / Kubernetes should use this for `healthcheck`, not /health.
+///
+/// Uses a short 500 ms timeout so that a saturated connection pool (all
+/// connections busy, acquire_timeout pending) returns 503 quickly rather
+/// than blocking the probe for the full 5-second pool acquire_timeout.
+/// A 503 here causes Kubernetes to stop routing traffic, which is the
+/// correct behaviour when the service cannot reach the database.
 pub async fn ready(State(state): State<ApiState>) -> impl IntoResponse {
-    match sqlx::query("SELECT 1").execute(state.store.pool()).await {
-        Ok(_) => (StatusCode::OK, Json(json!({ "status": "ready" }))),
-        Err(e) => (
+    let probe = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        sqlx::query("SELECT 1").execute(state.store.pool()),
+    )
+    .await;
+    match probe {
+        Ok(Ok(_)) => (StatusCode::OK, Json(json!({ "status": "ready" }))),
+        Ok(Err(e)) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "status": "unavailable", "error": e.to_string() })),
+        ),
+        Err(_elapsed) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "unavailable", "error": "db pool acquire timed out (500ms)" })),
         ),
     }
 }
