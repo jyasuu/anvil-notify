@@ -4,12 +4,12 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use metrics::counter;
 use chrono::Utc;
 use common::{
     is_valid_email, AppError, AttachmentRef, ChannelOverrides, EmailOptions, EmailStatus,
     FromOverride, Metadata, NotificationEvent, Recipient, RetryPolicy,
 };
+use metrics::counter;
 use serde_json::json;
 use uuid::Uuid;
 
@@ -77,10 +77,8 @@ async fn republish_event(
     // by the business service).  This ensures attachment expiry checks use the
     // publication time, not the consumer processing time.
     //
-    // For pre-0023 rows where event_timestamp is NULL, fall back to the
-    // earliest created_at across all rows — the same proxy used before the
-    // column existed.
-    let original_timestamp = detail.event_timestamp.unwrap_or(detail.earliest_created_at);
+    // The column is NOT NULL (migration 0024), so this is always present.
+    let original_timestamp = detail.event_timestamp;
 
     // ── 5. Attachment expiry check ────────────────────────────────────────────
     let attachments_raw = detail
