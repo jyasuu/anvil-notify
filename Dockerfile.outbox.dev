@@ -1,8 +1,0 @@
-# ── Stage 2: runtime ──────────────────────────────────────────────────────────
-FROM alpine AS runtime
-
-WORKDIR /app
-
-COPY ./target/x86_64-unknown-linux-musl/release/outbox-worker ./outbox-worker
-
-ENTRYPOINT ["./outbox-worker"]

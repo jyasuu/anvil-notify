@@ -3,10 +3,11 @@ FROM alpine AS runtime
 
 WORKDIR /app
 
-COPY ./target/x86_64-unknown-linux-musl/release/anvil-notify ./anvil-notify
+COPY ./target/x86_64-unknown-linux-musl/release/anvil-notify /usr/bin/
+COPY ./target/x86_64-unknown-linux-musl/release/outbox-worker /usr/bin/
 COPY ./migrations  ./migrations
 COPY ./config      ./config
 
 EXPOSE 8080
 
-ENTRYPOINT ["./anvil-notify"]
+ENTRYPOINT ["anvil-notify"]
