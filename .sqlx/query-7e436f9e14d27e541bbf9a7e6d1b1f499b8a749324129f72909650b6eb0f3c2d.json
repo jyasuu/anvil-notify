@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT n.recipient_id AS recipient_email, n.status,\n                      n.retry_count, n.last_error, n.updated_at\n               FROM notification_log n\n               WHERE n.event_id = $1\n                 AND n.channel  = 'email'\n               ORDER BY n.created_at",
+  "query": "SELECT n.recipient_id AS recipient_email, n.status,\n                  n.retry_count, n.last_error, n.updated_at\n           FROM notification_log n\n           WHERE n.event_id = $1\n             AND n.channel  = 'email'\n           ORDER BY n.created_at",
   "describe": {
     "columns": [
       {
@@ -42,5 +42,5 @@
       false
     ]
   },
-  "hash": "735d490f92d6664b712ff322f1050ed4c457c12cbb5c7552f2f3a32d786b4dbf"
+  "hash": "7e436f9e14d27e541bbf9a7e6d1b1f499b8a749324129f72909650b6eb0f3c2d"
 }
