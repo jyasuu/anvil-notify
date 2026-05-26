@@ -3,7 +3,7 @@
 # and produces a recipe.json that is stable as long as deps don't change.
 FROM rust:1.94-slim-bookworm AS chef
 RUN cargo install cargo-chef --locked
-RUN apt-get update && apt-get install -y pkg-config libssl-dev perl  build-essential cmake \
+RUN apt-get update && apt-get install -y pkg-config libssl-dev perl  build-essential cmake musl-tools \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
