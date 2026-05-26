@@ -28,7 +28,7 @@ COPY . .
 
 RUN rustup target add x86_64-unknown-linux-musl
 ENV CC_x86_64_unknown_linux_musl=musl-gcc
-RUN ls -lah && cargo build --release  --target=x86_64-unknown-linux-musl --all
+RUN ls -lah && cat .sqlx/* && cargo build --release  --target=x86_64-unknown-linux-musl --all
 
 # ── Stage 4: runtime ──────────────────────────────────────────────────────────
 FROM alpine AS runtime
@@ -40,9 +40,6 @@ COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/outbox-worker 
 COPY --from=builder /app/migrations  ./migrations
 COPY --from=builder /app/config      ./config
 
-# Drop privileges
-RUN useradd -m -u 1001 appuser
-USER appuser
 
 EXPOSE 8080
 
