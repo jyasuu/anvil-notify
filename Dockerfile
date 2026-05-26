@@ -28,7 +28,7 @@ COPY . .
 
 RUN rustup target add x86_64-unknown-linux-musl
 ENV CC_x86_64_unknown_linux_musl=musl-gcc
-RUN cargo build --release  --target=x86_64-unknown-linux-musl
+RUN cargo build --release  --target=x86_64-unknown-linux-musl --all
 
 # ── Stage 4: runtime ──────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
@@ -45,7 +45,8 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY --from=builder /app/target/release/anvil-notify ./anvil-notify
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/anvil-notify /usr/bin/
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/outbox-worker /usr/bin/
 COPY --from=builder /app/migrations  ./migrations
 COPY --from=builder /app/config      ./config
 
@@ -55,4 +56,4 @@ USER appuser
 
 EXPOSE 8080
 
-ENTRYPOINT ["./anvil-notify"]
+ENTRYPOINT ["anvil-notify"]
