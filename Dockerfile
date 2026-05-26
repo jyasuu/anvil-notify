@@ -3,7 +3,7 @@
 # and produces a recipe.json that is stable as long as deps don't change.
 FROM rust:1.94-slim-bookworm AS chef
 RUN cargo install cargo-chef --locked
-RUN apt-get update && apt-get install -y pkg-config libssl-dev \
+RUN apt-get update && apt-get install -y pkg-config libssl-dev perl  build-essential cmake musl-tools \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
@@ -28,24 +28,15 @@ COPY . .
 
 RUN rustup target add x86_64-unknown-linux-musl
 ENV CC_x86_64_unknown_linux_musl=musl-gcc
-RUN cargo build --release  --target=x86_64-unknown-linux-musl
+RUN cargo build --release  --target=x86_64-unknown-linux-musl --all
 
 # ── Stage 4: runtime ──────────────────────────────────────────────────────────
-FROM debian:bookworm-slim AS runtime
-
-# curl is required by the docker-compose healthcheck
-# (test: curl -sf http://localhost:8080/ready || exit 1).
-# Without it the container is never marked healthy and dependent
-# services cannot start.
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    curl \
-    libssl3 \
-    && rm -rf /var/lib/apt/lists/*
+FROM alpine AS runtime
 
 WORKDIR /app
 
-COPY --from=builder /app/target/release/anvil-notify ./anvil-notify
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/anvil-notify /usr/bin/
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/outbox-worker /usr/bin/
 COPY --from=builder /app/migrations  ./migrations
 COPY --from=builder /app/config      ./config
 
@@ -55,4 +46,4 @@ USER appuser
 
 EXPOSE 8080
 
-ENTRYPOINT ["./anvil-notify"]
+ENTRYPOINT ["anvil-notify"]
