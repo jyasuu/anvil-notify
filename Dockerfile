@@ -28,7 +28,7 @@ COPY . .
 
 RUN rustup target add x86_64-unknown-linux-musl
 ENV CC_x86_64_unknown_linux_musl=musl-gcc
-RUN cargo build --release  --target=x86_64-unknown-linux-musl --all
+RUN ls -lah && cargo build --release  --target=x86_64-unknown-linux-musl --all
 
 # ── Stage 4: runtime ──────────────────────────────────────────────────────────
 FROM alpine AS runtime
