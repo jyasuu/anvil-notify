@@ -4,12 +4,12 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use metrics::counter;
 use chrono::Utc;
 use common::{
     is_valid_email, AppError, AttachmentRef, ChannelOverrides, EmailOptions, EmailStatus,
     FromOverride, Metadata, NotificationEvent, Recipient, RetryPolicy,
 };
+use metrics::counter;
 use serde_json::json;
 use uuid::Uuid;
 

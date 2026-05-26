@@ -616,11 +616,7 @@ pub async fn process_group(
     };
 
     // Always insert the primary row first.
-    let primary_insert = match ctx
-        .store
-        .insert_pending(&make_args(primary, &shared))
-        .await
-    {
+    let primary_insert = match ctx.store.insert_pending(&make_args(primary, &shared)).await {
         Ok(r) => r,
         Err(e) => return RecipientOutcome::Failed(e),
     };

@@ -338,7 +338,10 @@ async fn main() -> anyhow::Result<()> {
     .await
     .is_err()
     {
-        tracing::warn!(shutdown_timeout_secs = cfg.shutdown_timeout_secs, "Graceful shutdown timed out — forcing exit");
+        tracing::warn!(
+            shutdown_timeout_secs = cfg.shutdown_timeout_secs,
+            "Graceful shutdown timed out — forcing exit"
+        );
     } else {
         info!("Graceful shutdown complete");
     }
