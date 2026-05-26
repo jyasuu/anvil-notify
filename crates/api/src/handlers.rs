@@ -4,12 +4,12 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use metrics::counter;
 use chrono::Utc;
 use common::{
     is_valid_email, AppError, AttachmentRef, ChannelOverrides, EmailOptions, EmailStatus,
     FromOverride, Metadata, NotificationEvent, Recipient, RetryPolicy,
 };
-use metrics::counter;
 use serde_json::json;
 use uuid::Uuid;
 
@@ -233,6 +233,18 @@ async fn republish_event(
     }
 
     // ── 10. Build and publish the replay envelope ─────────────────────────────
+    //
+    // Guard: if the stored payload is JSON null the template renderer will
+    // fail with a Template error on every consumer attempt, silently DLQ-ing
+    // the message.  Surface this as a 400 here so the operator knows the row
+    // needs repairing before a retry will work.
+    if detail.payload.is_null() {
+        return Err(ApiError(AppError::permanent_mailer(
+            "stored payload is null — the notification_log row must be repaired              with a valid JSON payload before this event can be retried"
+                .to_owned(),
+        )));
+    }
+
     let event = NotificationEvent {
         event_id,
         timestamp: original_timestamp,

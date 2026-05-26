@@ -386,6 +386,11 @@ impl NotificationStore for EmailNotificationStore {
             WHERE n.event_id = $1
               AND n.channel  = $2
             ORDER BY n.created_at
+            -- Safety cap: prevents a single pathological event with thousands of
+            -- recipients from loading the full result set into the API pod's memory.
+            -- 500 rows is well above any legitimate multi-recipient event; a bulk
+            -- campaign accidentally routed here would otherwise cause an OOM.
+            LIMIT 500
             "#,
             event_id,
             CHANNEL_EMAIL,
@@ -403,6 +408,7 @@ impl NotificationStore for EmailNotificationStore {
                     id: r.id,
                     event_id: r.event_id,
                     event_type: r.event_type,
+                    channel: CHANNEL_EMAIL.to_owned(),
                     recipient_email: r.recipient_email,
                     recipient_name: r.recipient_name,
                     status: NotificationStatus::try_from(r.status.as_str())?,
@@ -472,6 +478,7 @@ impl NotificationStore for EmailNotificationStore {
             id: r.id,
             event_id: r.event_id,
             event_type: r.event_type,
+            channel: CHANNEL_EMAIL.to_owned(),
             recipient_email: r.recipient_email,
             recipient_name: r.recipient_name,
             status: NotificationStatus::try_from(r.status.as_str())?,
