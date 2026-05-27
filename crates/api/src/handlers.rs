@@ -607,3 +607,36 @@ pub async fn invalidate_blocklist_cache(
     state.block_list_store.invalidate().await;
     StatusCode::NO_CONTENT
 }
+
+/// POST /admin/blocklist/cache
+///
+/// Eagerly reload the block_list cache from the database and return the
+/// number of active entries found.  Useful after a bulk DB import to
+/// pre-warm the cache immediately rather than waiting for the next TTL
+/// expiry or `check` call.
+pub async fn reload_blocklist_cache(
+    State(state): State<ApiState>,
+) -> impl IntoResponse {
+    // Invalidate the old snapshot first so `list_entries` is the authoritative
+    // view, then touch `check` on a dummy address to populate the cache eagerly.
+    state.block_list_store.invalidate().await;
+    match state.block_list_store.list_entries().await {
+        Ok(entries) => {
+            // Warm the cache by triggering a snapshot load.
+            let _ = state.block_list_store.check("__cache_warmup__@example.com").await;
+            (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({ "reloaded": true, "entry_count": entries.len() })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "reload_blocklist_cache: failed to list entries");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}

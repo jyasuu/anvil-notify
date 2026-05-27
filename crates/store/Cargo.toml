@@ -18,3 +18,13 @@ anyhow      = { workspace = true }
 async-trait = { workspace = true }
 moka  = { workspace = true }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "macros"] }
+
+[dev-dependencies]
+# `sqlx::test` spins up a temporary Postgres database per test function,
+# runs the crate's migrations, and tears it all down afterwards.
+# DATABASE_URL must point to a Postgres instance when running these tests.
+sqlx  = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "macros", "migrate"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+uuid  = { workspace = true, features = ["v4"] }
+serde_json = { workspace = true }
+chrono = { workspace = true }
