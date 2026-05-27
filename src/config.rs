@@ -130,7 +130,7 @@ fn default_stale_pending_timeout_secs() -> u64 {
     600
 }
 fn default_stale_pending_reaper_interval_secs() -> u64 {
-    300  // Run every 5 minutes.
+    300 // Run every 5 minutes.
 }
 
 fn default_max_rl_waits() -> u32 {

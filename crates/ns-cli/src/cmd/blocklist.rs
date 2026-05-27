@@ -64,7 +64,8 @@ pub async fn run(args: BlocklistArgs, cfg: CliConfig, fmt: crate::cli::OutputFor
                 let body = resp.text().await.unwrap_or_default();
                 bail!("List failed (HTTP {status}): {body}");
             }
-            let entries: Vec<serde_json::Value> = resp.json().await.context("Failed to parse response")?;
+            let entries: Vec<serde_json::Value> =
+                resp.json().await.context("Failed to parse response")?;
             if entries.is_empty() {
                 println!("(no active block/allow-list entries)");
                 return Ok(());
@@ -72,10 +73,10 @@ pub async fn run(args: BlocklistArgs, cfg: CliConfig, fmt: crate::cli::OutputFor
             let rows: Vec<BlocklistRow> = entries
                 .iter()
                 .map(|e| BlocklistRow {
-                    id:         e["id"].as_i64().unwrap_or(0),
-                    kind:       e["kind"].as_str().unwrap_or("").to_string(),
-                    value:      e["value"].as_str().unwrap_or("").to_string(),
-                    reason:     e["reason"].as_str().unwrap_or("").to_string(),
+                    id: e["id"].as_i64().unwrap_or(0),
+                    kind: e["kind"].as_str().unwrap_or("").to_string(),
+                    value: e["value"].as_str().unwrap_or("").to_string(),
+                    reason: e["reason"].as_str().unwrap_or("").to_string(),
                     created_at: e["created_at"].as_str().unwrap_or("").to_string(),
                 })
                 .collect();
@@ -86,7 +87,11 @@ pub async fn run(args: BlocklistArgs, cfg: CliConfig, fmt: crate::cli::OutputFor
         }
 
         // ── add ───────────────────────────────────────────────────────────────
-        BlocklistAction::Add { kind, value, reason } => {
+        BlocklistAction::Add {
+            kind,
+            value,
+            reason,
+        } => {
             let body = serde_json::json!({
                 "kind":   kind,
                 "value":  value,

@@ -13,9 +13,9 @@ use tower_http::trace::TraceLayer;
 use crate::{
     handlers::{
         add_blocklist_entry, get_email_status, get_recipient_status, health,
-        invalidate_all_template_cache, invalidate_blocklist_cache, reload_blocklist_cache,
-        invalidate_template_cache, list_blocklist, ready, remove_blocklist_entry,
-        retry_event, retry_recipient,
+        invalidate_all_template_cache, invalidate_blocklist_cache, invalidate_template_cache,
+        list_blocklist, ready, reload_blocklist_cache, remove_blocklist_entry, retry_event,
+        retry_recipient,
     },
     state::ApiState,
 };
@@ -56,11 +56,11 @@ pub fn build_router(state: ApiState) -> Router {
             delete(invalidate_template_cache),
         )
         // ── DB-backed blocklist admin ─────────────────────────────────────
-        .route("/admin/blocklist",          axum::routing::get(list_blocklist))
-        .route("/admin/blocklist",          post(add_blocklist_entry))
-        .route("/admin/blocklist/cache",    delete(invalidate_blocklist_cache))
-        .route("/admin/blocklist/cache",    post(reload_blocklist_cache))
-        .route("/admin/blocklist/{id}",     delete(remove_blocklist_entry))
+        .route("/admin/blocklist", axum::routing::get(list_blocklist))
+        .route("/admin/blocklist", post(add_blocklist_entry))
+        .route("/admin/blocklist/cache", delete(invalidate_blocklist_cache))
+        .route("/admin/blocklist/cache", post(reload_blocklist_cache))
+        .route("/admin/blocklist/{id}", delete(remove_blocklist_entry))
         .layer(middleware::from_fn_with_state(state.clone(), bearer_auth));
 
     Router::new()

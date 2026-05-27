@@ -22,7 +22,6 @@ use std::time::Duration;
 
 use common::{is_valid_email, AppError, NotificationEvent, Recipient, RetryPolicy, SendMode};
 use lapin::{message::Delivery, options::*};
-use uuid::Uuid;
 use mailer::fetch_attachments_with_limit;
 use mailer::message::ResolvedAttachment;
 use reqwest::Client;
@@ -30,6 +29,7 @@ use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
+use uuid::Uuid;
 
 use crate::{
     config::ConsumerConfig,

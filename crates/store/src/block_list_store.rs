@@ -31,22 +31,22 @@ const CACHE_KEY: &str = "block_list";
 /// A snapshot of all active block/allow-list entries loaded from the DB.
 #[derive(Clone, Default)]
 struct BlockListSnapshot {
-    blocked_emails:  HashSet<String>,
+    blocked_emails: HashSet<String>,
     blocked_domains: HashSet<String>,
-    allowed_emails:  HashSet<String>,
+    allowed_emails: HashSet<String>,
     allowed_domains: HashSet<String>,
     /// True when at least one allowlist entry is present.
-    allowlist_mode:  bool,
+    allowlist_mode: bool,
 }
 
 /// A block_list row as returned by the DB query.
 #[derive(Debug, Clone)]
 pub struct BlockListEntry {
-    pub id:         i64,
-    pub kind:       String,
-    pub value:      String,
-    pub reason:     Option<String>,
-    pub active:     bool,
+    pub id: i64,
+    pub kind: String,
+    pub value: String,
+    pub reason: Option<String>,
+    pub active: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -56,7 +56,7 @@ pub struct BlockListEntry {
 /// the same underlying moka cache.
 #[derive(Clone)]
 pub struct BlockListStore {
-    pool:  PgPool,
+    pool: PgPool,
     cache: Cache<&'static str, BlockListSnapshot>,
 }
 
@@ -126,11 +126,12 @@ impl BlockListStore {
 
     /// Returns `true` when no active entries exist in the DB (passthrough).
     pub async fn is_empty(&self) -> bool {
-        self.snapshot().await.map(|s| {
-            s.blocked_emails.is_empty()
-                && s.blocked_domains.is_empty()
-                && !s.allowlist_mode
-        }).unwrap_or(false)
+        self.snapshot()
+            .await
+            .map(|s| {
+                s.blocked_emails.is_empty() && s.blocked_domains.is_empty() && !s.allowlist_mode
+            })
+            .unwrap_or(false)
     }
 
     // ── Admin CRUD ────────────────────────────────────────────────────────────
@@ -164,11 +165,11 @@ impl BlockListStore {
 
         self.invalidate().await;
         Ok(BlockListEntry {
-            id:         row.id,
-            kind:       row.kind,
-            value:      row.value,
-            reason:     row.reason,
-            active:     row.active,
+            id: row.id,
+            kind: row.kind,
+            value: row.value,
+            reason: row.reason,
+            active: row.active,
             created_at: row.created_at,
         })
     }
@@ -206,11 +207,11 @@ impl BlockListStore {
         Ok(rows
             .into_iter()
             .map(|r| BlockListEntry {
-                id:         r.id,
-                kind:       r.kind,
-                value:      r.value,
-                reason:     r.reason,
-                active:     r.active,
+                id: r.id,
+                kind: r.kind,
+                value: r.value,
+                reason: r.reason,
+                active: r.active,
                 created_at: r.created_at,
             })
             .collect())
@@ -223,28 +224,36 @@ impl BlockListStore {
             return Ok(snap);
         }
 
-        let rows = sqlx::query!(
-            "SELECT kind, value FROM block_list WHERE active = TRUE"
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(AppError::Database)?;
+        let rows = sqlx::query!("SELECT kind, value FROM block_list WHERE active = TRUE")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(AppError::Database)?;
 
         let mut snap = BlockListSnapshot::default();
         for row in rows {
             match row.kind.as_str() {
-                "blocked_email"  => { snap.blocked_emails.insert(row.value); }
-                "blocked_domain" => { snap.blocked_domains.insert(row.value); }
-                "allowed_email"  => { snap.allowed_emails.insert(row.value); snap.allowlist_mode = true; }
-                "allowed_domain" => { snap.allowed_domains.insert(row.value); snap.allowlist_mode = true; }
+                "blocked_email" => {
+                    snap.blocked_emails.insert(row.value);
+                }
+                "blocked_domain" => {
+                    snap.blocked_domains.insert(row.value);
+                }
+                "allowed_email" => {
+                    snap.allowed_emails.insert(row.value);
+                    snap.allowlist_mode = true;
+                }
+                "allowed_domain" => {
+                    snap.allowed_domains.insert(row.value);
+                    snap.allowlist_mode = true;
+                }
                 other => tracing::warn!(kind = other, "Unknown block_list kind — skipping"),
             }
         }
 
         info!(
-            blocked_emails  = snap.blocked_emails.len(),
+            blocked_emails = snap.blocked_emails.len(),
             blocked_domains = snap.blocked_domains.len(),
-            allowed_emails  = snap.allowed_emails.len(),
+            allowed_emails = snap.allowed_emails.len(),
             allowed_domains = snap.allowed_domains.len(),
             "BlockListStore snapshot loaded from DB"
         );

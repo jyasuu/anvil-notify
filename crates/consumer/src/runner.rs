@@ -225,8 +225,6 @@ mod heartbeat_tests {
     }
 }
 
-
-
 // ── Topology ──────────────────────────────────────────────────────────────────
 
 async fn declare_topology(

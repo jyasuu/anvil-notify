@@ -18,8 +18,6 @@ use tracing::{info, warn};
 /// and subject to high latency.
 const CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-
-
 /// Thin wrapper around an AMQP channel used by the HTTP API to re-enqueue
 /// events whose DB rows have been reset to PENDING via the retry endpoints.
 ///

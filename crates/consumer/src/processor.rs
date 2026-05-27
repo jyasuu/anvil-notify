@@ -478,11 +478,11 @@ pub async fn process_group(
     // accurately reflects what was actually delivered, not the raw unfiltered
     // input.  Storing pre-filter lists would show addresses that were never
     // delivered to, and would waste a filter cycle on every retry.
-    let cc_json = match serialize_recipient_list(&effective_cc, "cc") {
+    let cc_json = match serialize_recipient_list(effective_cc, "cc") {
         Ok(v) => v,
         Err(e) => return RecipientOutcome::Failed(e),
     };
-    let bcc_json = match serialize_recipient_list(&effective_bcc, "bcc") {
+    let bcc_json = match serialize_recipient_list(effective_bcc, "bcc") {
         Ok(v) => v,
         Err(e) => return RecipientOutcome::Failed(e),
     };

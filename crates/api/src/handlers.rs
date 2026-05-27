@@ -523,19 +523,19 @@ pub async fn retry_event(
 /// GET /admin/blocklist
 ///
 /// Returns all active block/allow-list entries from the database.
-pub async fn list_blocklist(
-    State(state): State<ApiState>,
-) -> Result<impl IntoResponse, ApiError> {
+pub async fn list_blocklist(State(state): State<ApiState>) -> Result<impl IntoResponse, ApiError> {
     let entries = state.block_list_store.list_entries().await?;
     let body: Vec<_> = entries
         .iter()
-        .map(|e| json!({
-            "id":        e.id,
-            "kind":      e.kind,
-            "value":     e.value,
-            "reason":    e.reason,
-            "createdAt": e.created_at,
-        }))
+        .map(|e| {
+            json!({
+                "id":        e.id,
+                "kind":      e.kind,
+                "value":     e.value,
+                "reason":    e.reason,
+                "createdAt": e.created_at,
+            })
+        })
         .collect();
     Ok(Json(json!({ "entries": body })))
 }
@@ -564,7 +564,12 @@ pub async fn add_blocklist_entry(
         .ok_or_else(|| ApiError(AppError::permanent_mailer("missing field 'value'")))?;
     let reason = body.get("reason").and_then(|v| v.as_str());
 
-    let valid_kinds = ["blocked_email", "blocked_domain", "allowed_email", "allowed_domain"];
+    let valid_kinds = [
+        "blocked_email",
+        "blocked_domain",
+        "allowed_email",
+        "allowed_domain",
+    ];
     if !valid_kinds.contains(&kind) {
         return Err(ApiError(AppError::permanent_mailer(format!(
             "invalid kind '{kind}' — must be one of: {}",
@@ -572,7 +577,10 @@ pub async fn add_blocklist_entry(
         ))));
     }
 
-    let entry = state.block_list_store.add_entry(kind, value, reason).await?;
+    let entry = state
+        .block_list_store
+        .add_entry(kind, value, reason)
+        .await?;
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -601,9 +609,7 @@ pub async fn remove_blocklist_entry(
 ///
 /// Evict the block_list cache snapshot, forcing the next check to reload
 /// from the database.  Use this after direct DB edits.
-pub async fn invalidate_blocklist_cache(
-    State(state): State<ApiState>,
-) -> impl IntoResponse {
+pub async fn invalidate_blocklist_cache(State(state): State<ApiState>) -> impl IntoResponse {
     state.block_list_store.invalidate().await;
     StatusCode::NO_CONTENT
 }
@@ -614,16 +620,17 @@ pub async fn invalidate_blocklist_cache(
 /// number of active entries found.  Useful after a bulk DB import to
 /// pre-warm the cache immediately rather than waiting for the next TTL
 /// expiry or `check` call.
-pub async fn reload_blocklist_cache(
-    State(state): State<ApiState>,
-) -> impl IntoResponse {
+pub async fn reload_blocklist_cache(State(state): State<ApiState>) -> impl IntoResponse {
     // Invalidate the old snapshot first so `list_entries` is the authoritative
     // view, then touch `check` on a dummy address to populate the cache eagerly.
     state.block_list_store.invalidate().await;
     match state.block_list_store.list_entries().await {
         Ok(entries) => {
             // Warm the cache by triggering a snapshot load.
-            let _ = state.block_list_store.check("__cache_warmup__@example.com").await;
+            let _ = state
+                .block_list_store
+                .check("__cache_warmup__@example.com")
+                .await;
             (
                 StatusCode::OK,
                 axum::Json(serde_json::json!({ "reloaded": true, "entry_count": entries.len() })),
