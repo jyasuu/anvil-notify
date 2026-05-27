@@ -14,7 +14,7 @@ use recipient_filter::RecipientFilter;
 use store::{
     EmailInsertPendingArgs, InsertResult, NotificationStore, TemplateStore, CHANNEL_EMAIL,
 };
-use tracing::{error, info, instrument, warn};
+use tracing::{info, instrument, warn};
 
 /// Pre-filtered CC and BCC recipient lists, computed **once per event** before
 /// per-recipient tasks are spawned.
@@ -125,6 +125,38 @@ pub async fn process_recipient(
     let effective_cc = &cc_bcc.cc;
     let effective_bcc = &cc_bcc.bcc;
 
+    // ── 2c. Template rendering (before DB write) ──────────────────────────────
+    // Rendering is done here, before the idempotency DB write, so that a
+    // permanently broken template (bad Handlebars syntax) returns Failed without
+    // ever creating a PENDING row.  Without this, a bad template creates a row
+    // on the first attempt, returns Failed, and the retry loop burns through
+    // max_retries on a Duplicate path before giving up — producing log noise and
+    // wasting retry budget on an error that is not transient.
+    let subject_result = render_template(&prefetched_template.subject, &event.payload);
+    let html_result = render_html_template(&prefetched_template.body_html, &event.payload);
+    let text_result = render_template(&prefetched_template.body_text, &event.payload);
+
+    let (subject, body_html, body_text) = match (subject_result, html_result, text_result) {
+        (Ok(s), Ok(h), Ok(t)) => (s, h, t),
+        (sr, hr, tr) => {
+            if let Err(ref e) = sr {
+                tracing::warn!(component = "subject",   error = %e, "Template render failed");
+            }
+            if let Err(ref e) = hr {
+                tracing::warn!(component = "body_html", error = %e, "Template render failed");
+            }
+            if let Err(ref e) = tr {
+                tracing::warn!(component = "body_text", error = %e, "Template render failed");
+            }
+            let first_err = sr
+                .err()
+                .or(hr.err())
+                .or(tr.err())
+                .expect("at least one Err");
+            return RecipientOutcome::Failed(first_err);
+        }
+    };
+
     // ── 3. Idempotency ───────────────────────────────────────────────────────
     // Use map_err + ? rather than .ok() so that a serialization failure
     // surfaces as a permanent error instead of silently storing NULL and
@@ -210,38 +242,7 @@ pub async fn process_recipient(
         return RecipientOutcome::Blocked(reason);
     }
 
-    // ── 5. Template rendering ────────────────────────────────────────────────
-    // Render all three components and collect every error before returning.
-    // The original code surfaced only the first failure in the tuple match,
-    // silently discarding the second and third errors.  Collecting all errors
-    // gives operators a complete picture when triaging a broken template.
-    let subject_result = render_template(&prefetched_template.subject, &event.payload);
-    let html_result = render_html_template(&prefetched_template.body_html, &event.payload);
-    let text_result = render_template(&prefetched_template.body_text, &event.payload);
-
-    let (subject, body_html, body_text) = match (subject_result, html_result, text_result) {
-        (Ok(s), Ok(h), Ok(t)) => (s, h, t),
-        (sr, hr, tr) => {
-            // Log every component that failed, then return the first error.
-            // The original tuple-match (Err(e), _, _) | (_, Err(e), _) | ...
-            // silently discarded the second and third failures.
-            if let Err(ref e) = sr {
-                tracing::warn!(component = "subject",   error = %e, "Template render failed");
-            }
-            if let Err(ref e) = hr {
-                tracing::warn!(component = "body_html", error = %e, "Template render failed");
-            }
-            if let Err(ref e) = tr {
-                tracing::warn!(component = "body_text", error = %e, "Template render failed");
-            }
-            let first_err = sr
-                .err()
-                .or(hr.err())
-                .or(tr.err())
-                .expect("at least one Err");
-            return RecipientOutcome::Failed(first_err);
-        }
-    };
+    // (subject, body_html, body_text rendered above at step 2c, before the DB write)
 
     let msg = EmailMessage {
         event_id: event.event_id,
@@ -310,19 +311,6 @@ fn serialize_recipient_list(
     .map_err(|e| AppError::permanent_mailer(format!("failed to serialize {field}: {e}")))
 }
 
-/// Maximum number of recipients allowed in a single group send.
-///
-/// This is a defence-in-depth guard inside the processor itself.  The primary
-/// enforcement happens in `runner.rs` (`max_recipients_per_event`) before
-/// `process_group` is called, but having the check here ensures the limit is
-/// respected regardless of which call-site invokes this function in the future.
-///
-/// The value intentionally mirrors the runner's default (500) but is not
-/// read from config — it is a hard ceiling baked into the function contract.
-/// If the runner's configured limit is lower (the common case) the runner
-/// guard fires first and this one is never reached.
-pub const MAX_GROUP_RECIPIENTS: usize = 500;
-
 /// Process all recipients as a single group email (group send mode).
 ///
 /// All addresses in `email_opts.recipients` appear together in the `To:`
@@ -344,13 +332,15 @@ pub const MAX_GROUP_RECIPIENTS: usize = 500;
 /// that already have a `SENT` row.  Retried recipients receive a separate
 /// email (the `To:` header shows only their own address); the shared-`To:`
 /// visibility of the original group email is not preserved on retry.
-#[instrument(skip(ctx, event, email_opts, attachments, shutdown),
+#[instrument(skip(ctx, event, email_opts, attachments, cc_bcc, shutdown),
              fields(event_id = %event.event_id, recipient_count = email_opts.recipients.len()))]
 pub async fn process_group(
     ctx: &ProcessorContext,
     event: &NotificationEvent,
     email_opts: &common::EmailOptions,
     attachments: &[ResolvedAttachment],
+    cc_bcc: &EffectiveCcBcc,
+    max_recipients: usize,
     shutdown: &tokio_util::sync::CancellationToken,
 ) -> RecipientOutcome {
     let recipients = &email_opts.recipients;
@@ -367,16 +357,15 @@ pub async fn process_group(
     };
 
     // ── 0a. Recipient count guard (defence-in-depth) ─────────────────────────
-    // The runner enforces `max_recipients_per_event` before calling this
-    // function, so this path is normally unreachable.  The check is duplicated
-    // here so that any future call-site that bypasses the runner guard (e.g. a
-    // test harness, a new code path) still hits a hard ceiling before any
-    // allocations, DB writes, or network calls are made.
-    if recipients.len() > MAX_GROUP_RECIPIENTS {
+    // The primary enforcement happens in `delivery.rs` (`max_recipients_per_event`)
+    // before `process_group` is called; the same limit is passed in here so both
+    // layers always use the same configured value.  This check fires only if a
+    // future call-site bypasses the outer guard (e.g. a test harness).
+    if recipients.len() > max_recipients {
         return RecipientOutcome::Failed(AppError::permanent_mailer(format!(
             "group send: recipient count {} exceeds maximum allowed ({})",
             recipients.len(),
-            MAX_GROUP_RECIPIENTS,
+            max_recipients,
         )));
     }
 
@@ -410,78 +399,39 @@ pub async fn process_group(
             )));
         }
     }
-    // Invalid CC/BCC addresses are a permanent failure.
-    // Blocked addresses are excluded and logged at WARN level; delivery
-    // continues for the remaining CC/BCC recipients and all allowed TO
-    // recipients.  Same semantics as process_recipient.  Blocked CC/BCC do
-    // NOT get notification_log rows; consult structured logs
-    // (email=<addr>, message="CC address blocked") for the audit trail.
-    for r in email_opts.cc.iter().chain(email_opts.bcc.iter()) {
-        if !is_valid_email(&r.email) {
-            return RecipientOutcome::Failed(AppError::permanent_mailer(format!(
-                "invalid cc/bcc email address: {}",
-                r.email
-            )));
+    // CC/BCC validation and filtering were done once at the delivery level
+    // (delivery.rs) before this function was called, for the same reason as in
+    // process_recipient: avoids N×M filter evaluations and log noise.
+    let effective_cc = &cc_bcc.cc;
+    let effective_bcc = &cc_bcc.bcc;
+
+    // ── 2c. Template rendering (before DB write) ──────────────────────────────────
+    // Same rationale as process_recipient step 2c: fail before writing any DB row
+    // so a permanently broken template does not burn retry budget.
+    let subject_result = render_template(&prefetched_template.subject, &event.payload);
+    let html_result = render_html_template(&prefetched_template.body_html, &event.payload);
+    let text_result = render_template(&prefetched_template.body_text, &event.payload);
+
+    let (subject, body_html, body_text) = match (subject_result, html_result, text_result) {
+        (Ok(s), Ok(h), Ok(t)) => (s, h, t),
+        (sr, hr, tr) => {
+            if let Err(ref e) = sr {
+                tracing::warn!(component = "subject",   error = %e, "Template render failed");
+            }
+            if let Err(ref e) = hr {
+                tracing::warn!(component = "body_html", error = %e, "Template render failed");
+            }
+            if let Err(ref e) = tr {
+                tracing::warn!(component = "body_text", error = %e, "Template render failed");
+            }
+            let first_err = sr
+                .err()
+                .or(hr.err())
+                .or(tr.err())
+                .expect("at least one Err");
+            return RecipientOutcome::Failed(first_err);
         }
-    }
-    let effective_cc: Vec<Recipient> = email_opts
-        .cc
-        .iter()
-        .filter(|r| match ctx.filter.check(&r.email) {
-            Ok(()) => true,
-            Err(AppError::Blocked(ref reason)) => {
-                warn!(
-                    event_id = %event.event_id,
-                    email    = %r.email,
-                    reason   = %reason,
-                    "CC address blocked by filter — excluding from group delivery"
-                );
-                false
-            }
-            // Unexpected non-Blocked errors are treated as pass-through (fail-open):
-            // an unknown filter error should never silently drop a CC recipient.
-            Err(e) => {
-                error!(
-                    event_id = %event.event_id,
-                    email    = %r.email,
-                    error    = %e,
-                    "Unexpected (non-Blocked) error from recipient filter for CC address — \
-                     passing through (fail-open). Investigate filter health."
-                );
-                true
-            }
-        })
-        .cloned()
-        .collect();
-    let effective_bcc: Vec<Recipient> = email_opts
-        .bcc
-        .iter()
-        .filter(|r| match ctx.filter.check(&r.email) {
-            Ok(()) => true,
-            Err(AppError::Blocked(ref reason)) => {
-                warn!(
-                    event_id = %event.event_id,
-                    email    = %r.email,
-                    reason   = %reason,
-                    "BCC address blocked by filter — excluding from group delivery"
-                );
-                false
-            }
-            // Unexpected non-Blocked errors are treated as pass-through (fail-open):
-            // an unknown filter error should never silently drop a BCC recipient.
-            Err(e) => {
-                error!(
-                    event_id = %event.event_id,
-                    email    = %r.email,
-                    error    = %e,
-                    "Unexpected (non-Blocked) error from recipient filter for BCC address — \
-                     passing through (fail-open). Investigate filter health."
-                );
-                true
-            }
-        })
-        .cloned()
-        .collect();
+    };
 
     // ── 3. Idempotency ───────────────────────────────────────────────────────
     // Use map_err + ? for the same reason as in process_recipient: failures
@@ -587,6 +537,13 @@ pub async fn process_group(
     }
 
     // For GroupRetryMode::Individual, eagerly insert rows for every secondary recipient.
+    //
+    // ATOMICITY NOTE: the primary row was inserted above; secondary rows are
+    // inserted one-by-one here.  If the process crashes between two inserts,
+    // some secondaries will have no DB row.  On AMQP redelivery the primary
+    // Duplicate path returns early, so those recipients are silently skipped.
+    // A future improvement would be to insert all rows in a single batch
+    // INSERT (or a transaction) so the set is either fully written or not at all.
     if email_opts.group_retry_mode == GroupRetryMode::Individual {
         for r in recipients.iter().skip(1) {
             if let Err(e) = ctx.store.insert_pending(&make_args(r, &shared)).await {
@@ -655,38 +612,7 @@ pub async fn process_group(
     // mark_sent calls, and the `to_count` log field all stay consistent.
     let recipients = allowed_recipients;
 
-    // ── 5. Template rendering ────────────────────────────────────────────────
-    // Render all three components and collect every error before returning.
-    // The original code surfaced only the first failure in the tuple match,
-    // silently discarding the second and third errors.  Collecting all errors
-    // gives operators a complete picture when triaging a broken template.
-    let subject_result = render_template(&prefetched_template.subject, &event.payload);
-    let html_result = render_html_template(&prefetched_template.body_html, &event.payload);
-    let text_result = render_template(&prefetched_template.body_text, &event.payload);
-
-    let (subject, body_html, body_text) = match (subject_result, html_result, text_result) {
-        (Ok(s), Ok(h), Ok(t)) => (s, h, t),
-        (sr, hr, tr) => {
-            // Log every component that failed, then return the first error.
-            // The original tuple-match (Err(e), _, _) | (_, Err(e), _) | ...
-            // silently discarded the second and third failures.
-            if let Err(ref e) = sr {
-                tracing::warn!(component = "subject",   error = %e, "Template render failed");
-            }
-            if let Err(ref e) = hr {
-                tracing::warn!(component = "body_html", error = %e, "Template render failed");
-            }
-            if let Err(ref e) = tr {
-                tracing::warn!(component = "body_text", error = %e, "Template render failed");
-            }
-            let first_err = sr
-                .err()
-                .or(hr.err())
-                .or(tr.err())
-                .expect("at least one Err");
-            return RecipientOutcome::Failed(first_err);
-        }
-    };
+    // (subject, body_html, body_text rendered above at step 2c, before the DB write)
 
     let to_extra: Vec<MailboxRef> = recipients
         .iter()
@@ -870,6 +796,12 @@ async fn execute_send(
                     // can manually correct stuck rows.  Individual mode accepts this
                     // risk in exchange for per-recipient retry granularity on the first
                     // (pre-crash) attempt.
+                    //
+                    // `mark_sent_failures` tracks how many secondaries failed so we
+                    // can emit a single event-level counter (`email_group_mark_sent_partial_total`)
+                    // that is easy to alert on, in addition to the per-failure
+                    // `email_mark_sent_failed_total` increments below.
+                    let mut mark_sent_failures: usize = 0;
                     for email in secondaries {
                         if let Err(e) = ctx.store.mark_sent(*event_id, email).await {
                             warn!(
@@ -882,7 +814,16 @@ async fn execute_send(
                             counter!("email_mark_sent_failed_total",
                                 "event_type" => event_type.to_owned())
                             .increment(1);
+                            mark_sent_failures += 1;
                         }
+                    }
+                    // Fire once per group send if at least one secondary failed.
+                    // Alert on this metric to catch partial-completion events before
+                    // they result in re-send duplicates on the next AMQP redelivery.
+                    if mark_sent_failures > 0 {
+                        counter!("email_group_mark_sent_partial_total",
+                            "event_type" => event_type.to_owned())
+                        .increment(1);
                     }
                 }
             }

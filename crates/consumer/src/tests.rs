@@ -29,6 +29,7 @@ mod processor_tests {
     use tokio_retry::Retry;
     use uuid::Uuid;
 
+    use crate::config::ConsumerConfig;
     use crate::processor::{is_retryable, ProcessorContext};
 
     // ── Mock sender ───────────────────────────────────────────────────────────
@@ -897,17 +898,21 @@ mod processor_tests {
     }
 
     /// `process_group` must return Failed immediately when recipient count
-    /// exceeds `MAX_GROUP_RECIPIENTS`, before any DB write or network call.
+    /// exceeds `max_recipients_per_event`, before any DB write or network call.
     #[test]
     fn group_recipient_count_exceeds_max_is_permanent_failure() {
-        use crate::processor::{RecipientOutcome, MAX_GROUP_RECIPIENTS};
+        use crate::processor::RecipientOutcome;
+
+        // Use the same default as ConsumerConfig so this test stays in sync
+        // with the configured limit without importing a now-removed constant.
+        let max_recipients = ConsumerConfig::default().max_recipients_per_event;
 
         // Simulate the defence-in-depth guard inside process_group.
-        let recipient_count = MAX_GROUP_RECIPIENTS + 1;
-        let outcome = if recipient_count > MAX_GROUP_RECIPIENTS {
+        let recipient_count = max_recipients + 1;
+        let outcome = if recipient_count > max_recipients {
             RecipientOutcome::Failed(AppError::permanent_mailer(format!(
                 "group send: recipient count {recipient_count} exceeds maximum allowed \
-                 ({MAX_GROUP_RECIPIENTS})"
+                 ({max_recipients})"
             )))
         } else {
             RecipientOutcome::Sent // unreachable in this test
@@ -925,18 +930,16 @@ mod processor_tests {
         }
     }
 
-    /// `process_group` must accept exactly `MAX_GROUP_RECIPIENTS` recipients
+    /// `process_group` must accept exactly `max_recipients_per_event` recipients
     /// without triggering the count guard.
     #[test]
     fn group_recipient_count_at_max_is_allowed() {
-        use crate::processor::MAX_GROUP_RECIPIENTS;
-
-        let recipient_count = MAX_GROUP_RECIPIENTS;
+        let max_recipients = ConsumerConfig::default().max_recipients_per_event;
         // The guard condition: strictly greater than, not greater-or-equal.
-        let would_fail = recipient_count > MAX_GROUP_RECIPIENTS;
+        let would_fail = max_recipients > max_recipients;
         assert!(
             !would_fail,
-            "exactly MAX_GROUP_RECIPIENTS recipients must not trigger the count guard"
+            "exactly max_recipients_per_event recipients must not trigger the count guard"
         );
     }
 

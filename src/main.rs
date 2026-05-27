@@ -154,7 +154,9 @@ async fn main() -> anyhow::Result<()> {
             tracing::warn!(
                 account = name,
                 from_email = acct.from_email,
-                "Named sender account has empty username or password —                  this is only correct for no-auth SMTP relays (e.g. Mailpit).                  Set username and password in [sender_accounts.{name}] if auth is required."
+                "Named sender account has empty username or password — \
+                 this is only correct for no-auth SMTP relays (e.g. Mailpit). \
+                 Set username and password in [sender_accounts.{name}] if auth is required."
             );
         }
         let acct_sender = SmtpSender::new(mailer::smtp::SmtpConfig {
