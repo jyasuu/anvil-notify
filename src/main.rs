@@ -228,7 +228,7 @@ async fn main() -> anyhow::Result<()> {
     match &cfg.http.api_key {
         Some(_) => {}
         None if cfg.http.allow_unauthenticated => {
-            tracing::error!(
+            tracing::warn!(
                 "HTTP API authentication is DISABLED (allow_unauthenticated = true) — \
                  all /emails/* and /templates/* endpoints are publicly accessible. \
                  Do not use this setting in production."

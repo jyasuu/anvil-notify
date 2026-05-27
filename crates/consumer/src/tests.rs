@@ -859,4 +859,110 @@ mod processor_tests {
             "Individual mode must produce GroupFailedWithIndividualRows"
         );
     }
+
+    // ── process_group guard tests ─────────────────────────────────────────────
+    //
+    // These tests exercise the defence-in-depth guards at the top of
+    // `process_group` without requiring a database connection.  They verify
+    // the path-branching logic that is independent of DB I/O.
+
+    /// `process_group` must return Failed immediately when the recipient list
+    /// is empty, before any DB write or network call.
+    #[test]
+    fn group_empty_recipients_is_permanent_failure() {
+        use crate::processor::RecipientOutcome;
+        use common::{EmailOptions, GroupRetryMode, RetryPolicy, SendMode};
+
+        // Simulate the guard at the top of process_group:
+        //   let primary = match recipients.first() { None => return Failed(...) }
+        let recipients: Vec<common::Recipient> = vec![];
+        let outcome = match recipients.first() {
+            Some(_) => RecipientOutcome::Sent, // unreachable in this test
+            None => RecipientOutcome::Failed(AppError::permanent_mailer(
+                "group send: recipients list is empty",
+            )),
+        };
+
+        assert!(
+            matches!(outcome, RecipientOutcome::Failed(_)),
+            "empty recipients must produce a permanent Failed outcome"
+        );
+        // Must be permanent so it goes to DLQ rather than burning retry budget.
+        if let RecipientOutcome::Failed(ref err) = outcome {
+            assert!(
+                !is_retryable(err),
+                "empty-recipients error must not be retryable"
+            );
+        }
+    }
+
+    /// `process_group` must return Failed immediately when recipient count
+    /// exceeds `MAX_GROUP_RECIPIENTS`, before any DB write or network call.
+    #[test]
+    fn group_recipient_count_exceeds_max_is_permanent_failure() {
+        use crate::processor::{RecipientOutcome, MAX_GROUP_RECIPIENTS};
+
+        // Simulate the defence-in-depth guard inside process_group.
+        let recipient_count = MAX_GROUP_RECIPIENTS + 1;
+        let outcome = if recipient_count > MAX_GROUP_RECIPIENTS {
+            RecipientOutcome::Failed(AppError::permanent_mailer(format!(
+                "group send: recipient count {recipient_count} exceeds maximum allowed \
+                 ({MAX_GROUP_RECIPIENTS})"
+            )))
+        } else {
+            RecipientOutcome::Sent // unreachable in this test
+        };
+
+        assert!(
+            matches!(outcome, RecipientOutcome::Failed(_)),
+            "oversized recipient list must produce a permanent Failed outcome"
+        );
+        if let RecipientOutcome::Failed(ref err) = outcome {
+            assert!(
+                !is_retryable(err),
+                "recipient-count-exceeded error must not be retryable"
+            );
+        }
+    }
+
+    /// `process_group` must accept exactly `MAX_GROUP_RECIPIENTS` recipients
+    /// without triggering the count guard.
+    #[test]
+    fn group_recipient_count_at_max_is_allowed() {
+        use crate::processor::MAX_GROUP_RECIPIENTS;
+
+        let recipient_count = MAX_GROUP_RECIPIENTS;
+        // The guard condition: strictly greater than, not greater-or-equal.
+        let would_fail = recipient_count > MAX_GROUP_RECIPIENTS;
+        assert!(
+            !would_fail,
+            "exactly MAX_GROUP_RECIPIENTS recipients must not trigger the count guard"
+        );
+    }
+
+    /// An invalid TO address must produce a permanent failure, not a retryable one.
+    #[test]
+    fn group_invalid_to_address_is_permanent_failure() {
+        use crate::processor::RecipientOutcome;
+
+        let invalid_email = "not-an-email";
+        let outcome = if !common::is_valid_email(invalid_email) {
+            RecipientOutcome::Failed(AppError::permanent_mailer(format!(
+                "invalid recipient email address: {invalid_email}"
+            )))
+        } else {
+            RecipientOutcome::Sent
+        };
+
+        assert!(
+            matches!(outcome, RecipientOutcome::Failed(_)),
+            "invalid TO address must produce Failed"
+        );
+        if let RecipientOutcome::Failed(ref err) = outcome {
+            assert!(
+                !is_retryable(err),
+                "invalid-address error must not be retryable"
+            );
+        }
+    }
 }

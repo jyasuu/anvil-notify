@@ -270,71 +270,19 @@ pub async fn process_recipient(
             .collect(),
     };
 
-    // ── 6. Rate-limit token ──────────────────────────────────────────────────
-    // Only increment the counter when we had to actually wait — i.e. the
-    // service is being throttled.  Incrementing unconditionally (before the
-    // call) inflated the metric even when a token was immediately available,
-    // making it useless as a "we are being throttled" alert signal.
-    match ctx.rate_limiter.wait_for_token(shutdown).await {
-        rate_limiter::TokenResult::Acquired => {}
-        rate_limiter::TokenResult::AcquiredAfterWait => {
-            counter!("email_rate_limit_waits_total",
-                "event_type" => event.event_type.clone())
-            .increment(1);
-        }
-        rate_limiter::TokenResult::Shutdown => {
-            return RecipientOutcome::Failed(AppError::Queue(
-                "service shutdown during rate-limit wait".into(),
-            ));
-        }
-    }
-
-    // ── 7. Send ───────────────────────────────────────────────────────────────
-    let sender = ctx
-        .sender_registry
-        .resolve(email_opts.sender_account.as_deref())
-        .unwrap_or_else(|| Arc::clone(&ctx.sender));
-
-    let send_start = std::time::Instant::now();
-    match sender.send(&msg).await {
-        Ok(()) => {
-            let elapsed = send_start.elapsed().as_secs_f64();
-            // IMPORTANT: mark_sent failure after a successful SMTP send means
-            // the email was delivered but the row stays PENDING.  On AMQP
-            // re-delivery the idempotency check will see PENDING (Duplicate)
-            // and re-send, producing a duplicate.  Log at WARN so the operator
-            // can inspect and manually mark the row SENT if needed.
-            if let Err(e) = ctx.store.mark_sent(event.event_id, &recipient.email).await {
-                warn!(
-                    event_id = %event.event_id,
-                    email    = %recipient.email,
-                    error    = %e,
-                    "Email delivered but mark_sent DB write failed — \
-                     row remains PENDING; re-delivery will attempt to re-send"
-                );
-                counter!("email_mark_sent_failed_total",
-                    "event_type" => event.event_type.clone())
-                .increment(1);
-            }
-            counter!("emails_sent_total",
-                "event_type" => event.event_type.clone())
-            .increment(1);
-            histogram!("email_send_duration_seconds",
-                "event_type" => event.event_type.clone())
-            .record(elapsed);
-            info!("Email delivered");
-            RecipientOutcome::Sent
-        }
-        Err(e) => {
-            counter!("emails_failed_total",
-                "event_type" => event.event_type.clone(),
-                "reason"     => error_reason_label(&e)
-            )
-            .increment(1);
-            warn!(error = %e, "Send failed");
-            RecipientOutcome::Failed(e)
-        }
-    }
+    // ── 6 & 7. Rate-limit + send ─────────────────────────────────────────────
+    execute_send(
+        ctx,
+        &msg,
+        email_opts.sender_account.as_deref(),
+        &event.event_type,
+        shutdown,
+        SendTargets::Individual {
+            event_id: event.event_id,
+            email: &recipient.email,
+        },
+    )
+    .await
 }
 
 /// Serialize a non-empty recipient slice to a JSON value for storage in `notification_log`.
@@ -776,16 +724,81 @@ pub async fn process_group(
             .collect(),
     };
 
-    // ── 6. Rate-limit token ──────────────────────────────────────────────────
+    // ── 6 & 7. Rate-limit + send ─────────────────────────────────────────────
+    execute_send(
+        ctx,
+        &msg,
+        email_opts.sender_account.as_deref(),
+        &event.event_type,
+        shutdown,
+        SendTargets::Group {
+            event_id: event.event_id,
+            primary_email: &primary.email,
+            secondaries: if email_opts.group_retry_mode == GroupRetryMode::Individual {
+                recipients
+                    .iter()
+                    .skip(1)
+                    .map(|r| r.email.as_str())
+                    .collect()
+            } else {
+                vec![]
+            },
+            retry_mode: &email_opts.group_retry_mode,
+            to_count: recipients.len(),
+        },
+    )
+    .await
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Describes which `notification_log` rows to mark SENT after a successful send.
+///
+/// Passed to [`execute_send`] so the shared rate-limit + send + mark_sent
+/// logic can handle both individual and group sends without duplicating code.
+enum SendTargets<'a> {
+    /// Individual send: exactly one row to mark SENT.
+    Individual {
+        event_id: uuid::Uuid,
+        email: &'a str,
+    },
+    /// Group send: primary row always marked SENT; secondaries marked SENT only
+    /// when `retry_mode` is `Individual` (i.e. `secondaries` is non-empty).
+    Group {
+        event_id: uuid::Uuid,
+        primary_email: &'a str,
+        /// Pre-filtered slice of secondary recipient emails to mark SENT.
+        /// Empty for `GroupRetryMode::Whole`.
+        secondaries: Vec<&'a str>,
+        retry_mode: &'a GroupRetryMode,
+        to_count: usize,
+    },
+}
+
+/// Shared steps 6–7: rate-limit wait → sender selection → send → mark_sent → metrics.
+///
+/// Called by both [`process_recipient`] and [`process_group`] to eliminate the
+/// duplicate rate-limit / send / mark_sent / metric blocks.  Each caller passes
+/// the appropriate [`SendTargets`] variant so `mark_sent` and the log message
+/// stay correct for both individual and group sends.
+async fn execute_send(
+    ctx: &ProcessorContext,
+    msg: &mailer::EmailMessage,
+    sender_account: Option<&str>,
+    event_type: &str,
+    shutdown: &tokio_util::sync::CancellationToken,
+    targets: SendTargets<'_>,
+) -> RecipientOutcome {
+    // ── Rate-limit token ──────────────────────────────────────────────────────
     // Only increment the counter when we had to actually wait — i.e. the
-    // service is being throttled.  Incrementing unconditionally (before the
-    // call) inflated the metric even when a token was immediately available,
-    // making it useless as a "we are being throttled" alert signal.
+    // service is being throttled.  Incrementing unconditionally inflated the
+    // metric even when a token was immediately available, making it useless as
+    // a "we are being throttled" alert signal.
     match ctx.rate_limiter.wait_for_token(shutdown).await {
         rate_limiter::TokenResult::Acquired => {}
         rate_limiter::TokenResult::AcquiredAfterWait => {
             counter!("email_rate_limit_waits_total",
-                "event_type" => event.event_type.clone())
+                "event_type" => event_type.to_owned())
             .increment(1);
         }
         rate_limiter::TokenResult::Shutdown => {
@@ -795,75 +808,125 @@ pub async fn process_group(
         }
     }
 
-    // ── 7. Send ───────────────────────────────────────────────────────────────
+    // ── Sender selection ──────────────────────────────────────────────────────
     let sender = ctx
         .sender_registry
-        .resolve(email_opts.sender_account.as_deref())
+        .resolve(sender_account)
         .unwrap_or_else(|| Arc::clone(&ctx.sender));
 
+    // ── Send ──────────────────────────────────────────────────────────────────
     let send_start = std::time::Instant::now();
-    match sender.send(&msg).await {
+    match sender.send(msg).await {
         Ok(()) => {
             let elapsed = send_start.elapsed().as_secs_f64();
-            // IMPORTANT: mark_sent failure after a successful SMTP send means
+
+            // ── mark_sent ─────────────────────────────────────────────────────
+            // IMPORTANT: a mark_sent failure after a successful SMTP send means
             // the email was delivered but the row stays PENDING.  On AMQP
-            // re-delivery the idempotency check will see PENDING (Duplicate)
-            // and re-send, producing a duplicate.  Log at WARN so the operator
-            // can inspect and manually mark the row SENT if needed.
-            if let Err(e) = ctx.store.mark_sent(event.event_id, &primary.email).await {
-                warn!(
-                    event_id = %event.event_id,
-                    email    = %primary.email,
-                    error    = %e,
-                    "Group email delivered but mark_sent DB write failed for primary — \
-                     row remains PENDING; re-delivery will attempt to re-send"
-                );
-                counter!("email_mark_sent_failed_total",
-                    "event_type" => event.event_type.clone())
-                .increment(1);
-            }
-            // For GroupRetryMode::Individual, also mark every secondary row SENT.
-            if email_opts.group_retry_mode == GroupRetryMode::Individual {
-                for r in recipients.iter().skip(1) {
-                    if let Err(e) = ctx.store.mark_sent(event.event_id, &r.email).await {
+            // re-delivery the idempotency check will see PENDING (Duplicate) and
+            // re-send, producing a duplicate.  Log at WARN so the operator can
+            // inspect and manually mark the row SENT if needed.
+            match &targets {
+                SendTargets::Individual { event_id, email } => {
+                    if let Err(e) = ctx.store.mark_sent(*event_id, email).await {
                         warn!(
-                            event_id = %event.event_id,
-                            email    = %r.email,
+                            event_id = %event_id,
+                            email    = %email,
                             error    = %e,
-                            "Group email delivered but mark_sent DB write failed for secondary recipient — \
+                            "Email delivered but mark_sent DB write failed — \
                              row remains PENDING; re-delivery will attempt to re-send"
                         );
                         counter!("email_mark_sent_failed_total",
-                            "event_type" => event.event_type.clone())
+                            "event_type" => event_type.to_owned())
                         .increment(1);
                     }
                 }
+                SendTargets::Group {
+                    event_id,
+                    primary_email,
+                    secondaries,
+                    ..
+                } => {
+                    if let Err(e) = ctx.store.mark_sent(*event_id, primary_email).await {
+                        warn!(
+                            event_id = %event_id,
+                            email    = %primary_email,
+                            error    = %e,
+                            "Group email delivered but mark_sent DB write failed for primary — \
+                             row remains PENDING; re-delivery will attempt to re-send"
+                        );
+                        counter!("email_mark_sent_failed_total",
+                            "event_type" => event_type.to_owned())
+                        .increment(1);
+                    }
+                    // Mark secondary rows SENT for GroupRetryMode::Individual.
+                    //
+                    // IMPORTANT: this loop marks rows one by one after SMTP has
+                    // already accepted the message.  If the process crashes mid-loop,
+                    // some secondary rows remain PENDING.  On AMQP re-delivery the
+                    // idempotency check sees PENDING (Duplicate) and re-sends,
+                    // potentially causing duplicates.  This is the same trade-off as
+                    // the primary mark_sent above; both are logged at WARN so operators
+                    // can manually correct stuck rows.  Individual mode accepts this
+                    // risk in exchange for per-recipient retry granularity on the first
+                    // (pre-crash) attempt.
+                    for email in secondaries {
+                        if let Err(e) = ctx.store.mark_sent(*event_id, email).await {
+                            warn!(
+                                event_id = %event_id,
+                                email    = %email,
+                                error    = %e,
+                                "Group email delivered but mark_sent DB write failed for secondary \
+                                 recipient — row remains PENDING; re-delivery will attempt to re-send"
+                            );
+                            counter!("email_mark_sent_failed_total",
+                                "event_type" => event_type.to_owned())
+                            .increment(1);
+                        }
+                    }
+                }
             }
+
             counter!("emails_sent_total",
-                "event_type" => event.event_type.clone())
+                "event_type" => event_type.to_owned())
             .increment(1);
             histogram!("email_send_duration_seconds",
-                "event_type" => event.event_type.clone())
+                "event_type" => event_type.to_owned())
             .record(elapsed);
-            info!(to_count = recipients.len(), "Group email delivered");
+
+            match &targets {
+                SendTargets::Individual { .. } => info!("Email delivered"),
+                SendTargets::Group { to_count, .. } => {
+                    info!(to_count = %to_count, "Group email delivered")
+                }
+            }
+
             RecipientOutcome::Sent
         }
         Err(e) => {
             counter!("emails_failed_total",
-                "event_type" => event.event_type.clone(),
+                "event_type" => event_type.to_owned(),
                 "reason"     => error_reason_label(&e)
             )
             .increment(1);
-            warn!(error = %e, "Group send failed");
-            match email_opts.group_retry_mode {
-                GroupRetryMode::Individual => RecipientOutcome::GroupFailedWithIndividualRows(e),
-                GroupRetryMode::Whole => RecipientOutcome::Failed(e),
+
+            match &targets {
+                SendTargets::Individual { .. } => warn!(error = %e, "Send failed"),
+                SendTargets::Group { .. } => warn!(error = %e, "Group send failed"),
+            }
+
+            match targets {
+                SendTargets::Individual { .. } => RecipientOutcome::Failed(e),
+                SendTargets::Group { retry_mode, .. } => match retry_mode {
+                    GroupRetryMode::Individual => {
+                        RecipientOutcome::GroupFailedWithIndividualRows(e)
+                    }
+                    GroupRetryMode::Whole => RecipientOutcome::Failed(e),
+                },
             }
         }
     }
 }
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn resolve_from_override(ov: Option<&FromOverride>) -> (Option<String>, Option<String>) {
     match ov {
