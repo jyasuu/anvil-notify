@@ -75,31 +75,45 @@ pub async fn run_outbox_worker(
 
     let mut reconnect_delay = Duration::from_secs(2);
 
-    // Helper macro: abort the reaper and log any panic before returning.
-    // A plain abort() is safe here because the reaper holds no locks or
-    // un-ACK'd DB transactions — it only reads and updates outbox rows.
+    // Helper macro: stop the reaper and surface any panic before returning.
+    // abort() sends a cancellation to the task; the subsequent await resolves
+    // immediately (either Ok or JoinError::Cancelled).  Using abort() rather
+    // than relying solely on the CancellationToken ensures the task is stopped
+    // even on error paths where the token may not have fired yet.
+    // The await surfaces a panic as a tracing error; without it, a panicked
+    // JoinHandle is silently dropped by Tokio.
+    //
+    // Wrapped in a block so the handle is moved in only one branch at a time;
+    // all three call sites are `return` points so only one fires at runtime,
+    // but rustc needs the move to be unambiguous — hence the macro expansion
+    // rather than a closure (which cannot express the necessary `async move`).
     macro_rules! shutdown_reaper {
-        () => {
-            reaper_handle.abort();
-        };
+        ($handle:expr) => {{
+            $handle.abort();
+            match $handle.await {
+                Ok(()) => {}
+                Err(e) if e.is_cancelled() => {} // aborted cleanly
+                Err(e) => tracing::error!(error = %e, "Outbox reaper task panicked"),
+            }
+        }};
     }
 
     loop {
         if shutdown.is_cancelled() {
             info!("Outbox worker: shutdown requested");
-            shutdown_reaper!();
+            shutdown_reaper!(reaper_handle);
             return Ok(());
         }
 
         match connect_amqp_and_poll(&cfg, &pool, shutdown.clone()).await {
             Ok(()) => {
                 info!("Outbox worker: exiting cleanly");
-                shutdown_reaper!();
+                shutdown_reaper!(reaper_handle);
                 return Ok(());
             }
             Err(e) if shutdown.is_cancelled() => {
                 info!(error = %e, "Outbox worker: exited after shutdown");
-                shutdown_reaper!();
+                shutdown_reaper!(reaper_handle);
                 return Ok(());
             }
             Err(e) => {
@@ -369,6 +383,12 @@ async fn publish_and_mark(
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default(); // defaults to SendMode::Individual
 
+    let group_retry_mode: GroupRetryMode = row
+        .payload
+        .get("group_retry_mode")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default(); // defaults to GroupRetryMode::Whole
+
     let metadata: Metadata = row
         .payload
         .get("metadata")
@@ -407,7 +427,7 @@ async fn publish_and_mark(
                 from_override,
                 attachments,
                 sender_account,
-                group_retry_mode: GroupRetryMode::default(),
+                group_retry_mode,
                 retry_policy: RetryPolicy::default(),
             }),
         },

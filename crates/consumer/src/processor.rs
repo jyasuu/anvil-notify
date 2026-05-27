@@ -531,10 +531,42 @@ pub async fn process_group(
         group_retry_mode_str,
     };
 
-    // Always insert the primary row first.
-    let primary_insert = match ctx.store.insert_pending(&make_args(primary, &shared)).await {
+    // ── 3a. Idempotency inserts ───────────────────────────────────────────────
+    //
+    // For GroupRetryMode::Individual every recipient gets its own row so that
+    // re-delivery after a partial send can skip already-SENT addresses.  All
+    // rows are written in a single call so the set is written atomically:
+    // either every row exists or none do.  A crash during the insert rolls
+    // back the transaction; on re-delivery the batch is retried in full.
+    //
+    // For GroupRetryMode::Whole only the primary row is written (one row
+    // tracks the whole group send as a unit).
+    let rows_to_insert: Vec<_> = if email_opts.group_retry_mode == GroupRetryMode::Individual {
+        recipients.iter().map(|r| make_args(r, &shared)).collect()
+    } else {
+        vec![make_args(primary, &shared)]
+    };
+
+    let insert_results = match ctx.store.insert_pending_batch(&rows_to_insert).await {
         Ok(r) => r,
         Err(e) => return RecipientOutcome::Failed(e),
+    };
+
+    // The primary row is always first.  Its result drives the terminal-state
+    // check; secondary results are not inspected here because:
+    //   • InsertResult::Inserted — new row, proceed normally.
+    //   • InsertResult::Duplicate { Sent | Blocked } — already terminal; the
+    //     filter step below (step 4) will mark them BLOCKED if re-filtered, or
+    //     execute_send will find them SENT via the mark_sent no-op.
+    //   • InsertResult::Duplicate { non-terminal } — treated as a retry for
+    //     that recipient; execute_send will re-attempt delivery.
+    let primary_insert = match insert_results.into_iter().next() {
+        Some(r) => r,
+        None => {
+            return RecipientOutcome::Failed(AppError::permanent_mailer(
+                "insert_pending_batch returned empty results",
+            ))
+        }
     };
 
     match primary_insert {
@@ -552,22 +584,6 @@ pub async fn process_group(
             Err(e) => return RecipientOutcome::Failed(e),
         },
         InsertResult::Inserted => {}
-    }
-
-    // For GroupRetryMode::Individual, eagerly insert rows for every secondary recipient.
-    //
-    // ATOMICITY NOTE: the primary row was inserted above; secondary rows are
-    // inserted one-by-one here.  If the process crashes between two inserts,
-    // some secondaries will have no DB row.  On AMQP redelivery the primary
-    // Duplicate path returns early, so those recipients are silently skipped.
-    // A future improvement would be to insert all rows in a single batch
-    // INSERT (or a transaction) so the set is either fully written or not at all.
-    if email_opts.group_retry_mode == GroupRetryMode::Individual {
-        for r in recipients.iter().skip(1) {
-            if let Err(e) = ctx.store.insert_pending(&make_args(r, &shared)).await {
-                return RecipientOutcome::Failed(e);
-            }
-        }
     }
 
     // ── 4. Recipient filter — partition To: addresses into allowed / blocked ───

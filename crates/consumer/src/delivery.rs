@@ -173,26 +173,15 @@ pub(crate) async fn handle_delivery(
     };
 
     // ── CC/BCC validation and filtering (once per event) ──────────────────
-    // Invalid CC/BCC addresses are a permanent failure for the whole event.
-    // Blocked CC/BCC addresses are silently excluded — logged at WARN level —
-    // and delivery continues.  This runs once here rather than inside each
-    // per-recipient task to avoid N×M filter evaluations and log noise.
-    for r in email_opts.cc.iter().chain(email_opts.bcc.iter()) {
-        if !is_valid_email(&r.email) {
-            warn!(
-                event_id = %event.event_id,
-                email    = %r.email,
-                "Invalid CC/BCC address — sending to DLQ"
-            );
-            let _ = delivery
-                .nack(BasicNackOptions {
-                    requeue: false,
-                    ..Default::default()
-                })
-                .await;
-            return;
-        }
-    }
+    // Invalid or blocked CC/BCC addresses are silently excluded — logged at
+    // WARN level — and delivery continues.  This mirrors the block-list
+    // behaviour for CC/BCC: a bad copy address is not a reason to abort a
+    // delivery to valid TO recipients.  Contrast with TO recipients, where
+    // an invalid address returns a permanent AppError::Mailer for that
+    // recipient.
+    //
+    // This runs once here rather than inside each per-recipient task to avoid
+    // N×M filter evaluations and log noise.
     let cc_bcc = {
         // Helper that checks both the static config filter and the DB-backed
         // block_list_store for a CC/BCC address.  Config-file rules win (checked
@@ -206,6 +195,15 @@ pub(crate) async fn handle_delivery(
             r: &Recipient,
             field: &str,
         ) -> bool {
+            // 0. Basic address validity — strip rather than DLQ the event.
+            if !is_valid_email(&r.email) {
+                warn!(
+                    event_id = %event_id,
+                    email    = %r.email,
+                    "{} address is invalid — excluding from delivery", field
+                );
+                return false;
+            }
             // 1. Static config filter.
             match ctx.filter.check(&r.email) {
                 Ok(()) => {}

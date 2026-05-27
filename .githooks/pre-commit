@@ -1,0 +1,38 @@
+#!/bin/bash
+
+# Exit immediately if any command fails
+set -e
+TARGET="x86_64-unknown-linux-musl"
+
+echo "🦀 Running Rust Quality Gate..."
+
+# 1. Format Check
+# --check returns a non-zero exit code if the code isn't formatted, blocking the commit
+echo "--- 🎨 Checking code formatting (cargo fmt) ---"
+cargo fmt -- --check
+
+# 2. Cargo SQLx Prepare Check
+# Ensures your offline database savings are up to date with your actual models
+if [ -d ".sqlx" ]; then
+    echo "--- 🗃️ Checking SQLx metadata (cargo sqlx prepare) ---"
+    # --check ensures the .sqlx directory matches your current code and DB schema
+    cargo sqlx prepare --workspace --check -- --all-targets --all-features
+fi
+
+# 3. Clippy Lints
+# Treats warnings as errors so sloppy code can't get through
+echo "--- 🔬 Running linter (cargo clippy) ---"
+cargo clippy --all-targets --all-features -- -D warnings
+
+# 4. Build Check
+# Ensures everything actually compiles cleanly
+echo "--- 🔨 Building project (cargo build) ---"
+cargo build --target=$TARGET --all --release
+
+# 5. Run Tests
+# The final boss: all tests must pass
+echo "--- 🧪 Running test suite (cargo test) ---"
+cargo test --all-features --all
+
+echo "🎉 All checks passed! Your Rust code is pristine."
+exit 0
