@@ -89,6 +89,10 @@ auth_token = "bearer-token"  # optional
 | POST   | `/emails/:event_id/recipients/:email/retry` | Reset one FAILED recipient → PENDING          |
 | DELETE | `/templates/:event_type/cache`              | Evict one template from the in-memory cache   |
 | DELETE | `/templates/cache`                          | Clear the entire template cache               |
+| GET    | `/admin/blocklist`                          | List all active block/allow-list entries      |
+| POST   | `/admin/blocklist`                          | Add or reactivate a block/allow-list entry    |
+| DELETE | `/admin/blocklist/:id`                      | Soft-delete an entry by id                    |
+| DELETE | `/admin/blocklist/cache`                    | Force-reload the block_list cache from DB     |
 
 > **Kubernetes probes**: use `/ready` for `readinessProbe` and `/health` for `livenessProbe`.
 > `/ready` performs a live DB ping; `/health` is a shallow process check only.

@@ -15,7 +15,7 @@ use rate_limiter::MailRateLimiter;
 use recipient_filter::RecipientFilter;
 use reqwest::Client;
 use sqlx::postgres::PgPoolOptions;
-use store::{EmailNotificationStore, NotificationStore, TemplateStore};
+use store::{BlockListStore, EmailNotificationStore, NotificationStore, TemplateStore};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -78,8 +78,16 @@ async fn main() -> anyhow::Result<()> {
 
     let store = EmailNotificationStore::new(pool.clone());
     let template_store = TemplateStore::new_with_ttl(
-        pool,
+        pool.clone(),
         std::time::Duration::from_secs(cfg.template_cache_ttl_secs),
+    );
+    let block_list_store = BlockListStore::new(
+        pool.clone(),
+        std::time::Duration::from_secs(cfg.block_list_cache_ttl_secs),
+    );
+    info!(
+        ttl_secs = cfg.block_list_cache_ttl_secs,
+        "BlockListStore ready"
     );
     info!(ttl_secs = cfg.template_cache_ttl_secs, "Database ready");
 
@@ -249,6 +257,7 @@ async fn main() -> anyhow::Result<()> {
     let api_state = ApiState {
         store: Arc::new(store.clone()) as Arc<dyn NotificationStore>,
         template_store: template_store.clone(),
+        block_list_store: block_list_store.clone(),
         publisher,
         api_key: cfg.http.api_key.clone(),
         filter: filter.clone(),
@@ -256,6 +265,35 @@ async fn main() -> anyhow::Result<()> {
     let router = build_router(api_state);
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.http.port));
     info!(addr = %addr, "Starting HTTP API");
+
+    // ── Stale-PENDING reaper ──────────────────────────────────────────────────
+    // Recovers rows that are stuck in PENDING with no AMQP message to drive
+    // them forward (e.g. after a broker blip during a retry-endpoint call).
+    // Any PENDING row older than `stale_pending_timeout_secs` is reset to
+    // FAILED so an operator can see it and decide whether to retry manually.
+    let reaper_store = Arc::new(store.clone()) as Arc<dyn NotificationStore>;
+    let reaper_shutdown = shutdown.clone();
+    let reaper_timeout = cfg.stale_pending_timeout_secs;
+    let reaper_interval = cfg.stale_pending_reaper_interval_secs;
+    let reaper_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(reaper_interval));
+        loop {
+            tokio::select! {
+                _ = reaper_shutdown.cancelled() => break,
+                _ = interval.tick() => {
+                    match reaper_store.reap_stale_pending(reaper_timeout).await {
+                        Ok(n) if n > 0 => tracing::warn!(
+                            count = n,
+                            timeout_secs = reaper_timeout,
+                            "Stale-PENDING reaper: marked {n} orphaned rows as FAILED",
+                        ),
+                        Ok(_) => {}
+                        Err(e) => tracing::error!(error = %e, "Stale-PENDING reaper error"),
+                    }
+                }
+            }
+        }
+    });
 
     let api_shutdown = shutdown.clone();
     let api_task = tokio::spawn(async move {
@@ -302,6 +340,7 @@ async fn main() -> anyhow::Result<()> {
             sender,
             sender_registry,
             filter,
+            block_list_store,
             rate_limiter,
         };
         if let Err(e) = run_consumer(consumer_cfg, ctx, consumer_http, consumer_shutdown).await {
@@ -336,6 +375,7 @@ async fn main() -> anyhow::Result<()> {
     if tokio::time::timeout(timeout, async {
         let _ = api_task.await;
         let _ = consumer_task.await;
+        let _ = reaper_task.await;
     })
     .await
     .is_err()

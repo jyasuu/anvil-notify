@@ -18,21 +18,7 @@ use tracing::{info, warn};
 /// and subject to high latency.
 const CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Redact credentials from an AMQP URL before storing or logging.
-/// Same pattern as `runner.rs::scrub_amqp_url` — kept local to avoid a
-/// cross-crate dependency on consumer internals.
-#[allow(dead_code)]
-fn scrub_amqp_url(url: &str) -> String {
-    if let Some(at_pos) = url.find('@') {
-        if let Some(scheme_end) = url.find("://") {
-            let scheme = &url[..scheme_end + 3];
-            let after_at = &url[at_pos + 1..];
-            return format!("{scheme}[redacted]@{after_at}");
-        }
-        return "[redacted — unrecognised URL format containing '@']".to_owned();
-    }
-    url.to_owned()
-}
+
 
 /// Thin wrapper around an AMQP channel used by the HTTP API to re-enqueue
 /// events whose DB rows have been reset to PENDING via the retry endpoints.

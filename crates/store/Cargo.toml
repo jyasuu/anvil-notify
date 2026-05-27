@@ -16,4 +16,5 @@ tracing     = { workspace = true }
 anyhow      = { workspace = true }
 
 async-trait = { workspace = true }
+moka  = { workspace = true }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "macros"] }

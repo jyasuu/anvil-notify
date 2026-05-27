@@ -115,6 +115,13 @@ pub trait NotificationStore: Send + Sync + 'static {
         exhausted: bool,
     ) -> Result<(), AppError>;
 
+    /// Reset PENDING rows that are older than `timeout_secs` to FAILED.
+    ///
+    /// These are "orphaned" rows: status = PENDING with no AMQP message to
+    /// drive them forward (e.g. after a broker blip during a retry call).
+    /// Returns the number of rows updated.
+    async fn reap_stale_pending(&self, timeout_secs: u64) -> Result<u64, AppError>;
+
     /// Mark a delivery as blocked by the recipient filter.
     async fn mark_blocked(
         &self,
@@ -649,6 +656,31 @@ impl NotificationStore for EmailNotificationStore {
             cc: first.cc.clone(),
             bcc: first.bcc.clone(),
         })
+    }
+
+    async fn reap_stale_pending(&self, timeout_secs: u64) -> Result<u64, AppError> {
+        // Mark PENDING rows that are older than `timeout_secs` as FAILED.
+        // These are orphaned rows: the AMQP message that should drive them
+        // was lost (e.g. a broker blip mid-retry-API call).
+        // We use a conservative last_error message so operators understand
+        // this is an infrastructure issue, not a delivery failure.
+        let result = sqlx::query!(
+            r#"
+            UPDATE notification_log
+               SET status     = 'FAILED',
+                   last_error = 'Orphaned by stale-PENDING reaper: PENDING row exceeded timeout with no AMQP message to drive it. Trigger a manual retry when the broker is healthy.',
+                   updated_at = now()
+             WHERE status     = 'PENDING'
+               AND channel    = $1
+               AND updated_at < now() - ($2 || ' seconds')::interval
+            "#,
+            CHANNEL_EMAIL,
+            timeout_secs.to_string(),
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(AppError::Database)?;
+        Ok(result.rows_affected())
     }
 
     fn pool(&self) -> &PgPool {

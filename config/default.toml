@@ -79,7 +79,19 @@ blocked_domains = []   # e.g. ["competitor.com"]
 # Increase for high-throughput deployments; decrease (or set to 0) when editing
 # templates frequently. Operators can also call DELETE /templates/cache for
 # immediate invalidation without restarting the service.
-template_cache_ttl_secs = 300  # 5 minutes
+template_cache_ttl_secs = 300
+
+# How long the DB-backed block/allow-list snapshot is cached (seconds).
+# Changes to /admin/blocklist rows propagate within this window.
+# Set to 0 to disable caching (every check hits the DB — only for very small deployments).
+block_list_cache_ttl_secs = 30
+
+# PENDING rows older than this (seconds) are assumed orphaned and reset to FAILED
+# by the background reaper task.  Increase if your broker can be offline for longer.
+stale_pending_timeout_secs = 600
+
+# How often (seconds) the stale-PENDING reaper scans for orphaned rows.
+stale_pending_reaper_interval_secs = 300  # 5 minutes
 
 # Maximum size of a single fetched email attachment in bytes.
 # Attachments larger than this are permanently rejected (no retry).

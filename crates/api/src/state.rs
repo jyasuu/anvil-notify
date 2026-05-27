@@ -1,22 +1,23 @@
 use std::sync::Arc;
 
 use recipient_filter::RecipientFilter;
-use store::{NotificationStore, TemplateStore};
+use store::{BlockListStore, NotificationStore, TemplateStore};
 
 use crate::publisher::Publisher;
 
 #[derive(Clone)]
 pub struct ApiState {
-    pub store: Arc<dyn NotificationStore>,
-    pub template_store: TemplateStore,
+    pub store:            Arc<dyn NotificationStore>,
+    pub template_store:   TemplateStore,
+    /// DB-backed block/allow-list store. Used by admin endpoints and retry
+    /// validation; the consumer uses `RecipientFilter` which merges config-file
+    /// and DB entries at startup and is refreshed per-check via BlockListStore.
+    pub block_list_store: BlockListStore,
     /// Used by retry endpoints to re-enqueue events after resetting DB rows.
-    pub publisher: Publisher,
+    pub publisher:        Publisher,
     /// When `Some`, every request must supply `Authorization: Bearer <token>`.
-    /// Set via `AN__HTTP__API_KEY` env var or `http.api_key` in config.
-    /// Leave `None` (default) only when the API is network-isolated.
-    pub api_key: Option<String>,
-    /// Recipient filter used to validate CC/BCC addresses before re-enqueuing.
-    /// Prevents the retry API from accepting events that the consumer would
-    /// immediately reject with a permanent CC/BCC-blocked failure.
-    pub filter: RecipientFilter,
+    pub api_key:          Option<String>,
+    /// Static recipient filter (config-file entries). The BlockListStore covers
+    /// the DB-backed entries.
+    pub filter:           RecipientFilter,
 }
