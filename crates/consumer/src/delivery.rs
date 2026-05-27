@@ -29,6 +29,7 @@ use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
+use uuid::Uuid;
 
 use crate::{
     config::ConsumerConfig,
@@ -193,42 +194,60 @@ pub(crate) async fn handle_delivery(
         }
     }
     let cc_bcc = {
-        let cc: Vec<Recipient> = email_opts
-            .cc
-            .iter()
-            .filter(|r| match ctx.filter.check(&r.email) {
+        // Helper that checks both the static config filter and the DB-backed
+        // block_list_store for a CC/BCC address.  Config-file rules win (checked
+        // first); DB entries can be added/removed at runtime via the HTTP API.
+        // Returns true (keep) or false (exclude), logging the block reason.
+        // Fails open on non-Blocked errors from either check so an unexpected
+        // filter error never silently drops a copy recipient.
+        async fn cc_bcc_allowed(
+            ctx: &ProcessorContext,
+            event_id: Uuid,
+            r: &Recipient,
+            field: &str,
+        ) -> bool {
+            // 1. Static config filter.
+            match ctx.filter.check(&r.email) {
+                Ok(()) => {}
+                Err(AppError::Blocked(ref reason)) => {
+                    warn!(
+                        event_id = %event_id,
+                        email    = %r.email,
+                        reason   = %reason,
+                        "{} address blocked by config filter — excluding from delivery", field
+                    );
+                    return false;
+                }
+                Err(_) => {} // fail-open
+            }
+            // 2. DB-backed block/allow-list (checked after config so config always wins).
+            match ctx.block_list_store.check(&r.email).await {
                 Ok(()) => true,
                 Err(AppError::Blocked(ref reason)) => {
                     warn!(
-                        event_id = %event.event_id,
+                        event_id = %event_id,
                         email    = %r.email,
                         reason   = %reason,
-                        "CC address blocked by filter — excluding from delivery"
+                        "{} address blocked by DB block_list — excluding from delivery", field
                     );
                     false
                 }
-                Err(_) => true, // fail-open: unknown filter errors never silently drop
-            })
-            .cloned()
-            .collect();
-        let bcc: Vec<Recipient> = email_opts
-            .bcc
-            .iter()
-            .filter(|r| match ctx.filter.check(&r.email) {
-                Ok(()) => true,
-                Err(AppError::Blocked(ref reason)) => {
-                    warn!(
-                        event_id = %event.event_id,
-                        email    = %r.email,
-                        reason   = %reason,
-                        "BCC address blocked by filter — excluding from delivery"
-                    );
-                    false
-                }
-                Err(_) => true,
-            })
-            .cloned()
-            .collect();
+                Err(_) => true, // fail-open
+            }
+        }
+
+        let mut cc: Vec<Recipient> = Vec::with_capacity(email_opts.cc.len());
+        for r in &email_opts.cc {
+            if cc_bcc_allowed(&ctx, event.event_id, r, "CC").await {
+                cc.push(r.clone());
+            }
+        }
+        let mut bcc: Vec<Recipient> = Vec::with_capacity(email_opts.bcc.len());
+        for r in &email_opts.bcc {
+            if cc_bcc_allowed(&ctx, event.event_id, r, "BCC").await {
+                bcc.push(r.clone());
+            }
+        }
         Arc::new(EffectiveCcBcc { cc, bcc })
     };
 

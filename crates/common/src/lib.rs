@@ -14,3 +14,6 @@ pub use log::{
     EmailDeliveryDetail, EmailLog, EmailStatus, NotificationLog, NotificationLogRow,
     NotificationStatus,
 };
+
+pub mod amqp_util;
+pub use amqp_util::scrub_amqp_url;

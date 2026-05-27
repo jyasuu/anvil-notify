@@ -21,6 +21,17 @@ pub struct AppConfig {
     /// How long resolved templates are cached in memory (seconds).
     #[serde(default = "default_template_cache_ttl_secs")]
     pub template_cache_ttl_secs: u64,
+    /// How long the DB-backed block/allow-list snapshot is cached in memory (seconds).
+    /// Set to 0 to disable caching (every check hits the DB).
+    #[serde(default = "default_block_list_cache_ttl_secs")]
+    pub block_list_cache_ttl_secs: u64,
+    /// PENDING rows older than this (seconds) are considered orphaned and
+    /// reset to FAILED by the stale-PENDING reaper task.
+    #[serde(default = "default_stale_pending_timeout_secs")]
+    pub stale_pending_timeout_secs: u64,
+    /// How often (seconds) the stale-PENDING reaper runs.
+    #[serde(default = "default_stale_pending_reaper_interval_secs")]
+    pub stale_pending_reaper_interval_secs: u64,
     /// Maximum size of a single fetched email attachment in bytes.
     #[serde(default = "default_max_attachment_bytes")]
     pub max_attachment_bytes: usize,
@@ -109,6 +120,17 @@ impl std::fmt::Debug for SmtpAccountConfig {
 
 fn default_shutdown_timeout_secs() -> u64 {
     30
+}
+fn default_block_list_cache_ttl_secs() -> u64 {
+    30
+}
+fn default_stale_pending_timeout_secs() -> u64 {
+    // 10 minutes: generous enough to avoid false-positives during slow brokers,
+    // tight enough to surface genuine orphans before they age out of operator attention.
+    600
+}
+fn default_stale_pending_reaper_interval_secs() -> u64 {
+    300 // Run every 5 minutes.
 }
 
 fn default_max_rl_waits() -> u32 {

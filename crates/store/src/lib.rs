@@ -8,3 +8,6 @@ pub use notification_log::{
     NotificationStore, CHANNEL_EMAIL,
 };
 pub use template_store::{EmailTemplate, NotificationTemplate, TemplateStore};
+
+pub mod block_list_store;
+pub use block_list_store::{BlockListEntry, BlockListStore};

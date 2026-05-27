@@ -12,6 +12,11 @@
 //! ns retry   <event-id> [--email alice@example.com]
 //! ns logs    [--status FAILED] [--limit 50]
 //! ns outbox  [--status PENDING] [--limit 50]
+//! ns blocklist list
+//! ns blocklist add  --kind blocked_email --value spam@example.com [--reason "opt-out"]
+//! ns blocklist remove <id>
+//! ns blocklist flush
+//! ns blocklist reload
 //! ns template list
 //! ns template show  <event-type>
 //! ns template flush [<event-type>]
@@ -47,6 +52,7 @@ async fn main() -> Result<()> {
         Command::Retry(args) => cmd::retry::run(args, cfg).await,
         Command::Logs(args) => cmd::logs::run(*args, cfg, fmt).await,
         Command::Outbox(args) => cmd::outbox::run(args, cfg, fmt).await,
+        Command::Blocklist(args) => cmd::blocklist::run(args, cfg, fmt).await,
         Command::Template(args) => cmd::template::run(args, cfg, fmt).await,
         Command::Health(args) => cmd::health::run(args, cfg).await,
     }

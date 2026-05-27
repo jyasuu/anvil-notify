@@ -89,6 +89,11 @@ auth_token = "bearer-token"  # optional
 | POST   | `/emails/:event_id/recipients/:email/retry` | Reset one FAILED recipient → PENDING          |
 | DELETE | `/templates/:event_type/cache`              | Evict one template from the in-memory cache   |
 | DELETE | `/templates/cache`                          | Clear the entire template cache               |
+| GET    | `/admin/blocklist`                          | List all active block/allow-list entries      |
+| POST   | `/admin/blocklist`                          | Add or reactivate a block/allow-list entry    |
+| DELETE | `/admin/blocklist/:id`                      | Soft-delete an entry by id                    |
+| DELETE | `/admin/blocklist/cache`                    | Evict the block_list cache (lazy reload)      |
+| POST   | `/admin/blocklist/cache`                    | Evict + eagerly reload block_list cache       |
 
 > **Kubernetes probes**: use `/ready` for `readinessProbe` and `/health` for `livenessProbe`.
 > `/ready` performs a live DB ping; `/health` is a shallow process check only.
@@ -271,10 +276,11 @@ SELECT notify_send_email(
 
 > **CC/BCC semantics:** CC and BCC addresses are included in every delivery for
 > the event but do not get their own `notification_log` rows. They are subject
-> to the same recipient filter (blocklist and allowlist) as TO recipients. A
-> blocked CC or BCC address is **silently excluded** from that delivery — it is
-> logged at WARN level but does not cause the event to fail. TO recipients are
-> unaffected. Per-address retry is not available for CC/BCC.
+> to the same recipient filter (config-file blocklist/allowlist and the
+> DB-backed block_list) as TO recipients. A blocked CC or BCC address is
+> **silently excluded** from that delivery — it is logged at WARN level but
+> does not cause the event to fail. TO recipients are unaffected. Per-address
+> retry is not available for CC/BCC.
 
 ## CLI (`ns`)
 
@@ -292,6 +298,11 @@ recovering notification state without touching the DB directly.
 | `ns template flush` | none | none | DELETE `/templates/…/cache` (requires `api_key`) |
 | `ns send` | none | PUBLISH to `<exchange>` | none |
 | `ns retry` | none | none | POST `/emails/…/retry` (requires `api_key`) |
+| `ns blocklist list` | none | none | GET `/admin/blocklist` (requires `api_key`) |
+| `ns blocklist add` | none | none | POST `/admin/blocklist` (requires `api_key`) |
+| `ns blocklist remove` | none | none | DELETE `/admin/blocklist/:id` (requires `api_key`) |
+| `ns blocklist flush` | none | none | DELETE `/admin/blocklist/cache` (requires `api_key`) |
+| `ns blocklist reload` | none | none | POST `/admin/blocklist/cache` (requires `api_key`) |
 | `ns health` | none | none | GET `/health` + `/ready` |
 
 #### Postgres role (read-only commands)

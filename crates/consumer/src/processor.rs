@@ -12,7 +12,8 @@ use metrics::{counter, histogram};
 use rate_limiter::MailRateLimiter;
 use recipient_filter::RecipientFilter;
 use store::{
-    EmailInsertPendingArgs, InsertResult, NotificationStore, TemplateStore, CHANNEL_EMAIL,
+    BlockListStore, EmailInsertPendingArgs, InsertResult, NotificationStore, TemplateStore,
+    CHANNEL_EMAIL,
 };
 use tracing::{info, instrument, warn};
 
@@ -40,7 +41,11 @@ pub struct ProcessorContext {
     pub sender: Arc<dyn EmailSender>,
     /// Registry of named per-business-system SMTP accounts.
     pub sender_registry: SenderRegistry,
+    /// Static config-file recipient filter (block/allow lists from config.toml).
     pub filter: RecipientFilter,
+    /// DB-backed block/allow-list. Checked after `filter`; entries can be added
+    /// or removed at runtime via the HTTP API without a service restart.
+    pub block_list_store: BlockListStore,
     pub rate_limiter: MailRateLimiter,
 }
 
@@ -231,9 +236,22 @@ pub async fn process_recipient(
         Err(e) => return RecipientOutcome::Failed(e),
     }
 
-    // ── 4. Recipient filter ───────────────────────────────────────────────────
+    // ── 4. Recipient filter (config-file) ────────────────────────────────────
     if let Err(AppError::Blocked(reason)) = ctx.filter.check(&recipient.email) {
-        warn!(reason = %reason, "Recipient blocked — dropping");
+        warn!(reason = %reason, "Recipient blocked by config filter — dropping");
+        let _ = ctx
+            .store
+            .mark_blocked(event.event_id, &recipient.email, &reason)
+            .await;
+        counter!("emails_blocked_total", "event_type" => event.event_type.clone()).increment(1);
+        return RecipientOutcome::Blocked(reason);
+    }
+
+    // ── 4b. DB-backed block/allow-list ────────────────────────────────────────
+    // Checked after the static filter so config-file rules always win.
+    // DB entries can be added/removed at runtime via the HTTP API.
+    if let Err(AppError::Blocked(reason)) = ctx.block_list_store.check(&recipient.email).await {
+        warn!(reason = %reason, "Recipient blocked by DB block_list — dropping");
         let _ = ctx
             .store
             .mark_blocked(event.event_id, &recipient.email, &reason)
@@ -460,11 +478,11 @@ pub async fn process_group(
     // accurately reflects what was actually delivered, not the raw unfiltered
     // input.  Storing pre-filter lists would show addresses that were never
     // delivered to, and would waste a filter cycle on every retry.
-    let cc_json = match serialize_recipient_list(&effective_cc, "cc") {
+    let cc_json = match serialize_recipient_list(effective_cc, "cc") {
         Ok(v) => v,
         Err(e) => return RecipientOutcome::Failed(e),
     };
-    let bcc_json = match serialize_recipient_list(&effective_bcc, "bcc") {
+    let bcc_json = match serialize_recipient_list(effective_bcc, "bcc") {
         Ok(v) => v,
         Err(e) => return RecipientOutcome::Failed(e),
     };
