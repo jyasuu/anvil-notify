@@ -1,3 +1,4 @@
+pub mod blocklist;
 pub mod health;
 pub mod logs;
 pub mod outbox;

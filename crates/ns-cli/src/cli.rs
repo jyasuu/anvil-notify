@@ -51,6 +51,9 @@ pub enum Command {
     /// Inspect the business-service outbox table.
     Outbox(OutboxArgs),
 
+    /// Manage the runtime block/allow-list (add, remove, list, flush cache).
+    Blocklist(BlocklistArgs),
+
     /// Manage email templates (list / show / flush cache).
     Template(TemplateArgs),
 
@@ -246,6 +249,52 @@ pub struct OutboxArgs {
     /// Show full payload JSON (truncated by default).
     #[arg(long)]
     pub full_payload: bool,
+}
+
+// ── blocklist ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Args)]
+pub struct BlocklistArgs {
+    #[command(subcommand)]
+    pub action: BlocklistAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BlocklistAction {
+    /// List all active block/allow-list entries.
+    List,
+
+    /// Add or reactivate a block/allow-list entry.
+    Add {
+        /// Entry kind: `blocked_email`, `blocked_domain`, `allowed_email`, or `allowed_domain`.
+        #[arg(long, short)]
+        kind: String,
+
+        /// The email address or domain to add (case-insensitive; stored lowercase).
+        #[arg(long, short)]
+        value: String,
+
+        /// Human-readable reason for this entry (stored for operator reference).
+        #[arg(long, short)]
+        reason: Option<String>,
+    },
+
+    /// Soft-delete an entry by its numeric id (shown in `list`).
+    Remove {
+        /// Numeric id of the entry to remove.
+        id: i64,
+    },
+
+    /// Evict the in-memory cache snapshot (lazy reload on next delivery check).
+    ///
+    /// Use after direct DB edits to ensure stale data is not served.
+    Flush,
+
+    /// Evict the cache and eagerly reload it from the database.
+    ///
+    /// Useful after a bulk import to pre-warm the cache immediately rather
+    /// than waiting for the next TTL expiry.
+    Reload,
 }
 
 // ── template ──────────────────────────────────────────────────────────────────
