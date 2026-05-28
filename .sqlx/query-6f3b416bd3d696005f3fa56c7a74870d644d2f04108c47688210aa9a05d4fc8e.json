@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE outbox\n        SET    status    = 'PENDING',\n               locked_at = NULL\n        WHERE  status    = 'IN_PROGRESS'\n          AND  COALESCE(locked_at, '-infinity'::timestamptz) < now() - make_interval(secs => $1)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6f3b416bd3d696005f3fa56c7a74870d644d2f04108c47688210aa9a05d4fc8e"
+}

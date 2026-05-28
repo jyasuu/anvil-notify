@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                n.id,\n                n.event_id,\n                n.event_type,\n                n.status,\n                n.retry_count,\n                n.total_attempts,\n                n.last_error,\n                n.payload,\n                n.event_timestamp,\n                n.created_at,\n                n.updated_at,\n                e.recipient_email,\n                e.recipient_name,\n                e.from_override,\n                e.sender_account,\n                e.send_mode,\n                e.group_retry_mode,\n                e.cc,\n                e.bcc,\n                e.attachments\n            FROM notification_log n\n            JOIN email_notification_log e ON e.notification_id = n.id\n            WHERE n.event_id    = $1\n              AND n.channel     = $2\n              AND n.recipient_id = $3\n            ",
+  "query": "\n            SELECT\n                n.id,\n                n.event_id,\n                n.event_type,\n                n.status,\n                n.retry_count,\n                n.total_attempts,\n                n.last_error,\n                n.payload,\n                n.event_timestamp,\n                n.created_at,\n                n.updated_at,\n                e.recipient_email,\n                e.recipient_name,\n                e.from_override,\n                e.sender_account,\n                e.send_mode,\n                e.group_retry_mode,\n                e.cc,\n                e.bcc,\n                e.attachments,\n                e.to_recipients\n            FROM notification_log n\n            JOIN email_notification_log e ON e.notification_id = n.id\n            WHERE n.event_id    = $1\n              AND n.channel     = $2\n              AND n.recipient_id = $3\n            ",
   "describe": {
     "columns": [
       {
@@ -102,6 +102,11 @@
         "ordinal": 19,
         "name": "attachments",
         "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 20,
+        "name": "to_recipients",
+        "type_info": "Jsonb"
       }
     ],
     "parameters": {
@@ -131,8 +136,9 @@
       true,
       true,
       true,
+      true,
       true
     ]
   },
-  "hash": "3321323a09e4614a126dd1a16f178ba8ebf249981cd3ad16eb2676093dffd91c"
+  "hash": "b41b3209bb150aff8381d2bdb216572d6d36c2ce83b0e4a2626d102d0d72c2bf"
 }

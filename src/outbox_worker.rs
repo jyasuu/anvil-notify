@@ -7,12 +7,13 @@
 //!
 //! Configuration is via environment variables (AN__OUTBOX__ prefix):
 //!
-//!   AN__OUTBOX__DATABASE_URL   — business DB  (required)
-//!   AN__OUTBOX__AMQP_URL       — RabbitMQ URL (required)
-//!   AN__OUTBOX__EXCHANGE       — default: anvil-notify
-//!   AN__OUTBOX__ROUTING_KEY    — default: email.requested
-//!   AN__OUTBOX__POLL_INTERVAL_MS — default: 1000
-//!   AN__OUTBOX__BATCH_SIZE     — default: 50
+//!   AN__OUTBOX__DATABASE_URL          — business DB  (required)
+//!   AN__OUTBOX__AMQP_URL              — RabbitMQ URL (required)
+//!   AN__OUTBOX__EXCHANGE              — default: anvil-notify
+//!   AN__OUTBOX__ROUTING_KEY           — default: email.requested
+//!   AN__OUTBOX__POLL_INTERVAL_MS      — default: 1000
+//!   AN__OUTBOX__BATCH_SIZE            — default: 50
+//!   AN__OUTBOX__MAX_PUBLISH_FAILURES  — default: 5
 
 use anyhow::Context;
 use outbox::{run_outbox_worker, OutboxConfig};
@@ -41,6 +42,10 @@ struct OutboxEnv {
     /// Requires migration 0016_outbox_locked_at.sql to be applied first.
     #[serde(default = "default_stale_lock_timeout_secs")]
     stale_lock_timeout_secs: u64,
+    /// Consecutive publish failures before a row is permanently marked FAILED
+    /// (AN__OUTBOX__MAX_PUBLISH_FAILURES, default: 5).
+    #[serde(default = "default_max_publish_failures")]
+    max_publish_failures: i32,
 }
 
 fn default_exchange() -> String {
@@ -60,6 +65,9 @@ fn default_pool_size() -> u32 {
 }
 fn default_stale_lock_timeout_secs() -> u64 {
     300
+}
+fn default_max_publish_failures() -> i32 {
+    5
 }
 
 impl OutboxEnv {
@@ -118,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
         batch_size: env.batch_size,
         pool_size: env.pool_size,
         stale_lock_timeout_secs: env.stale_lock_timeout_secs,
+        max_publish_failures: env.max_publish_failures,
     };
 
     // ── Graceful shutdown ─────────────────────────────────────────────────────
