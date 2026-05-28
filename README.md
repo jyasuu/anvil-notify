@@ -219,12 +219,6 @@ See [`migrations/business_db/README.md`](migrations/business_db/README.md) for
 the full table and instructions. Quick reference:
 
 ```bash
-psql "$BUSINESS_DATABASE_URL" -f migrations/business_db/0002_create_outbox.sql
-psql "$BUSINESS_DATABASE_URL" -f migrations/business_db/0005_outbox_from_override.sql
-psql "$BUSINESS_DATABASE_URL" -f migrations/business_db/0006_outbox_fail_count.sql
-psql "$BUSINESS_DATABASE_URL" -f migrations/business_db/0008_outbox_attachments.sql
-psql "$BUSINESS_DATABASE_URL" -f migrations/business_db/0016_outbox_locked_at.sql
-psql "$BUSINESS_DATABASE_URL" -f migrations/business_db/0021_send_notification_fn_cc_bcc.sql
 ```
 
 ### Sending email from a Postgres function
