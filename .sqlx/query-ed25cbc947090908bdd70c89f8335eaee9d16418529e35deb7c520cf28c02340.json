@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                n.id,\n                n.event_id,\n                n.event_type,\n                n.status,\n                n.retry_count,\n                n.total_attempts,\n                n.last_error,\n                n.payload,\n                n.event_timestamp,\n                n.created_at,\n                n.updated_at,\n                e.recipient_email,\n                e.recipient_name,\n                e.from_override,\n                e.sender_account,\n                e.send_mode,\n                e.group_retry_mode,\n                e.cc,\n                e.bcc,\n                e.attachments,\n                e.to_recipients\n            FROM notification_log n\n            JOIN email_notification_log e ON e.notification_id = n.id\n            WHERE n.event_id = $1\n              AND n.channel  = $2\n            ORDER BY n.created_at\n            -- Safety cap: prevents a single pathological event with thousands of\n            -- recipients from loading the full result set into the API pod's memory.\n            -- 500 rows is well above any legitimate multi-recipient event; a bulk\n            -- campaign accidentally routed here would otherwise cause an OOM.\n            LIMIT 500\n            ",
+  "query": "\n            SELECT\n                n.id,\n                n.event_id,\n                n.event_type,\n                n.status,\n                n.retry_count,\n                n.total_attempts,\n                n.last_error,\n                n.payload,\n                n.event_timestamp,\n                n.created_at,\n                n.updated_at,\n                COALESCE(e.recipient_email, n.recipient_id) AS \"recipient_email!\",\n                e.recipient_name,\n                e.from_override,\n                e.sender_account,\n                e.send_mode,\n                e.group_retry_mode,\n                e.cc,\n                e.bcc,\n                e.attachments,\n                e.to_recipients\n            FROM notification_log n\n            LEFT JOIN email_notification_log e ON e.notification_id = n.id\n            WHERE n.event_id    = $1\n              AND n.channel     = $2\n              AND n.recipient_id = $3\n            ",
   "describe": {
     "columns": [
       {
@@ -60,7 +60,7 @@
       },
       {
         "ordinal": 11,
-        "name": "recipient_email",
+        "name": "recipient_email!",
         "type_info": "Text"
       },
       {
@@ -112,6 +112,7 @@
     "parameters": {
       "Left": [
         "Uuid",
+        "Text",
         "Text"
       ]
     },
@@ -127,7 +128,7 @@
       false,
       false,
       false,
-      false,
+      null,
       true,
       true,
       true,
@@ -139,5 +140,5 @@
       true
     ]
   },
-  "hash": "fb1f8931ca98bf26bb0a570ed54ecc34db1b60570f2b1be1e8dbe460fa9184bf"
+  "hash": "ed25cbc947090908bdd70c89f8335eaee9d16418529e35deb7c520cf28c02340"
 }

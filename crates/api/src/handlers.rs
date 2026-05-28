@@ -138,6 +138,17 @@ async fn republish_event(
         })
         .collect();
 
+    // Guard: if all rows are SKIPPED there are no real recipients to replay
+    // and get_event_delivery_detail will return NotFound (SKIPPED rows have no
+    // email_notification_log entry).  Surface a clear 422 rather than a
+    // confusing 404.
+    if recipients.is_empty() && logs.iter().all(|l| l.status == EmailStatus::Skipped) {
+        return Err(ApiError(AppError::permanent_mailer(format!(
+            "Event {event_id} was skipped at validation time and has no deliverable recipients. \
+             The publisher must re-publish a corrected event."
+        ))));
+    }
+
     // ── 7. Deserialize typed fields from the detail ───────────────────────────
     // Use map_err + ? instead of .ok() so that a malformed stored JSONB value
     // surfaces as a 500 here rather than silently yielding None/empty and

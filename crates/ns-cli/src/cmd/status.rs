@@ -72,10 +72,15 @@ pub async fn run(args: StatusArgs, cfg: CliConfig, fmt: OutputFormat) -> Result<
             let failed = rows.iter().filter(|r| r.status == "FAILED").count();
             let blocked = rows.iter().filter(|r| r.status == "BLOCKED").count();
             let pending = rows.iter().filter(|r| r.status == "PENDING").count();
+            let skipped = rows.iter().filter(|r| r.status == "SKIPPED").count();
             println!("Event: {}", args.event_id);
-            println!(
+            print!(
                 "Total: {total}  Sent: {sent}  Pending: {pending}  Failed: {failed}  Blocked: {blocked}"
             );
+            if skipped > 0 {
+                print!("  Skipped: {skipped}");
+            }
+            println!();
             println!();
         }
 

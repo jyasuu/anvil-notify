@@ -553,7 +553,7 @@ impl NotificationStore for EmailNotificationStore {
                 n.event_timestamp,
                 n.created_at,
                 n.updated_at,
-                e.recipient_email,
+                COALESCE(e.recipient_email, n.recipient_id) AS "recipient_email!",
                 e.recipient_name,
                 e.from_override,
                 e.sender_account,
@@ -564,7 +564,7 @@ impl NotificationStore for EmailNotificationStore {
                 e.attachments,
                 e.to_recipients
             FROM notification_log n
-            JOIN email_notification_log e ON e.notification_id = n.id
+            LEFT JOIN email_notification_log e ON e.notification_id = n.id
             WHERE n.event_id = $1
               AND n.channel  = $2
             ORDER BY n.created_at
@@ -634,7 +634,7 @@ impl NotificationStore for EmailNotificationStore {
                 n.event_timestamp,
                 n.created_at,
                 n.updated_at,
-                e.recipient_email,
+                COALESCE(e.recipient_email, n.recipient_id) AS "recipient_email!",
                 e.recipient_name,
                 e.from_override,
                 e.sender_account,
@@ -645,7 +645,7 @@ impl NotificationStore for EmailNotificationStore {
                 e.attachments,
                 e.to_recipients
             FROM notification_log n
-            JOIN email_notification_log e ON e.notification_id = n.id
+            LEFT JOIN email_notification_log e ON e.notification_id = n.id
             WHERE n.event_id    = $1
               AND n.channel     = $2
               AND n.recipient_id = $3
