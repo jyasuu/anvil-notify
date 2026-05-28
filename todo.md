@@ -240,5 +240,7 @@ Let me read all the relevant code carefully before touching anything.Now I have 
 
 **`reap_stale_pending_zero_timeout_is_valid_sql`** — the live test also needs `to_recipients: None` added to its `EmailInsertPendingArgs`.
 
+help me review todo.
+all test pass.
 we should consider merge migrations by table.
 also eazy pick part for outbox table for worker.
