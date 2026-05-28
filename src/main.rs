@@ -275,6 +275,40 @@ async fn main() -> anyhow::Result<()> {
     let reaper_shutdown = shutdown.clone();
     let reaper_timeout = cfg.stale_pending_timeout_secs;
     let reaper_interval = cfg.stale_pending_reaper_interval_secs;
+
+    // Sanity-check the reaper config at startup so a misconfiguration is
+    // visible immediately rather than silently degrading orphan recovery.
+    //
+    // A timeout of 0 disables the reaper entirely (reap_stale_pending(0)
+    // would match every PENDING row immediately, which is also wrong).
+    // A timeout above 24 h means orphaned rows stay PENDING for over a day
+    // before an operator is alerted — usually not intentional.
+    const REAPER_WARN_THRESHOLD_SECS: u64 = 24 * 3600; // 24 hours
+    if reaper_timeout == 0 {
+        tracing::warn!(
+            stale_pending_timeout_secs = reaper_timeout,
+            "stale_pending_timeout_secs is 0 — the stale-PENDING reaper is effectively \
+             disabled. Orphaned PENDING rows (stranded after a broker blip) will never \
+             be automatically recovered. Set a positive value (default: 600) to enable \
+             automatic recovery."
+        );
+    } else if reaper_timeout > REAPER_WARN_THRESHOLD_SECS {
+        tracing::warn!(
+            stale_pending_timeout_secs = reaper_timeout,
+            threshold_secs = REAPER_WARN_THRESHOLD_SECS,
+            "stale_pending_timeout_secs exceeds 24 hours — orphaned PENDING rows will \
+             remain invisible to operators for an unusually long window. Consider \
+             reducing this value (default: 600) unless you have very long retry \
+             back-off windows that require a larger threshold."
+        );
+    } else {
+        info!(
+            stale_pending_timeout_secs = reaper_timeout,
+            reaper_interval_secs = reaper_interval,
+            "Stale-PENDING reaper configured"
+        );
+    }
+
     let reaper_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(reaper_interval));
         loop {

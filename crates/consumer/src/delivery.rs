@@ -16,6 +16,85 @@
 //! The connection loop and AMQP topology setup live in `runner.rs`; the
 //! per-recipient processor logic (idempotency, template rendering, send) lives
 //! in `processor.rs`.  This module is the glue between them.
+//!
+//! # Mail delivery flow
+//!
+//! ```text
+//! AMQP broker
+//!  │
+//!  │  Delivery (raw bytes)
+//!  ▼
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │ handle_delivery                                                 │
+//! │                                                                 │
+//! │  1. Deserialise ──────────────────────────────────────────────► │ FAIL → NACK → DLQ
+//! │       NotificationEvent  (or legacy EmailEvent fallback)        │
+//! │                                                                 │
+//! │  2a. No email channel_overrides? ──────────────────────────────► mark_skipped → ACK
+//! │  2b. Recipients empty?          ──────────────────────────────► mark_skipped → ACK
+//! │  2c. Recipients > max_per_event? ─────────────────────────────► mark_skipped → NACK → DLQ
+//! │                                                                 │
+//! │  3. Fetch attachments (once for all recipients) ───────────────► FAIL permanent → NACK → DLQ
+//! │                                                                 │    transient  → NACK → requeue
+//! │  4. Filter CC / BCC (once per event)                           │
+//! │       invalid / blocked address ──────────────────────────────► WARN + exclude (delivery continues)
+//! │                                                                 │
+//! │  5. Dispatch ──────────────────────────────────────────────────┤
+//! │       send_mode = Group  ─────────────────────────────────────► process_one_group
+//! │       send_mode = Individual (default)                         │
+//! │         └─ per recipient (parallel JoinSet tasks)             ► process_one_recipient
+//! │                                                                 │
+//! │  6. ACK (after all tasks complete)                             │
+//! └─────────────────────────────────────────────────────────────────┘
+//!
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │ process_one_recipient  (retry loop)                             │
+//! │                                                                 │
+//! │  process_recipient() ─────────────────────────────────────────► RecipientOutcome
+//! │    │                                                            │
+//! │    ├─ Sent / Blocked / Skipped ───────────────────────────────► return (terminal)
+//! │    │                                                            │
+//! │    ├─ Duplicate { retry_count } ───────────────────────────────► seed attempt counter, retry immediately
+//! │    │                                                            │
+//! │    ├─ Failed (permanent) ──────────────────────────────────────► mark_failed(exhausted=true) → return
+//! │    ├─ Failed (attempt ≥ max_retries) ──────────────────────────► mark_failed(exhausted=true) → return
+//! │    ├─ Failed + NoRetry policy ─────────────────────────────────► mark_failed(exhausted=true) → return
+//! │    │                                                            │
+//! │    ├─ Failed (RateLimited, rl_count ≤ max_rl_waits) ──────────► mark_failed(exhausted=false)
+//! │    │    └─ sleep(30s × 2^rl_count, max 4h) ──────────────────► retry
+//! │    ├─ Failed (RateLimited, rl_count > max_rl_waits) ──────────► mark_failed(exhausted=true) → return
+//! │    │                                                            │
+//! │    └─ Failed (transient) ──────────────────────────────────────► mark_failed(exhausted=false)
+//! │         └─ sleep(base × 2^attempt, max 30 min) ──────────────► retry
+//! │                                                                 │
+//! │  Shutdown during backoff ─────────────────────────────────────► mark_failed(exhausted=true) → return
+//! └─────────────────────────────────────────────────────────────────┘
+//!
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │ process_one_group  (retry loop, mirrors process_one_recipient)  │
+//! │                                                                 │
+//! │  Same outcomes as above, plus:                                  │
+//! │    GroupFailedWithIndividualRows ─────────────────────────────► spawn process_one_recipient
+//! │      (group_retry_mode = Individual)                            │  per address (parallel JoinSet)
+//! │      already-SENT rows are skipped by idempotency guard        │
+//! └─────────────────────────────────────────────────────────────────┘
+//!
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │ process_recipient  (single attempt, called by the loops above)  │
+//! │                                                                 │
+//! │  0. Validate recipient email address                           │
+//! │  1. Resolve template (cached TTL)                              │
+//! │  2. Validate from_override address                             │
+//! │  3. Render subject / body_html / body_text                     │
+//! │  4. Idempotency: INSERT PENDING (ON CONFLICT → Duplicate)      │
+//! │  5. Config-file recipient filter                               │
+//! │  6. DB block_list_store check                                  │
+//! │  7. Rate-limiter token (wait or Shutdown)                      │
+//! │  8. Select sender (named account registry → global fallback)   │
+//! │  9. sender.send(EmailMessage)                                  │
+//! │ 10. mark_sent / mark_failed / mark_blocked                     │
+//! └─────────────────────────────────────────────────────────────────┘
+//! ```
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -111,32 +190,93 @@ pub(crate) async fn handle_delivery(
     };
 
     // ── Extract email channel options ────────────────────────────────────────
-    // If there are no email options, ACK cleanly so other (future) channels
-    // can still process the event without it being re-queued.
+    // If there are no email options the event has no work for this service to
+    // do.  We write a SKIPPED row so operators can see the event in the status
+    // API and diagnose the publisher bug, then ACK cleanly so the message is
+    // not re-queued or sent to DLQ.
+    //
+    // Logged at ERROR (not WARN) because a missing email channel_overrides is
+    // almost always a publisher bug — it should never happen in production and
+    // must not go unnoticed.
     let email_opts = match event.channel_overrides.email.as_ref() {
         Some(opts) => opts.clone(),
         None => {
-            warn!(event_id = %event.event_id, "Event has no email channel options — ACKing and skipping");
+            error!(
+                event_id   = %event.event_id,
+                event_type = %event.event_type,
+                "Event has no email channel_overrides — publisher bug? \
+                 Writing SKIPPED row so the event is visible via the status API."
+            );
+            // Use the event_id string as the sentinel recipient_id so the row
+            // is queryable via GET /emails/{event_id} without a real address.
+            let _ = ctx
+                .store
+                .mark_skipped(
+                    event.event_id,
+                    &event.event_type,
+                    &format!("event:{}", event.event_id),
+                    "no email channel_overrides in event — publisher must re-publish with corrected data",
+                    event.timestamp,
+                    &event.payload,
+                )
+                .await;
             let _ = delivery.ack(BasicAckOptions::default()).await;
             return;
         }
     };
 
     if email_opts.recipients.is_empty() {
-        warn!(event_id = %event.event_id, "Event has no recipients — ACKing and skipping");
+        error!(
+            event_id   = %event.event_id,
+            event_type = %event.event_type,
+            "Event has no recipients — publisher bug? \
+             Writing SKIPPED row so the event is visible via the status API."
+        );
+        let _ = ctx
+            .store
+            .mark_skipped(
+                event.event_id,
+                &event.event_type,
+                &format!("event:{}", event.event_id),
+                "email channel_overrides.recipients is empty — publisher must re-publish with at least one recipient",
+                event.timestamp,
+                &event.payload,
+            )
+            .await;
         let _ = delivery.ack(BasicAckOptions::default()).await;
         return;
     }
 
     // Guard against pathologically large recipient lists that would monopolise
     // the semaphore permit for an unbounded duration and exhaust DB connections.
+    // Write a SKIPPED row with a sentinel recipient_id before NACKing so an
+    // operator can diagnose the rejection via GET /emails/{event_id} rather
+    // than seeing a 404 and wondering whether the event was ever received.
     if email_opts.recipients.len() > cfg.max_recipients_per_event {
         error!(
             event_id        = %event.event_id,
+            event_type      = %event.event_type,
             recipient_count = email_opts.recipients.len(),
             limit           = cfg.max_recipients_per_event,
-            "Event exceeds max_recipients_per_event — sending to DLQ"
+            "Event exceeds max_recipients_per_event — writing SKIPPED row and sending to DLQ"
         );
+        let reason = format!(
+            "recipient count {} exceeds max_recipients_per_event {} — \
+             reduce the list or raise the limit before re-publishing",
+            email_opts.recipients.len(),
+            cfg.max_recipients_per_event,
+        );
+        let _ = ctx
+            .store
+            .mark_skipped(
+                event.event_id,
+                &event.event_type,
+                &format!("event:{}", event.event_id),
+                &reason,
+                event.timestamp,
+                &event.payload,
+            )
+            .await;
         let _ = delivery
             .nack(BasicNackOptions {
                 requeue: false,

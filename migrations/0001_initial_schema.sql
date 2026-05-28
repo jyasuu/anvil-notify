@@ -394,3 +394,26 @@ COMMENT ON COLUMN block_list.kind  IS 'Entry type: blocked_email | blocked_domai
 COMMENT ON COLUMN block_list.value IS 'Lowercase email address or domain. Normalised to lowercase on insert.';
 COMMENT ON COLUMN block_list.reason IS 'Operator note explaining why this entry was added.';
 COMMENT ON COLUMN block_list.active IS 'Soft-delete flag. Set to FALSE to disable without losing history.';
+
+-- Migration 0003: add SKIPPED to notification_log status check constraint.
+--
+-- SKIPPED is a terminal status written when the consumer ACKs a delivery
+-- without attempting to send it:
+--   • event has no email channel_overrides (publisher omitted the field)
+--   • event has no recipients in the email channel
+--   • event exceeds max_recipients_per_event
+--   • (future) event targets a channel not yet supported
+--
+-- Unlike FAILED, SKIPPED rows are not eligible for the manual operator
+-- retry API — the publisher must re-publish the event with the correct
+-- channel_overrides after fixing the upstream data.
+--
+-- The constraint is dropped and re-created to add the new value; no existing
+-- rows are touched (none can have an unrecognised status today).
+
+ALTER TABLE notification_log
+    DROP CONSTRAINT IF EXISTS notification_log_status_check;
+
+ALTER TABLE notification_log
+    ADD CONSTRAINT notification_log_status_check
+        CHECK (status IN ('PENDING', 'SENT', 'FAILED', 'BLOCKED', 'SKIPPED'));

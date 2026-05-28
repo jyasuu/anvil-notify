@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO notification_log\n                (event_id, event_type, channel, recipient_id,\n                 status, last_error, payload, event_timestamp,\n                 retry_count, total_attempts)\n            VALUES ($1, $2, $3, $4,\n                    'SKIPPED', $5, $6, $7,\n                    0, 0)\n            ON CONFLICT (event_id, channel, recipient_id) DO NOTHING\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "39d8c08fde34cf02f76bf00345455a38e0df5d31264501644ef7e0114f7301b8"
+}

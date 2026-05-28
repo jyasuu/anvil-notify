@@ -12,6 +12,14 @@ pub enum NotificationStatus {
     Sent,
     Failed,
     Blocked,
+    /// Terminal status written when the consumer ACKs a delivery without
+    /// attempting to send it — e.g. no email channel in the event, empty
+    /// recipient list, or recipient count exceeding the configured ceiling.
+    ///
+    /// Unlike `Failed`, `Skipped` rows are **not** eligible for the manual
+    /// retry API.  The publisher must re-publish the event with corrected
+    /// `channel_overrides` after fixing the upstream data.
+    Skipped,
 }
 
 impl NotificationStatus {
@@ -21,6 +29,7 @@ impl NotificationStatus {
             NotificationStatus::Sent => "SENT",
             NotificationStatus::Failed => "FAILED",
             NotificationStatus::Blocked => "BLOCKED",
+            NotificationStatus::Skipped => "SKIPPED",
         }
     }
 }
@@ -34,6 +43,7 @@ impl TryFrom<&str> for NotificationStatus {
             "SENT" => Ok(NotificationStatus::Sent),
             "FAILED" => Ok(NotificationStatus::Failed),
             "BLOCKED" => Ok(NotificationStatus::Blocked),
+            "SKIPPED" => Ok(NotificationStatus::Skipped),
             other => Err(AppError::UnknownStatus(other.to_owned())),
         }
     }

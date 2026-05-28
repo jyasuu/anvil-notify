@@ -158,6 +158,27 @@ pub trait NotificationStore: Send + Sync + 'static {
         reason: &str,
     ) -> Result<(), AppError>;
 
+    /// Record a terminal skip for an event-level validation failure.
+    ///
+    /// Written when the consumer ACKs a delivery without attempting to send:
+    /// no email `channel_overrides`, empty recipient list, or recipient count
+    /// exceeding `max_recipients_per_event`.
+    ///
+    /// `reason` is a short human-readable description stored in `last_error`
+    /// so operators can diagnose the skip via the status API.
+    ///
+    /// Unlike `mark_failed`, `SKIPPED` rows are **not** eligible for the
+    /// manual retry API — the publisher must re-publish with corrected data.
+    async fn mark_skipped(
+        &self,
+        event_id: Uuid,
+        event_type: &str,
+        recipient_id: &str,
+        reason: &str,
+        event_timestamp: chrono::DateTime<chrono::Utc>,
+        payload: &serde_json::Value,
+    ) -> Result<(), AppError>;
+
     /// Fetch all delivery rows for an event (one per recipient).
     async fn get_by_event_id(&self, event_id: Uuid) -> Result<Vec<NotificationLog>, AppError>;
 
@@ -467,6 +488,52 @@ impl NotificationStore for EmailNotificationStore {
                 "mark_blocked matched no rows — row may have been deleted or recipient_id is wrong"
             );
         }
+        Ok(())
+    }
+
+    /// Insert a terminal SKIPPED row into `notification_log`.
+    ///
+    /// Unlike the other `mark_*` methods this does an INSERT rather than an
+    /// UPDATE — SKIPPED rows are written at the moment of the skip decision,
+    /// before any PENDING row exists.  We use `ON CONFLICT DO NOTHING` so a
+    /// re-delivered duplicate message (broker re-delivery before ACK arrived)
+    /// does not fail; the original SKIPPED row is preserved and the consumer
+    /// can safely ACK the duplicate.
+    ///
+    /// `email_notification_log` is intentionally NOT written: SKIPPED events
+    /// have no delivery detail worth storing — no recipient was contacted and
+    /// no template was rendered.
+    #[instrument(skip(self, reason, payload))]
+    async fn mark_skipped(
+        &self,
+        event_id: Uuid,
+        event_type: &str,
+        recipient_id: &str,
+        reason: &str,
+        event_timestamp: chrono::DateTime<chrono::Utc>,
+        payload: &serde_json::Value,
+    ) -> Result<(), AppError> {
+        sqlx::query!(
+            r#"
+            INSERT INTO notification_log
+                (event_id, event_type, channel, recipient_id,
+                 status, last_error, payload, event_timestamp,
+                 retry_count, total_attempts)
+            VALUES ($1, $2, $3, $4,
+                    'SKIPPED', $5, $6, $7,
+                    0, 0)
+            ON CONFLICT (event_id, channel, recipient_id) DO NOTHING
+            "#,
+            event_id,
+            event_type,
+            CHANNEL_EMAIL,
+            recipient_id,
+            reason,
+            payload,
+            event_timestamp,
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

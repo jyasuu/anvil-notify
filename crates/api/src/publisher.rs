@@ -109,9 +109,14 @@ impl Publisher {
                     // stall this call (and hold the mutex) indefinitely.
                     return tokio::time::timeout(CONFIRM_TIMEOUT, confirm)
                         .await
-                        .map_err(|_| AppError::Queue(
-                            format!("Publisher: broker confirm timed out after {}s —                                      message may or may not have been persisted;                                      retry the operation", CONFIRM_TIMEOUT.as_secs())
-                        ))?
+                        .map_err(|_| {
+                            AppError::Queue(format!(
+                                "Publisher: broker confirm timed out after {}s — \
+                                 message may or may not have been persisted; \
+                                 retry the operation",
+                                CONFIRM_TIMEOUT.as_secs()
+                            ))
+                        })?
                         .map(|_| ())
                         .map_err(|e| AppError::Queue(e.to_string()));
                 }
