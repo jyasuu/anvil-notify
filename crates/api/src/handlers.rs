@@ -385,6 +385,10 @@ pub async fn get_email_status(
                 "retryCount":    log.retry_count,
                 "totalAttempts": log.total_attempts,
                 "lastError":     log.last_error,
+                // Non-null only for group sends with group_retry_mode = "whole":
+                // the primary row carries the full To: list so operators can
+                // see every recipient without querying each address individually.
+                "toRecipients":  log.to_recipients,
                 "createdAt":     log.created_at,
                 "updatedAt":     log.updated_at,
             })

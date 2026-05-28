@@ -51,6 +51,13 @@ pub struct EmailInsertPendingArgs<'a> {
     /// Stored so `republish_event()` faithfully replays the original retry strategy.
     /// `None` means the field was absent (pre-0028 rows); treated as `"whole"` on retry.
     pub group_retry_mode: Option<&'a str>,
+    /// Full To: recipient list for group sends with `group_retry_mode = "whole"`.
+    ///
+    /// Non-NULL only when `send_mode = "group"` AND `group_retry_mode = "whole"`:
+    /// that is the only case where a single row tracks multiple recipients.
+    /// Individual sends and group/Individual sends each write one row per
+    /// recipient, making this column redundant for those modes.
+    pub to_recipients: Option<&'a serde_json::Value>,
 }
 
 // ── Channel constants ─────────────────────────────────────────────────────────
@@ -261,8 +268,8 @@ impl NotificationStore for EmailNotificationStore {
             INSERT INTO email_notification_log
                 (notification_id, recipient_email, recipient_name,
                  from_override, sender_account, send_mode, group_retry_mode,
-                 cc, bcc, attachments)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 cc, bcc, attachments, to_recipients)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             "#,
             row.id,
             args.recipient_email,
@@ -274,6 +281,7 @@ impl NotificationStore for EmailNotificationStore {
             args.cc,
             args.bcc,
             args.attachments,
+            args.to_recipients,
         )
         .execute(&mut *tx)
         .await?;
@@ -335,8 +343,8 @@ impl NotificationStore for EmailNotificationStore {
                 INSERT INTO email_notification_log
                     (notification_id, recipient_email, recipient_name,
                      from_override, sender_account, send_mode, group_retry_mode,
-                     cc, bcc, attachments)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                     cc, bcc, attachments, to_recipients)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 "#,
                 row.id,
                 a.recipient_email,
@@ -348,6 +356,7 @@ impl NotificationStore for EmailNotificationStore {
                 a.cc,
                 a.bcc,
                 a.attachments,
+                a.to_recipients,
             )
             .execute(&mut *tx)
             .await?;
@@ -485,7 +494,8 @@ impl NotificationStore for EmailNotificationStore {
                 e.group_retry_mode,
                 e.cc,
                 e.bcc,
-                e.attachments
+                e.attachments,
+                e.to_recipients
             FROM notification_log n
             JOIN email_notification_log e ON e.notification_id = n.id
             WHERE n.event_id = $1
@@ -528,6 +538,7 @@ impl NotificationStore for EmailNotificationStore {
                     bcc: r.bcc,
                     send_mode: r.send_mode,
                     group_retry_mode: r.group_retry_mode,
+                    to_recipients: r.to_recipients,
                     event_timestamp: Some(r.event_timestamp),
                     created_at: r.created_at,
                     updated_at: r.updated_at,
@@ -564,7 +575,8 @@ impl NotificationStore for EmailNotificationStore {
                 e.group_retry_mode,
                 e.cc,
                 e.bcc,
-                e.attachments
+                e.attachments,
+                e.to_recipients
             FROM notification_log n
             JOIN email_notification_log e ON e.notification_id = n.id
             WHERE n.event_id    = $1
@@ -598,6 +610,7 @@ impl NotificationStore for EmailNotificationStore {
             bcc: r.bcc,
             send_mode: r.send_mode,
             group_retry_mode: r.group_retry_mode,
+            to_recipients: r.to_recipients,
             event_timestamp: Some(r.event_timestamp),
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -677,7 +690,8 @@ impl NotificationStore for EmailNotificationStore {
                 e.group_retry_mode,
                 e.attachments,
                 e.cc,
-                e.bcc
+                e.bcc,
+                e.to_recipients
             FROM notification_log n
             JOIN email_notification_log e ON e.notification_id = n.id
             WHERE n.event_id = $1
@@ -817,202 +831,206 @@ mod tests {
     ///
     /// After `reap_stale_pending(5)` exactly one row should have flipped to
     /// FAILED with the reaper's signature string in `last_error`.
-    // #[sqlx::test(migrations = "../../migrations")]
-    // async fn reap_stale_pending_counts_and_leaves_other_rows_alone(pool: PgPool) {
-    //     let store = EmailNotificationStore::new(pool.clone());
-    //     let payload = serde_json::json!({"k": "v"});
-    //     let ts = Utc::now();
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn reap_stale_pending_counts_and_leaves_other_rows_alone(pool: PgPool) {
+        let store = EmailNotificationStore::new(pool.clone());
+        let payload = serde_json::json!({"k": "v"});
+        let ts = Utc::now();
 
-    //     // ── Insert stale PENDING row ──────────────────────────────────────────
-    //     let eid_stale = Uuid::new_v4();
-    //     assert!(matches!(
-    //         store
-    //             .insert_pending(&EmailInsertPendingArgs {
-    //                 event_id: eid_stale,
-    //                 event_type: "test.reap",
-    //                 recipient_email: "stale@example.com",
-    //                 recipient_name: None,
-    //                 payload: &payload,
-    //                 from_override: None,
-    //                 attachments: None,
-    //                 sender_account: None,
-    //                 cc: None,
-    //                 bcc: None,
-    //                 send_mode: "individual",
-    //                 group_retry_mode: None,
-    //                 event_timestamp: ts,
-    //             })
-    //             .await
-    //             .unwrap(),
-    //         InsertResult::Inserted
-    //     ));
-    //     // Back-date to simulate the row being stuck for 10 minutes.
-    //     sqlx::query!(
-    //         "UPDATE notification_log SET updated_at = now() - interval '10 minutes' \
-    //          WHERE event_id = $1 AND recipient_email = $2",
-    //         eid_stale,
-    //         "stale@example.com",
-    //     )
-    //     .execute(&pool)
-    //     .await
-    //     .unwrap();
+        // ── Insert stale PENDING row ──────────────────────────────────────────
+        let eid_stale = Uuid::new_v4();
+        assert!(matches!(
+            store
+                .insert_pending(&EmailInsertPendingArgs {
+                    event_id: eid_stale,
+                    event_type: "test.reap",
+                    recipient_email: "stale@example.com",
+                    recipient_name: None,
+                    payload: &payload,
+                    from_override: None,
+                    attachments: None,
+                    sender_account: None,
+                    cc: None,
+                    bcc: None,
+                    send_mode: "individual",
+                    group_retry_mode: None,
+                    to_recipients: None,
+                    event_timestamp: ts,
+                })
+                .await
+                .unwrap(),
+            InsertResult::Inserted
+        ));
+        // Back-date to simulate the row being stuck for 10 minutes.
+        sqlx::query!(
+            "UPDATE notification_log SET updated_at = now() - interval '10 minutes' \
+             WHERE event_id = $1 AND recipient_id = $2",
+            eid_stale,
+            "stale@example.com",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
-    //     // ── Insert fresh PENDING row (should not be reaped) ───────────────────
-    //     let eid_fresh = Uuid::new_v4();
-    //     store
-    //         .insert_pending(&EmailInsertPendingArgs {
-    //             event_id: eid_fresh,
-    //             event_type: "test.reap",
-    //             recipient_email: "fresh@example.com",
-    //             recipient_name: None,
-    //             payload: &payload,
-    //             from_override: None,
-    //             attachments: None,
-    //             sender_account: None,
-    //             cc: None,
-    //             bcc: None,
-    //             send_mode: "individual",
-    //             group_retry_mode: None,
-    //             event_timestamp: ts,
-    //         })
-    //         .await
-    //         .unwrap();
+        // ── Insert fresh PENDING row (should not be reaped) ───────────────────
+        let eid_fresh = Uuid::new_v4();
+        store
+            .insert_pending(&EmailInsertPendingArgs {
+                event_id: eid_fresh,
+                event_type: "test.reap",
+                recipient_email: "fresh@example.com",
+                recipient_name: None,
+                payload: &payload,
+                from_override: None,
+                attachments: None,
+                sender_account: None,
+                cc: None,
+                bcc: None,
+                send_mode: "individual",
+                group_retry_mode: None,
+                to_recipients: None,
+                event_timestamp: ts,
+            })
+            .await
+            .unwrap();
 
-    //     // ── Insert a row, back-date it, then transition to pre-existing FAILED ─
-    //     let eid_failed = Uuid::new_v4();
-    //     store
-    //         .insert_pending(&EmailInsertPendingArgs {
-    //             event_id: eid_failed,
-    //             event_type: "test.reap",
-    //             recipient_email: "failed@example.com",
-    //             recipient_name: None,
-    //             payload: &payload,
-    //             from_override: None,
-    //             attachments: None,
-    //             sender_account: None,
-    //             cc: None,
-    //             bcc: None,
-    //             send_mode: "individual",
-    //             group_retry_mode: None,
-    //             event_timestamp: ts,
-    //         })
-    //         .await
-    //         .unwrap();
-    //     sqlx::query!(
-    //         "UPDATE notification_log SET updated_at = now() - interval '10 minutes' \
-    //          WHERE event_id = $1",
-    //         eid_failed,
-    //     )
-    //     .execute(&pool)
-    //     .await
-    //     .unwrap();
-    //     store
-    //         .mark_failed(
-    //             eid_failed,
-    //             "failed@example.com",
-    //             "pre-existing failure",
-    //             true,
-    //         )
-    //         .await
-    //         .unwrap();
+        // ── Insert a row, back-date it, then transition to pre-existing FAILED ─
+        let eid_failed = Uuid::new_v4();
+        store
+            .insert_pending(&EmailInsertPendingArgs {
+                event_id: eid_failed,
+                event_type: "test.reap",
+                recipient_email: "failed@example.com",
+                recipient_name: None,
+                payload: &payload,
+                from_override: None,
+                attachments: None,
+                sender_account: None,
+                cc: None,
+                bcc: None,
+                send_mode: "individual",
+                group_retry_mode: None,
+                to_recipients: None,
+                event_timestamp: ts,
+            })
+            .await
+            .unwrap();
+        sqlx::query!(
+            "UPDATE notification_log SET updated_at = now() - interval '10 minutes' \
+             WHERE event_id = $1",
+            eid_failed,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        store
+            .mark_failed(
+                eid_failed,
+                "failed@example.com",
+                "pre-existing failure",
+                true,
+            )
+            .await
+            .unwrap();
 
-    //     // ── Insert a row, back-date it, then mark SENT ────────────────────────
-    //     let eid_sent = Uuid::new_v4();
-    //     store
-    //         .insert_pending(&EmailInsertPendingArgs {
-    //             event_id: eid_sent,
-    //             event_type: "test.reap",
-    //             recipient_email: "sent@example.com",
-    //             recipient_name: None,
-    //             payload: &payload,
-    //             from_override: None,
-    //             attachments: None,
-    //             sender_account: None,
-    //             cc: None,
-    //             bcc: None,
-    //             send_mode: "individual",
-    //             group_retry_mode: None,
-    //             event_timestamp: ts,
-    //         })
-    //         .await
-    //         .unwrap();
-    //     sqlx::query!(
-    //         "UPDATE notification_log SET updated_at = now() - interval '10 minutes' \
-    //          WHERE event_id = $1",
-    //         eid_sent,
-    //     )
-    //     .execute(&pool)
-    //     .await
-    //     .unwrap();
-    //     store.mark_sent(eid_sent, "sent@example.com").await.unwrap();
+        // ── Insert a row, back-date it, then mark SENT ────────────────────────
+        let eid_sent = Uuid::new_v4();
+        store
+            .insert_pending(&EmailInsertPendingArgs {
+                event_id: eid_sent,
+                event_type: "test.reap",
+                recipient_email: "sent@example.com",
+                recipient_name: None,
+                payload: &payload,
+                from_override: None,
+                attachments: None,
+                sender_account: None,
+                cc: None,
+                bcc: None,
+                send_mode: "individual",
+                group_retry_mode: None,
+                to_recipients: None,
+                event_timestamp: ts,
+            })
+            .await
+            .unwrap();
+        sqlx::query!(
+            "UPDATE notification_log SET updated_at = now() - interval '10 minutes' \
+             WHERE event_id = $1",
+            eid_sent,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        store.mark_sent(eid_sent, "sent@example.com").await.unwrap();
 
-    //     // ── Run the reaper with a 5-second timeout ────────────────────────────
-    //     let reaped = store.reap_stale_pending(5).await.unwrap();
-    //     assert_eq!(
-    //         reaped, 1,
-    //         "Expected exactly 1 stale row reaped, got {reaped}"
-    //     );
+        // ── Run the reaper with a 5-second timeout ────────────────────────────
+        let reaped = store.reap_stale_pending(5).await.unwrap();
+        assert_eq!(
+            reaped, 1,
+            "Expected exactly 1 stale row reaped, got {reaped}"
+        );
 
-    //     // Stale row must now be FAILED with the reaper's signature message.
-    //     let row = sqlx::query!(
-    //         "SELECT status, last_error FROM notification_log \
-    //          WHERE event_id = $1 AND recipient_email = $2", // notification_log.recipient_email not exists
-    //         eid_stale,
-    //         "stale@example.com",
-    //     )
-    //     .fetch_one(&pool)
-    //     .await
-    //     .unwrap();
-    //     assert_eq!(row.status, "FAILED");
-    //     assert!(
-    //         row.last_error
-    //             .as_deref()
-    //             .unwrap_or("")
-    //             .contains("stale-PENDING reaper"),
-    //         "Expected reaper signature in last_error; got: {:?}",
-    //         row.last_error,
-    //     );
+        // Stale row must now be FAILED with the reaper's signature message.
+        let row = sqlx::query!(
+            "SELECT status, last_error FROM notification_log \
+             WHERE event_id = $1 AND recipient_id = $2",
+            eid_stale,
+            "stale@example.com",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.status, "FAILED");
+        assert!(
+            row.last_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("stale-PENDING reaper"),
+            "Expected reaper signature in last_error; got: {:?}",
+            row.last_error,
+        );
 
-    //     // Fresh row must still be PENDING.
-    //     let row = sqlx::query!(
-    //         "SELECT status FROM notification_log WHERE event_id = $1",
-    //         eid_fresh,
-    //     )
-    //     .fetch_one(&pool)
-    //     .await
-    //     .unwrap();
-    //     assert_eq!(
-    //         row.status, "PENDING",
-    //         "Fresh row should not have been reaped"
-    //     );
+        // Fresh row must still be PENDING.
+        let row = sqlx::query!(
+            "SELECT status FROM notification_log WHERE event_id = $1",
+            eid_fresh,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row.status, "PENDING",
+            "Fresh row should not have been reaped"
+        );
 
-    //     // Pre-existing FAILED row must not have been overwritten.
-    //     let row = sqlx::query!(
-    //         "SELECT status, last_error FROM notification_log WHERE event_id = $1",
-    //         eid_failed,
-    //     )
-    //     .fetch_one(&pool)
-    //     .await
-    //     .unwrap();
-    //     assert_eq!(row.status, "FAILED");
-    //     assert!(
-    //         !row.last_error
-    //             .as_deref()
-    //             .unwrap_or("")
-    //             .contains("stale-PENDING reaper"),
-    //         "Pre-existing FAILED last_error should not have been overwritten",
-    //     );
+        // Pre-existing FAILED row must not have been overwritten.
+        let row = sqlx::query!(
+            "SELECT status, last_error FROM notification_log WHERE event_id = $1",
+            eid_failed,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.status, "FAILED");
+        assert!(
+            !row.last_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("stale-PENDING reaper"),
+            "Pre-existing FAILED last_error should not have been overwritten",
+        );
 
-    //     // SENT row must be untouched.
-    //     let row = sqlx::query!(
-    //         "SELECT status FROM notification_log WHERE event_id = $1",
-    //         eid_sent,
-    //     )
-    //     .fetch_one(&pool)
-    //     .await
-    //     .unwrap();
-    //     assert_eq!(row.status, "SENT");
-    // }
+        // SENT row must be untouched.
+        let row = sqlx::query!(
+            "SELECT status FROM notification_log WHERE event_id = $1",
+            eid_sent,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.status, "SENT");
+    }
 
     /// `reap_stale_pending(0)` with a zero-second timeout should not panic
     /// and should produce valid SQL (tests the `|| ' seconds'` interpolation
@@ -1038,6 +1056,7 @@ mod tests {
                 bcc: None,
                 send_mode: "individual",
                 group_retry_mode: None,
+                to_recipients: None,
                 event_timestamp: ts,
             })
             .await

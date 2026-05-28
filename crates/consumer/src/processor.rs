@@ -217,6 +217,7 @@ pub async fn process_recipient(
             bcc: bcc_json.as_ref(),
             send_mode: email_opts.send_mode.as_str(),
             group_retry_mode: None, // individual mode — group_retry_mode is not applicable
+            to_recipients: None,    // individual mode — every recipient has its own row
             event_timestamp: event.timestamp,
         })
         .await
@@ -503,6 +504,9 @@ pub async fn process_group(
         cc_json: Option<&'a serde_json::Value>,
         bcc_json: Option<&'a serde_json::Value>,
         group_retry_mode_str: &'a str,
+        /// Serialized full To: list. Non-None only for GroupRetryMode::Whole so
+        /// that the single primary row records who else received the email.
+        to_recipients_json: Option<&'a serde_json::Value>,
     }
     fn make_args<'a>(r: &'a Recipient, s: &'a SharedArgs<'a>) -> EmailInsertPendingArgs<'a> {
         EmailInsertPendingArgs {
@@ -518,9 +522,27 @@ pub async fn process_group(
             bcc: s.bcc_json,
             send_mode: s.email_opts.send_mode.as_str(),
             group_retry_mode: Some(s.group_retry_mode_str),
+            to_recipients: s.to_recipients_json,
             event_timestamp: s.event.timestamp,
         }
     }
+
+    // For GroupRetryMode::Whole, serialize the full recipient list once so the
+    // primary row records every address that received this group email.
+    // For GroupRetryMode::Individual every recipient gets its own row, so
+    // to_recipients is redundant and left NULL.
+    let to_recipients_json: Option<serde_json::Value> =
+        if email_opts.group_retry_mode == GroupRetryMode::Whole {
+            match serde_json::to_value(&email_opts.recipients).map_err(|e| {
+                AppError::permanent_mailer(format!("failed to serialize to_recipients: {e}"))
+            }) {
+                Ok(v) => Some(v),
+                Err(e) => return RecipientOutcome::Failed(e),
+            }
+        } else {
+            None
+        };
+
     let shared = SharedArgs {
         event,
         email_opts,
@@ -529,6 +551,7 @@ pub async fn process_group(
         cc_json: cc_json.as_ref(),
         bcc_json: bcc_json.as_ref(),
         group_retry_mode_str,
+        to_recipients_json: to_recipients_json.as_ref(),
     };
 
     // ── 3a. Idempotency inserts ───────────────────────────────────────────────
@@ -769,10 +792,20 @@ async fn execute_send(
     }
 
     // ── Sender selection ──────────────────────────────────────────────────────
-    let sender = ctx
-        .sender_registry
-        .resolve(sender_account)
-        .unwrap_or_else(|| Arc::clone(&ctx.sender));
+    let sender = match ctx.sender_registry.resolve(sender_account) {
+        Some(s) => s,
+        None => {
+            if let Some(account) = sender_account {
+                warn!(
+                    account,
+                    event_type,
+                    "Named sender_account not found in registry — falling back to global sender. \
+                     Check [sender_accounts.{account}] in config."
+                );
+            }
+            Arc::clone(&ctx.sender)
+        }
+    };
 
     // ── Send ──────────────────────────────────────────────────────────────────
     let send_start = std::time::Instant::now();

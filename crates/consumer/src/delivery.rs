@@ -39,6 +39,13 @@ use crate::{
     },
 };
 
+/// Maximum retry backoff delay, applied in both the individual and group retry
+/// loops. Capped at 30 minutes to stay safely below RabbitMQ's default
+/// consumer_timeout (also 30 min). The shift exponent is bounded at 10 so
+/// the multiplier never exceeds 1024×; saturating_mul prevents wrapping on
+/// large retry_base_ms values.
+const MAX_RETRY_DELAY_MS: u64 = 30 * 60 * 1000; // 30 minutes
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 /// Handle one delivery.
@@ -406,7 +413,7 @@ pub(crate) async fn process_one_recipient(
                         .await;
                     return;
                 }
-                let delay = Duration::from_secs(30 * (1u64 << attempt.min(3)));
+                let delay = Duration::from_secs(30 * (1u64 << rl_count.min(3)));
                 warn!(
                     event_id   = %event.event_id,
                     email      = %recipient.email,
@@ -481,7 +488,6 @@ pub(crate) async fn process_one_recipient(
                 // retry_base_ms does not strand the un-ACK'd AMQP message beyond
                 // any reasonable consumer timeout.  Operators who need longer hold
                 // times should increase max_retries and keep retry_base_ms ≤ 2 000.
-                const MAX_RETRY_DELAY_MS: u64 = 30 * 60 * 1000; // 30 minutes
                 let delay = Duration::from_millis(
                     cfg.retry_base_ms
                         .saturating_mul(1u64 << attempt.min(10))
@@ -626,7 +632,7 @@ pub(crate) async fn process_one_group(
                     }
                     return;
                 }
-                let delay = Duration::from_secs(30 * (1u64 << attempt.min(3)));
+                let delay = Duration::from_secs(30 * (1u64 << rl_count.min(3)));
                 warn!(
                     event_id   = %event.event_id,
                     rl_count,
@@ -726,7 +732,6 @@ pub(crate) async fn process_one_group(
                 attempt += 1;
                 rl_count = 0;
                 // Same cap and saturating_mul as process_one_recipient — see comment there.
-                const MAX_RETRY_DELAY_MS: u64 = 30 * 60 * 1000; // 30 minutes
                 let delay = Duration::from_millis(
                     cfg.retry_base_ms
                         .saturating_mul(1u64 << attempt.min(10))

@@ -115,6 +115,10 @@ pub struct EmailDeliveryDetail {
     pub cc: Option<serde_json::Value>,
     /// BCC recipients (post-filter).  JSONB array.
     pub bcc: Option<serde_json::Value>,
+    /// Full To: recipient list for group sends with `group_retry_mode = "whole"`.
+    /// NULL for individual sends and group/Individual sends (those modes write
+    /// one row per recipient, making this field redundant). NULL for pre-0030 rows.
+    pub to_recipients: Option<serde_json::Value>,
 }
 
 // ── Composed view (backwards-compatible flat struct) ─────────────────────────
@@ -155,6 +159,9 @@ pub struct NotificationLog {
     pub attachments: Option<serde_json::Value>,
     pub cc: Option<serde_json::Value>,
     pub bcc: Option<serde_json::Value>,
+    /// Full To: recipient list for group sends with `group_retry_mode = "whole"`.
+    /// NULL for individual sends and group/Individual sends. NULL for pre-0030 rows.
+    pub to_recipients: Option<serde_json::Value>,
 }
 
 impl NotificationLog {
@@ -189,6 +196,7 @@ impl NotificationLog {
             attachments: self.attachments.clone(),
             cc: self.cc.clone(),
             bcc: self.bcc.clone(),
+            to_recipients: self.to_recipients.clone(),
         }
     }
 }
