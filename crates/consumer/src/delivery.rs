@@ -16,6 +16,85 @@
 //! The connection loop and AMQP topology setup live in `runner.rs`; the
 //! per-recipient processor logic (idempotency, template rendering, send) lives
 //! in `processor.rs`.  This module is the glue between them.
+//!
+//! # Mail delivery flow
+//!
+//! ```text
+//! AMQP broker
+//!  │
+//!  │  Delivery (raw bytes)
+//!  ▼
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │ handle_delivery                                                 │
+//! │                                                                 │
+//! │  1. Deserialise ──────────────────────────────────────────────► │ FAIL → NACK → DLQ
+//! │       NotificationEvent  (or legacy EmailEvent fallback)        │
+//! │                                                                 │
+//! │  2a. No email channel_overrides? ──────────────────────────────► mark_skipped → ACK
+//! │  2b. Recipients empty?          ──────────────────────────────► mark_skipped → ACK
+//! │  2c. Recipients > max_per_event? ─────────────────────────────► mark_skipped → NACK → DLQ
+//! │                                                                 │
+//! │  3. Fetch attachments (once for all recipients) ───────────────► FAIL permanent → NACK → DLQ
+//! │                                                                 │    transient  → NACK → requeue
+//! │  4. Filter CC / BCC (once per event)                           │
+//! │       invalid / blocked address ──────────────────────────────► WARN + exclude (delivery continues)
+//! │                                                                 │
+//! │  5. Dispatch ──────────────────────────────────────────────────┤
+//! │       send_mode = Group  ─────────────────────────────────────► process_one_group
+//! │       send_mode = Individual (default)                         │
+//! │         └─ per recipient (parallel JoinSet tasks)             ► process_one_recipient
+//! │                                                                 │
+//! │  6. ACK (after all tasks complete)                             │
+//! └─────────────────────────────────────────────────────────────────┘
+//!
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │ process_one_recipient  (retry loop)                             │
+//! │                                                                 │
+//! │  process_recipient() ─────────────────────────────────────────► RecipientOutcome
+//! │    │                                                            │
+//! │    ├─ Sent / Blocked / Skipped ───────────────────────────────► return (terminal)
+//! │    │                                                            │
+//! │    ├─ Duplicate { retry_count } ───────────────────────────────► seed attempt counter, retry immediately
+//! │    │                                                            │
+//! │    ├─ Failed (permanent) ──────────────────────────────────────► mark_failed(exhausted=true) → return
+//! │    ├─ Failed (attempt ≥ max_retries) ──────────────────────────► mark_failed(exhausted=true) → return
+//! │    ├─ Failed + NoRetry policy ─────────────────────────────────► mark_failed(exhausted=true) → return
+//! │    │                                                            │
+//! │    ├─ Failed (RateLimited, rl_count ≤ max_rl_waits) ──────────► mark_failed(exhausted=false)
+//! │    │    └─ sleep(30s × 2^rl_count, max 4h) ──────────────────► retry
+//! │    ├─ Failed (RateLimited, rl_count > max_rl_waits) ──────────► mark_failed(exhausted=true) → return
+//! │    │                                                            │
+//! │    └─ Failed (transient) ──────────────────────────────────────► mark_failed(exhausted=false)
+//! │         └─ sleep(base × 2^attempt, max 30 min) ──────────────► retry
+//! │                                                                 │
+//! │  Shutdown during backoff ─────────────────────────────────────► mark_failed(exhausted=true) → return
+//! └─────────────────────────────────────────────────────────────────┘
+//!
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │ process_one_group  (retry loop, mirrors process_one_recipient)  │
+//! │                                                                 │
+//! │  Same outcomes as above, plus:                                  │
+//! │    GroupFailedWithIndividualRows ─────────────────────────────► spawn process_one_recipient
+//! │      (group_retry_mode = Individual)                            │  per address (parallel JoinSet)
+//! │      already-SENT rows are skipped by idempotency guard        │
+//! └─────────────────────────────────────────────────────────────────┘
+//!
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │ process_recipient  (single attempt, called by the loops above)  │
+//! │                                                                 │
+//! │  0. Validate recipient email address                           │
+//! │  1. Resolve template (cached TTL)                              │
+//! │  2. Validate from_override address                             │
+//! │  3. Render subject / body_html / body_text                     │
+//! │  4. Idempotency: INSERT PENDING (ON CONFLICT → Duplicate)      │
+//! │  5. Config-file recipient filter                               │
+//! │  6. DB block_list_store check                                  │
+//! │  7. Rate-limiter token (wait or Shutdown)                      │
+//! │  8. Select sender (named account registry → global fallback)   │
+//! │  9. sender.send(EmailMessage)                                  │
+//! │ 10. mark_sent / mark_failed / mark_blocked                     │
+//! └─────────────────────────────────────────────────────────────────┘
+//! ```
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,6 +117,13 @@ use crate::{
         RecipientOutcome,
     },
 };
+
+/// Maximum retry backoff delay, applied in both the individual and group retry
+/// loops. Capped at 30 minutes to stay safely below RabbitMQ's default
+/// consumer_timeout (also 30 min). The shift exponent is bounded at 10 so
+/// the multiplier never exceeds 1024×; saturating_mul prevents wrapping on
+/// large retry_base_ms values.
+const MAX_RETRY_DELAY_MS: u64 = 30 * 60 * 1000; // 30 minutes
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -104,32 +190,93 @@ pub(crate) async fn handle_delivery(
     };
 
     // ── Extract email channel options ────────────────────────────────────────
-    // If there are no email options, ACK cleanly so other (future) channels
-    // can still process the event without it being re-queued.
+    // If there are no email options the event has no work for this service to
+    // do.  We write a SKIPPED row so operators can see the event in the status
+    // API and diagnose the publisher bug, then ACK cleanly so the message is
+    // not re-queued or sent to DLQ.
+    //
+    // Logged at ERROR (not WARN) because a missing email channel_overrides is
+    // almost always a publisher bug — it should never happen in production and
+    // must not go unnoticed.
     let email_opts = match event.channel_overrides.email.as_ref() {
         Some(opts) => opts.clone(),
         None => {
-            warn!(event_id = %event.event_id, "Event has no email channel options — ACKing and skipping");
+            error!(
+                event_id   = %event.event_id,
+                event_type = %event.event_type,
+                "Event has no email channel_overrides — publisher bug? \
+                 Writing SKIPPED row so the event is visible via the status API."
+            );
+            // Use the event_id string as the sentinel recipient_id so the row
+            // is queryable via GET /emails/{event_id} without a real address.
+            let _ = ctx
+                .store
+                .mark_skipped(
+                    event.event_id,
+                    &event.event_type,
+                    &format!("event:{}", event.event_id),
+                    "no email channel_overrides in event — publisher must re-publish with corrected data",
+                    event.timestamp,
+                    &event.payload,
+                )
+                .await;
             let _ = delivery.ack(BasicAckOptions::default()).await;
             return;
         }
     };
 
     if email_opts.recipients.is_empty() {
-        warn!(event_id = %event.event_id, "Event has no recipients — ACKing and skipping");
+        error!(
+            event_id   = %event.event_id,
+            event_type = %event.event_type,
+            "Event has no recipients — publisher bug? \
+             Writing SKIPPED row so the event is visible via the status API."
+        );
+        let _ = ctx
+            .store
+            .mark_skipped(
+                event.event_id,
+                &event.event_type,
+                &format!("event:{}", event.event_id),
+                "email channel_overrides.recipients is empty — publisher must re-publish with at least one recipient",
+                event.timestamp,
+                &event.payload,
+            )
+            .await;
         let _ = delivery.ack(BasicAckOptions::default()).await;
         return;
     }
 
     // Guard against pathologically large recipient lists that would monopolise
     // the semaphore permit for an unbounded duration and exhaust DB connections.
+    // Write a SKIPPED row with a sentinel recipient_id before NACKing so an
+    // operator can diagnose the rejection via GET /emails/{event_id} rather
+    // than seeing a 404 and wondering whether the event was ever received.
     if email_opts.recipients.len() > cfg.max_recipients_per_event {
         error!(
             event_id        = %event.event_id,
+            event_type      = %event.event_type,
             recipient_count = email_opts.recipients.len(),
             limit           = cfg.max_recipients_per_event,
-            "Event exceeds max_recipients_per_event — sending to DLQ"
+            "Event exceeds max_recipients_per_event — writing SKIPPED row and sending to DLQ"
         );
+        let reason = format!(
+            "recipient count {} exceeds max_recipients_per_event {} — \
+             reduce the list or raise the limit before re-publishing",
+            email_opts.recipients.len(),
+            cfg.max_recipients_per_event,
+        );
+        let _ = ctx
+            .store
+            .mark_skipped(
+                event.event_id,
+                &event.event_type,
+                &format!("event:{}", event.event_id),
+                &reason,
+                event.timestamp,
+                &event.payload,
+            )
+            .await;
         let _ = delivery
             .nack(BasicNackOptions {
                 requeue: false,
@@ -173,26 +320,15 @@ pub(crate) async fn handle_delivery(
     };
 
     // ── CC/BCC validation and filtering (once per event) ──────────────────
-    // Invalid CC/BCC addresses are a permanent failure for the whole event.
-    // Blocked CC/BCC addresses are silently excluded — logged at WARN level —
-    // and delivery continues.  This runs once here rather than inside each
-    // per-recipient task to avoid N×M filter evaluations and log noise.
-    for r in email_opts.cc.iter().chain(email_opts.bcc.iter()) {
-        if !is_valid_email(&r.email) {
-            warn!(
-                event_id = %event.event_id,
-                email    = %r.email,
-                "Invalid CC/BCC address — sending to DLQ"
-            );
-            let _ = delivery
-                .nack(BasicNackOptions {
-                    requeue: false,
-                    ..Default::default()
-                })
-                .await;
-            return;
-        }
-    }
+    // Invalid or blocked CC/BCC addresses are silently excluded — logged at
+    // WARN level — and delivery continues.  This mirrors the block-list
+    // behaviour for CC/BCC: a bad copy address is not a reason to abort a
+    // delivery to valid TO recipients.  Contrast with TO recipients, where
+    // an invalid address returns a permanent AppError::Mailer for that
+    // recipient.
+    //
+    // This runs once here rather than inside each per-recipient task to avoid
+    // N×M filter evaluations and log noise.
     let cc_bcc = {
         // Helper that checks both the static config filter and the DB-backed
         // block_list_store for a CC/BCC address.  Config-file rules win (checked
@@ -206,6 +342,15 @@ pub(crate) async fn handle_delivery(
             r: &Recipient,
             field: &str,
         ) -> bool {
+            // 0. Basic address validity — strip rather than DLQ the event.
+            if !is_valid_email(&r.email) {
+                warn!(
+                    event_id = %event_id,
+                    email    = %r.email,
+                    "{} address is invalid — excluding from delivery", field
+                );
+                return false;
+            }
             // 1. Static config filter.
             match ctx.filter.check(&r.email) {
                 Ok(()) => {}
@@ -408,7 +553,7 @@ pub(crate) async fn process_one_recipient(
                         .await;
                     return;
                 }
-                let delay = Duration::from_secs(30 * (1u64 << attempt.min(3)));
+                let delay = Duration::from_secs(30 * (1u64 << rl_count.min(3)));
                 warn!(
                     event_id   = %event.event_id,
                     email      = %recipient.email,
@@ -483,7 +628,6 @@ pub(crate) async fn process_one_recipient(
                 // retry_base_ms does not strand the un-ACK'd AMQP message beyond
                 // any reasonable consumer timeout.  Operators who need longer hold
                 // times should increase max_retries and keep retry_base_ms ≤ 2 000.
-                const MAX_RETRY_DELAY_MS: u64 = 30 * 60 * 1000; // 30 minutes
                 let delay = Duration::from_millis(
                     cfg.retry_base_ms
                         .saturating_mul(1u64 << attempt.min(10))
@@ -628,7 +772,7 @@ pub(crate) async fn process_one_group(
                     }
                     return;
                 }
-                let delay = Duration::from_secs(30 * (1u64 << attempt.min(3)));
+                let delay = Duration::from_secs(30 * (1u64 << rl_count.min(3)));
                 warn!(
                     event_id   = %event.event_id,
                     rl_count,
@@ -728,7 +872,6 @@ pub(crate) async fn process_one_group(
                 attempt += 1;
                 rl_count = 0;
                 // Same cap and saturating_mul as process_one_recipient — see comment there.
-                const MAX_RETRY_DELAY_MS: u64 = 30 * 60 * 1000; // 30 minutes
                 let delay = Duration::from_millis(
                     cfg.retry_base_ms
                         .saturating_mul(1u64 << attempt.min(10))

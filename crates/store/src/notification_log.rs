@@ -51,6 +51,13 @@ pub struct EmailInsertPendingArgs<'a> {
     /// Stored so `republish_event()` faithfully replays the original retry strategy.
     /// `None` means the field was absent (pre-0028 rows); treated as `"whole"` on retry.
     pub group_retry_mode: Option<&'a str>,
+    /// Full To: recipient list for group sends with `group_retry_mode = "whole"`.
+    ///
+    /// Non-NULL only when `send_mode = "group"` AND `group_retry_mode = "whole"`:
+    /// that is the only case where a single row tracks multiple recipients.
+    /// Individual sends and group/Individual sends each write one row per
+    /// recipient, making this column redundant for those modes.
+    pub to_recipients: Option<&'a serde_json::Value>,
 }
 
 // ── Channel constants ─────────────────────────────────────────────────────────
@@ -99,6 +106,27 @@ pub trait NotificationStore: Send + Sync + 'static {
         args: &EmailInsertPendingArgs<'_>,
     ) -> Result<InsertResult, AppError>;
 
+    /// Insert multiple PENDING delivery rows atomically.
+    ///
+    /// Used by the group-send path (`GroupRetryMode::Individual`) to write all
+    /// per-recipient rows in one operation so a mid-batch crash cannot leave
+    /// the set partially written.  If any insert fails the entire batch is
+    /// rolled back and the caller receives the error.
+    ///
+    /// The default implementation falls back to sequential `insert_pending`
+    /// calls (no atomicity guarantee).  `EmailNotificationStore` overrides
+    /// this with a real database transaction.
+    async fn insert_pending_batch(
+        &self,
+        args: &[EmailInsertPendingArgs<'_>],
+    ) -> Result<Vec<InsertResult>, AppError> {
+        let mut results = Vec::with_capacity(args.len());
+        for a in args {
+            results.push(self.insert_pending(a).await?);
+        }
+        Ok(results)
+    }
+
     /// Mark a delivery as successfully sent.
     async fn mark_sent(&self, event_id: Uuid, recipient_id: &str) -> Result<(), AppError>;
 
@@ -128,6 +156,27 @@ pub trait NotificationStore: Send + Sync + 'static {
         event_id: Uuid,
         recipient_id: &str,
         reason: &str,
+    ) -> Result<(), AppError>;
+
+    /// Record a terminal skip for an event-level validation failure.
+    ///
+    /// Written when the consumer ACKs a delivery without attempting to send:
+    /// no email `channel_overrides`, empty recipient list, or recipient count
+    /// exceeding `max_recipients_per_event`.
+    ///
+    /// `reason` is a short human-readable description stored in `last_error`
+    /// so operators can diagnose the skip via the status API.
+    ///
+    /// Unlike `mark_failed`, `SKIPPED` rows are **not** eligible for the
+    /// manual retry API — the publisher must re-publish with corrected data.
+    async fn mark_skipped(
+        &self,
+        event_id: Uuid,
+        event_type: &str,
+        recipient_id: &str,
+        reason: &str,
+        event_timestamp: chrono::DateTime<chrono::Utc>,
+        payload: &serde_json::Value,
     ) -> Result<(), AppError>;
 
     /// Fetch all delivery rows for an event (one per recipient).
@@ -240,8 +289,8 @@ impl NotificationStore for EmailNotificationStore {
             INSERT INTO email_notification_log
                 (notification_id, recipient_email, recipient_name,
                  from_override, sender_account, send_mode, group_retry_mode,
-                 cc, bcc, attachments)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 cc, bcc, attachments, to_recipients)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             "#,
             row.id,
             args.recipient_email,
@@ -253,12 +302,91 @@ impl NotificationStore for EmailNotificationStore {
             args.cc,
             args.bcc,
             args.attachments,
+            args.to_recipients,
         )
         .execute(&mut *tx)
         .await?;
 
         tx.commit().await?;
         Ok(InsertResult::Inserted)
+    }
+
+    /// Transactional override: all rows in one `BEGIN`/`COMMIT`.
+    ///
+    /// Runs every pair of `(notification_log, email_notification_log)` inserts
+    /// inside a single outer transaction so the batch is written atomically.
+    /// A crash between any two rows rolls back the entire set; on AMQP
+    /// redelivery the `Duplicate` path in `insert_pending` handles individual
+    /// rows that were committed in a prior partial attempt.
+    #[instrument(skip(self, args), fields(count = args.len()))]
+    async fn insert_pending_batch(
+        &self,
+        args: &[EmailInsertPendingArgs<'_>],
+    ) -> Result<Vec<InsertResult>, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let mut results = Vec::with_capacity(args.len());
+
+        for a in args {
+            // ── notification_log ──────────────────────────────────────────────
+            let row = sqlx::query!(
+                r#"
+                INSERT INTO notification_log
+                    (event_id, event_type, channel, recipient_id, payload, event_timestamp)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (event_id, channel, recipient_id) DO UPDATE
+                    SET updated_at = notification_log.updated_at
+                RETURNING id,
+                          retry_count,
+                          status,
+                          (xmax <> 0) AS "was_conflict!: bool"
+                "#,
+                a.event_id,
+                a.event_type,
+                CHANNEL_EMAIL,
+                a.recipient_email,
+                a.payload,
+                a.event_timestamp,
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+
+            if row.was_conflict {
+                results.push(InsertResult::Duplicate {
+                    retry_count: row.retry_count,
+                    status: row.status,
+                });
+                continue;
+            }
+
+            // ── email_notification_log ────────────────────────────────────────
+            sqlx::query!(
+                r#"
+                INSERT INTO email_notification_log
+                    (notification_id, recipient_email, recipient_name,
+                     from_override, sender_account, send_mode, group_retry_mode,
+                     cc, bcc, attachments, to_recipients)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                "#,
+                row.id,
+                a.recipient_email,
+                a.recipient_name,
+                a.from_override,
+                a.sender_account,
+                a.send_mode,
+                a.group_retry_mode,
+                a.cc,
+                a.bcc,
+                a.attachments,
+                a.to_recipients,
+            )
+            .execute(&mut *tx)
+            .await?;
+
+            results.push(InsertResult::Inserted);
+        }
+
+        tx.commit().await?;
+        Ok(results)
     }
 
     #[instrument(skip(self))]
@@ -363,6 +491,52 @@ impl NotificationStore for EmailNotificationStore {
         Ok(())
     }
 
+    /// Insert a terminal SKIPPED row into `notification_log`.
+    ///
+    /// Unlike the other `mark_*` methods this does an INSERT rather than an
+    /// UPDATE — SKIPPED rows are written at the moment of the skip decision,
+    /// before any PENDING row exists.  We use `ON CONFLICT DO NOTHING` so a
+    /// re-delivered duplicate message (broker re-delivery before ACK arrived)
+    /// does not fail; the original SKIPPED row is preserved and the consumer
+    /// can safely ACK the duplicate.
+    ///
+    /// `email_notification_log` is intentionally NOT written: SKIPPED events
+    /// have no delivery detail worth storing — no recipient was contacted and
+    /// no template was rendered.
+    #[instrument(skip(self, reason, payload))]
+    async fn mark_skipped(
+        &self,
+        event_id: Uuid,
+        event_type: &str,
+        recipient_id: &str,
+        reason: &str,
+        event_timestamp: chrono::DateTime<chrono::Utc>,
+        payload: &serde_json::Value,
+    ) -> Result<(), AppError> {
+        sqlx::query!(
+            r#"
+            INSERT INTO notification_log
+                (event_id, event_type, channel, recipient_id,
+                 status, last_error, payload, event_timestamp,
+                 retry_count, total_attempts)
+            VALUES ($1, $2, $3, $4,
+                    'SKIPPED', $5, $6, $7,
+                    0, 0)
+            ON CONFLICT (event_id, channel, recipient_id) DO NOTHING
+            "#,
+            event_id,
+            event_type,
+            CHANNEL_EMAIL,
+            recipient_id,
+            reason,
+            payload,
+            event_timestamp,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     #[instrument(skip(self))]
     async fn get_by_event_id(&self, event_id: Uuid) -> Result<Vec<NotificationLog>, AppError> {
         let rows = sqlx::query!(
@@ -379,7 +553,7 @@ impl NotificationStore for EmailNotificationStore {
                 n.event_timestamp,
                 n.created_at,
                 n.updated_at,
-                e.recipient_email,
+                COALESCE(e.recipient_email, n.recipient_id) AS "recipient_email!",
                 e.recipient_name,
                 e.from_override,
                 e.sender_account,
@@ -387,9 +561,10 @@ impl NotificationStore for EmailNotificationStore {
                 e.group_retry_mode,
                 e.cc,
                 e.bcc,
-                e.attachments
+                e.attachments,
+                e.to_recipients
             FROM notification_log n
-            JOIN email_notification_log e ON e.notification_id = n.id
+            LEFT JOIN email_notification_log e ON e.notification_id = n.id
             WHERE n.event_id = $1
               AND n.channel  = $2
             ORDER BY n.created_at
@@ -430,6 +605,7 @@ impl NotificationStore for EmailNotificationStore {
                     bcc: r.bcc,
                     send_mode: r.send_mode,
                     group_retry_mode: r.group_retry_mode,
+                    to_recipients: r.to_recipients,
                     event_timestamp: Some(r.event_timestamp),
                     created_at: r.created_at,
                     updated_at: r.updated_at,
@@ -458,7 +634,7 @@ impl NotificationStore for EmailNotificationStore {
                 n.event_timestamp,
                 n.created_at,
                 n.updated_at,
-                e.recipient_email,
+                COALESCE(e.recipient_email, n.recipient_id) AS "recipient_email!",
                 e.recipient_name,
                 e.from_override,
                 e.sender_account,
@@ -466,9 +642,10 @@ impl NotificationStore for EmailNotificationStore {
                 e.group_retry_mode,
                 e.cc,
                 e.bcc,
-                e.attachments
+                e.attachments,
+                e.to_recipients
             FROM notification_log n
-            JOIN email_notification_log e ON e.notification_id = n.id
+            LEFT JOIN email_notification_log e ON e.notification_id = n.id
             WHERE n.event_id    = $1
               AND n.channel     = $2
               AND n.recipient_id = $3
@@ -500,6 +677,7 @@ impl NotificationStore for EmailNotificationStore {
             bcc: r.bcc,
             send_mode: r.send_mode,
             group_retry_mode: r.group_retry_mode,
+            to_recipients: r.to_recipients,
             event_timestamp: Some(r.event_timestamp),
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -579,7 +757,8 @@ impl NotificationStore for EmailNotificationStore {
                 e.group_retry_mode,
                 e.attachments,
                 e.cc,
-                e.bcc
+                e.bcc,
+                e.to_recipients
             FROM notification_log n
             JOIN email_notification_log e ON e.notification_id = n.id
             WHERE n.event_id = $1
@@ -742,6 +921,7 @@ mod tests {
                     bcc: None,
                     send_mode: "individual",
                     group_retry_mode: None,
+                    to_recipients: None,
                     event_timestamp: ts,
                 })
                 .await
@@ -751,7 +931,7 @@ mod tests {
         // Back-date to simulate the row being stuck for 10 minutes.
         sqlx::query!(
             "UPDATE notification_log SET updated_at = now() - interval '10 minutes' \
-             WHERE event_id = $1 AND recipient_email = $2",
+             WHERE event_id = $1 AND recipient_id = $2",
             eid_stale,
             "stale@example.com",
         )
@@ -775,6 +955,7 @@ mod tests {
                 bcc: None,
                 send_mode: "individual",
                 group_retry_mode: None,
+                to_recipients: None,
                 event_timestamp: ts,
             })
             .await
@@ -796,6 +977,7 @@ mod tests {
                 bcc: None,
                 send_mode: "individual",
                 group_retry_mode: None,
+                to_recipients: None,
                 event_timestamp: ts,
             })
             .await
@@ -834,6 +1016,7 @@ mod tests {
                 bcc: None,
                 send_mode: "individual",
                 group_retry_mode: None,
+                to_recipients: None,
                 event_timestamp: ts,
             })
             .await
@@ -858,7 +1041,7 @@ mod tests {
         // Stale row must now be FAILED with the reaper's signature message.
         let row = sqlx::query!(
             "SELECT status, last_error FROM notification_log \
-             WHERE event_id = $1 AND recipient_email = $2",
+             WHERE event_id = $1 AND recipient_id = $2",
             eid_stale,
             "stale@example.com",
         )
@@ -940,6 +1123,7 @@ mod tests {
                 bcc: None,
                 send_mode: "individual",
                 group_retry_mode: None,
+                to_recipients: None,
                 event_timestamp: ts,
             })
             .await

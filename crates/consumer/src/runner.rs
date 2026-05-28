@@ -93,7 +93,12 @@ pub async fn run_consumer(
                 // failing, treat this as a fresh start and reset the backoff.
                 // This prevents a long-lived connection that eventually drops
                 // from carrying a near-maximum delay into the very next reconnect.
-                if connected_at.elapsed() > Duration::from_secs(30) {
+                //
+                // The threshold is 90 s — safely above the AMQP heartbeat
+                // interval (60 s) — so a connection that failed during
+                // handshake or before the first heartbeat does not reset the
+                // delay and cause rapid retry storms.
+                if connected_at.elapsed() > Duration::from_secs(90) {
                     reconnect_delay = Duration::from_secs(2);
                 }
                 counter!("consumer_reconnects_total").increment(1);

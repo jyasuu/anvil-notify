@@ -50,6 +50,20 @@ pub struct OutboxConfig {
     /// Requires migration 0016_outbox_locked_at.sql to be applied first.
     /// Default: 300 s.
     pub stale_lock_timeout_secs: u64,
+
+    /// Maximum consecutive publish failures before an outbox row is permanently
+    /// marked FAILED and removed from the retry pool.
+    ///
+    /// Each failed publish attempt increments `fail_count`; once it reaches
+    /// this threshold the row transitions to FAILED and is never retried again.
+    /// Operators can inspect FAILED rows and requeue them manually if needed.
+    ///
+    /// Tune based on your tolerance for repeated delivery attempts of broken
+    /// events.  A low value (3–5) keeps the outbox clean; a higher value gives
+    /// more chances for transient failures (broker restarts, network blips) to
+    /// self-heal before giving up.
+    /// Default: 5.
+    pub max_publish_failures: i32,
 }
 
 impl Default for OutboxConfig {
@@ -63,6 +77,7 @@ impl Default for OutboxConfig {
             batch_size: 10, // reduced from 50 — smaller lock window per cycle
             pool_size: 2,   // reduced from 5 — worker rarely uses more than 2
             stale_lock_timeout_secs: 300, // 5 minutes
+            max_publish_failures: 5,
         }
     }
 }

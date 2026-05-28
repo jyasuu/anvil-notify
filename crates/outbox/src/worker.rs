@@ -35,9 +35,6 @@ use crate::OutboxConfig;
 //
 // See `migrations/0002_create_outbox.sql` for the full definition.
 
-/// Maximum consecutive publish failures before a row is permanently marked FAILED.
-const MAX_PUBLISH_FAILURES: i32 = 5;
-
 // ── Public entry point ────────────────────────────────────────────────────────
 
 /// Poll the business outbox table and publish pending events to RabbitMQ.
@@ -75,31 +72,45 @@ pub async fn run_outbox_worker(
 
     let mut reconnect_delay = Duration::from_secs(2);
 
-    // Helper macro: abort the reaper and log any panic before returning.
-    // A plain abort() is safe here because the reaper holds no locks or
-    // un-ACK'd DB transactions — it only reads and updates outbox rows.
+    // Helper macro: stop the reaper and surface any panic before returning.
+    // abort() sends a cancellation to the task; the subsequent await resolves
+    // immediately (either Ok or JoinError::Cancelled).  Using abort() rather
+    // than relying solely on the CancellationToken ensures the task is stopped
+    // even on error paths where the token may not have fired yet.
+    // The await surfaces a panic as a tracing error; without it, a panicked
+    // JoinHandle is silently dropped by Tokio.
+    //
+    // Wrapped in a block so the handle is moved in only one branch at a time;
+    // all three call sites are `return` points so only one fires at runtime,
+    // but rustc needs the move to be unambiguous — hence the macro expansion
+    // rather than a closure (which cannot express the necessary `async move`).
     macro_rules! shutdown_reaper {
-        () => {
-            reaper_handle.abort();
-        };
+        ($handle:expr) => {{
+            $handle.abort();
+            match $handle.await {
+                Ok(()) => {}
+                Err(e) if e.is_cancelled() => {} // aborted cleanly
+                Err(e) => tracing::error!(error = %e, "Outbox reaper task panicked"),
+            }
+        }};
     }
 
     loop {
         if shutdown.is_cancelled() {
             info!("Outbox worker: shutdown requested");
-            shutdown_reaper!();
+            shutdown_reaper!(reaper_handle);
             return Ok(());
         }
 
         match connect_amqp_and_poll(&cfg, &pool, shutdown.clone()).await {
             Ok(()) => {
                 info!("Outbox worker: exiting cleanly");
-                shutdown_reaper!();
+                shutdown_reaper!(reaper_handle);
                 return Ok(());
             }
             Err(e) if shutdown.is_cancelled() => {
                 info!(error = %e, "Outbox worker: exited after shutdown");
-                shutdown_reaper!();
+                shutdown_reaper!(reaper_handle);
                 return Ok(());
             }
             Err(e) => {
@@ -219,7 +230,7 @@ async fn poll_once(cfg: &OutboxConfig, pool: &PgPool, channel: &Channel) -> anyh
                         error!(event_id = %row.event_id, error = %e, "Failed to publish outbox row");
                         metrics::counter!("outbox_publish_failed_total").increment(1);
                         if let Err(e2) =
-                            record_publish_failure(pool, row.id, MAX_PUBLISH_FAILURES).await
+                            record_publish_failure(pool, row.id, cfg.max_publish_failures).await
                         {
                             error!(event_id = %row.event_id, error = %e2, "Could not record publish failure");
                         }
@@ -258,6 +269,10 @@ struct OutboxRow {
     /// it up.  Using `Utc::now()` here would shrink the URL validity window
     /// by any queue or processing lag.
     created_at: chrono::DateTime<chrono::Utc>,
+    /// Running tally of consecutive publish failures for this row.
+    /// Logged at WARN level when > 0 so operators can see retried events
+    /// in prod logs without querying the DB.
+    fail_count: i32,
 }
 
 async fn fetch_pending_batch(pool: &PgPool, limit: i64) -> anyhow::Result<Vec<OutboxRow>> {
@@ -271,7 +286,7 @@ async fn fetch_pending_batch(pool: &PgPool, limit: i64) -> anyhow::Result<Vec<Ou
     let mut tx = pool.begin().await?;
     let rows = sqlx::query!(
         r#"
-        SELECT id, event_id, event_type, payload, created_at
+        SELECT id, event_id, event_type, payload, created_at, fail_count
         FROM   outbox
         WHERE  status = 'PENDING'
         ORDER  BY created_at ASC
@@ -302,6 +317,7 @@ async fn fetch_pending_batch(pool: &PgPool, limit: i64) -> anyhow::Result<Vec<Ou
             event_type: r.event_type,
             payload: r.payload,
             created_at: r.created_at,
+            fail_count: r.fail_count,
         })
         .collect())
 }
@@ -331,8 +347,8 @@ async fn publish_and_mark(
     // Backwards-compatible recipient promotion:
     //   Legacy payload: { "recipient": {...} }     → one-element Vec
     //   New payload:    { "recipients": [...] }    → forwarded verbatim
-    let recipients: Vec<Recipient> =
-        serde_json::from_value(promote_recipients(&row.payload)).unwrap_or_default();
+    let recipients: Vec<Recipient> = serde_json::from_value(promote_recipients(&row.payload))
+        .context("outbox row has malformed recipients field — skipping")?;
 
     let from_override: Option<FromOverride> = row
         .payload
@@ -368,6 +384,12 @@ async fn publish_and_mark(
         .get("send_mode")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default(); // defaults to SendMode::Individual
+
+    let group_retry_mode: GroupRetryMode = row
+        .payload
+        .get("group_retry_mode")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default(); // defaults to GroupRetryMode::Whole
 
     let metadata: Metadata = row
         .payload
@@ -407,13 +429,22 @@ async fn publish_and_mark(
                 from_override,
                 attachments,
                 sender_account,
-                group_retry_mode: GroupRetryMode::default(),
+                group_retry_mode,
                 retry_policy: RetryPolicy::default(),
             }),
         },
     };
 
     let body = serde_json::to_vec(&event)?;
+
+    if row.fail_count > 0 {
+        tracing::warn!(
+            event_id    = %row.event_id,
+            event_type  = %row.event_type,
+            fail_count  = row.fail_count,
+            "Publishing outbox event that has previously failed — this is a retry"
+        );
+    }
 
     // ORDERING: we publish to the broker BEFORE marking the row PUBLISHED.
     // If the process crashes between these two operations the row stays
@@ -495,6 +526,15 @@ async fn record_publish_failure(pool: &PgPool, id: Uuid, max_failures: i32) -> a
 /// the update to rows that are still IN_PROGRESS, and each row's `locked_at`
 /// prevents double-reset races (the first update clears locked_at; a
 /// concurrent reaper sees NULL or a fresh timestamp and skips it).
+///
+/// # NULL locked_at (pre-migration-0016 rows)
+///
+/// Rows that entered IN_PROGRESS before migration 0016 was applied have
+/// `locked_at IS NULL`.  `NULL < <timestamp>` evaluates to NULL in Postgres,
+/// so those rows would be invisible to the standard `locked_at < threshold`
+/// predicate and stay stuck forever.  The `COALESCE` below treats a NULL
+/// `locked_at` as epoch (the distant past), making such rows immediately
+/// eligible for recovery on the first reaper run after the migration is applied.
 async fn reap_stale_in_progress(pool: &PgPool, timeout: Duration) -> anyhow::Result<u64> {
     let timeout_secs = timeout.as_secs() as f64;
     let result = sqlx::query!(
@@ -503,7 +543,7 @@ async fn reap_stale_in_progress(pool: &PgPool, timeout: Duration) -> anyhow::Res
         SET    status    = 'PENDING',
                locked_at = NULL
         WHERE  status    = 'IN_PROGRESS'
-          AND  locked_at < now() - make_interval(secs => $1)
+          AND  COALESCE(locked_at, '-infinity'::timestamptz) < now() - make_interval(secs => $1)
         "#,
         timeout_secs,
     )
@@ -732,20 +772,22 @@ mod tests {
     }
 
     // ── record_publish_failure thresholds ─────────────────────────────────────
-    // These tests validate the CASE expression logic through Rust constants
-    // rather than the DB, ensuring the boundary condition is correct.
+    // These tests validate the CASE expression logic through the config default,
+    // ensuring the boundary condition matches what operators would configure.
 
     #[test]
-    fn max_publish_failures_constant_is_positive() {
-        assert!(MAX_PUBLISH_FAILURES > 0, "MAX_PUBLISH_FAILURES must be > 0");
+    fn max_publish_failures_default_is_positive() {
+        assert!(
+            OutboxConfig::default().max_publish_failures > 0,
+            "max_publish_failures must be > 0"
+        );
     }
 
-    /// Confirm that the threshold value used in the SQL matches what is
-    /// declared as a constant — a common source of subtle drift.
+    /// Confirm that the default threshold is the expected value.
+    /// If this fails after a deliberate change, update both the Default impl
+    /// and this assertion together so the change is visible in review.
     #[test]
-    fn max_publish_failures_matches_expected_default() {
-        // If this fails after a deliberate change, update both the constant
-        // and this assertion together so the change is visible in review.
-        assert_eq!(MAX_PUBLISH_FAILURES, 5);
+    fn max_publish_failures_default_matches_expected() {
+        assert_eq!(OutboxConfig::default().max_publish_failures, 5);
     }
 }

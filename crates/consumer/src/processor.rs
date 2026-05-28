@@ -217,6 +217,7 @@ pub async fn process_recipient(
             bcc: bcc_json.as_ref(),
             send_mode: email_opts.send_mode.as_str(),
             group_retry_mode: None, // individual mode — group_retry_mode is not applicable
+            to_recipients: None,    // individual mode — every recipient has its own row
             event_timestamp: event.timestamp,
         })
         .await
@@ -503,6 +504,9 @@ pub async fn process_group(
         cc_json: Option<&'a serde_json::Value>,
         bcc_json: Option<&'a serde_json::Value>,
         group_retry_mode_str: &'a str,
+        /// Serialized full To: list. Non-None only for GroupRetryMode::Whole so
+        /// that the single primary row records who else received the email.
+        to_recipients_json: Option<&'a serde_json::Value>,
     }
     fn make_args<'a>(r: &'a Recipient, s: &'a SharedArgs<'a>) -> EmailInsertPendingArgs<'a> {
         EmailInsertPendingArgs {
@@ -518,9 +522,27 @@ pub async fn process_group(
             bcc: s.bcc_json,
             send_mode: s.email_opts.send_mode.as_str(),
             group_retry_mode: Some(s.group_retry_mode_str),
+            to_recipients: s.to_recipients_json,
             event_timestamp: s.event.timestamp,
         }
     }
+
+    // For GroupRetryMode::Whole, serialize the full recipient list once so the
+    // primary row records every address that received this group email.
+    // For GroupRetryMode::Individual every recipient gets its own row, so
+    // to_recipients is redundant and left NULL.
+    let to_recipients_json: Option<serde_json::Value> =
+        if email_opts.group_retry_mode == GroupRetryMode::Whole {
+            match serde_json::to_value(&email_opts.recipients).map_err(|e| {
+                AppError::permanent_mailer(format!("failed to serialize to_recipients: {e}"))
+            }) {
+                Ok(v) => Some(v),
+                Err(e) => return RecipientOutcome::Failed(e),
+            }
+        } else {
+            None
+        };
+
     let shared = SharedArgs {
         event,
         email_opts,
@@ -529,12 +551,45 @@ pub async fn process_group(
         cc_json: cc_json.as_ref(),
         bcc_json: bcc_json.as_ref(),
         group_retry_mode_str,
+        to_recipients_json: to_recipients_json.as_ref(),
     };
 
-    // Always insert the primary row first.
-    let primary_insert = match ctx.store.insert_pending(&make_args(primary, &shared)).await {
+    // ── 3a. Idempotency inserts ───────────────────────────────────────────────
+    //
+    // For GroupRetryMode::Individual every recipient gets its own row so that
+    // re-delivery after a partial send can skip already-SENT addresses.  All
+    // rows are written in a single call so the set is written atomically:
+    // either every row exists or none do.  A crash during the insert rolls
+    // back the transaction; on re-delivery the batch is retried in full.
+    //
+    // For GroupRetryMode::Whole only the primary row is written (one row
+    // tracks the whole group send as a unit).
+    let rows_to_insert: Vec<_> = if email_opts.group_retry_mode == GroupRetryMode::Individual {
+        recipients.iter().map(|r| make_args(r, &shared)).collect()
+    } else {
+        vec![make_args(primary, &shared)]
+    };
+
+    let insert_results = match ctx.store.insert_pending_batch(&rows_to_insert).await {
         Ok(r) => r,
         Err(e) => return RecipientOutcome::Failed(e),
+    };
+
+    // The primary row is always first.  Its result drives the terminal-state
+    // check; secondary results are not inspected here because:
+    //   • InsertResult::Inserted — new row, proceed normally.
+    //   • InsertResult::Duplicate { Sent | Blocked } — already terminal; the
+    //     filter step below (step 4) will mark them BLOCKED if re-filtered, or
+    //     execute_send will find them SENT via the mark_sent no-op.
+    //   • InsertResult::Duplicate { non-terminal } — treated as a retry for
+    //     that recipient; execute_send will re-attempt delivery.
+    let primary_insert = match insert_results.into_iter().next() {
+        Some(r) => r,
+        None => {
+            return RecipientOutcome::Failed(AppError::permanent_mailer(
+                "insert_pending_batch returned empty results",
+            ))
+        }
     };
 
     match primary_insert {
@@ -552,22 +607,6 @@ pub async fn process_group(
             Err(e) => return RecipientOutcome::Failed(e),
         },
         InsertResult::Inserted => {}
-    }
-
-    // For GroupRetryMode::Individual, eagerly insert rows for every secondary recipient.
-    //
-    // ATOMICITY NOTE: the primary row was inserted above; secondary rows are
-    // inserted one-by-one here.  If the process crashes between two inserts,
-    // some secondaries will have no DB row.  On AMQP redelivery the primary
-    // Duplicate path returns early, so those recipients are silently skipped.
-    // A future improvement would be to insert all rows in a single batch
-    // INSERT (or a transaction) so the set is either fully written or not at all.
-    if email_opts.group_retry_mode == GroupRetryMode::Individual {
-        for r in recipients.iter().skip(1) {
-            if let Err(e) = ctx.store.insert_pending(&make_args(r, &shared)).await {
-                return RecipientOutcome::Failed(e);
-            }
-        }
     }
 
     // ── 4. Recipient filter — partition To: addresses into allowed / blocked ───
@@ -753,10 +792,20 @@ async fn execute_send(
     }
 
     // ── Sender selection ──────────────────────────────────────────────────────
-    let sender = ctx
-        .sender_registry
-        .resolve(sender_account)
-        .unwrap_or_else(|| Arc::clone(&ctx.sender));
+    let sender = match ctx.sender_registry.resolve(sender_account) {
+        Some(s) => s,
+        None => {
+            if let Some(account) = sender_account {
+                warn!(
+                    account,
+                    event_type,
+                    "Named sender_account not found in registry — falling back to global sender. \
+                     Check [sender_accounts.{account}] in config."
+                );
+            }
+            Arc::clone(&ctx.sender)
+        }
+    };
 
     // ── Send ──────────────────────────────────────────────────────────────────
     let send_start = std::time::Instant::now();

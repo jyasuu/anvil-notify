@@ -314,6 +314,10 @@ mod processor_tests {
             EmailStatus::try_from("BLOCKED").unwrap(),
             EmailStatus::Blocked
         );
+        assert_eq!(
+            EmailStatus::try_from("SKIPPED").unwrap(),
+            EmailStatus::Skipped
+        );
     }
 
     #[test]

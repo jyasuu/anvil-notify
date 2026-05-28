@@ -12,6 +12,14 @@ pub enum NotificationStatus {
     Sent,
     Failed,
     Blocked,
+    /// Terminal status written when the consumer ACKs a delivery without
+    /// attempting to send it — e.g. no email channel in the event, empty
+    /// recipient list, or recipient count exceeding the configured ceiling.
+    ///
+    /// Unlike `Failed`, `Skipped` rows are **not** eligible for the manual
+    /// retry API.  The publisher must re-publish the event with corrected
+    /// `channel_overrides` after fixing the upstream data.
+    Skipped,
 }
 
 impl NotificationStatus {
@@ -21,6 +29,7 @@ impl NotificationStatus {
             NotificationStatus::Sent => "SENT",
             NotificationStatus::Failed => "FAILED",
             NotificationStatus::Blocked => "BLOCKED",
+            NotificationStatus::Skipped => "SKIPPED",
         }
     }
 }
@@ -34,6 +43,7 @@ impl TryFrom<&str> for NotificationStatus {
             "SENT" => Ok(NotificationStatus::Sent),
             "FAILED" => Ok(NotificationStatus::Failed),
             "BLOCKED" => Ok(NotificationStatus::Blocked),
+            "SKIPPED" => Ok(NotificationStatus::Skipped),
             other => Err(AppError::UnknownStatus(other.to_owned())),
         }
     }
@@ -115,6 +125,10 @@ pub struct EmailDeliveryDetail {
     pub cc: Option<serde_json::Value>,
     /// BCC recipients (post-filter).  JSONB array.
     pub bcc: Option<serde_json::Value>,
+    /// Full To: recipient list for group sends with `group_retry_mode = "whole"`.
+    /// NULL for individual sends and group/Individual sends (those modes write
+    /// one row per recipient, making this field redundant). NULL for pre-0030 rows.
+    pub to_recipients: Option<serde_json::Value>,
 }
 
 // ── Composed view (backwards-compatible flat struct) ─────────────────────────
@@ -155,6 +169,9 @@ pub struct NotificationLog {
     pub attachments: Option<serde_json::Value>,
     pub cc: Option<serde_json::Value>,
     pub bcc: Option<serde_json::Value>,
+    /// Full To: recipient list for group sends with `group_retry_mode = "whole"`.
+    /// NULL for individual sends and group/Individual sends. NULL for pre-0030 rows.
+    pub to_recipients: Option<serde_json::Value>,
 }
 
 impl NotificationLog {
@@ -189,6 +206,7 @@ impl NotificationLog {
             attachments: self.attachments.clone(),
             cc: self.cc.clone(),
             bcc: self.bcc.clone(),
+            to_recipients: self.to_recipients.clone(),
         }
     }
 }

@@ -119,8 +119,13 @@ async fn republish_event(
     // Only include the recipients that were actually reset (the caller
     // supplies the subset).  Avoids re-enqueuing already-terminal
     // (SENT/BLOCKED) addresses and the AMQP round-trips they would cause.
+    //
+    // Also exclude SKIPPED rows — their recipient_email is a sentinel
+    // ("event:{uuid}") that is not a real address. SKIPPED rows are never
+    // eligible for replay; the publisher must re-send a corrected event.
     let recipients: Vec<Recipient> = logs
         .iter()
+        .filter(|l| l.status != EmailStatus::Skipped)
         .filter(|l| {
             only_emails
                 .map(|set| set.iter().any(|e| e == &l.recipient_email))
@@ -132,6 +137,17 @@ async fn republish_event(
             name: l.recipient_name.clone(),
         })
         .collect();
+
+    // Guard: if all rows are SKIPPED there are no real recipients to replay
+    // and get_event_delivery_detail will return NotFound (SKIPPED rows have no
+    // email_notification_log entry).  Surface a clear 422 rather than a
+    // confusing 404.
+    if recipients.is_empty() && logs.iter().all(|l| l.status == EmailStatus::Skipped) {
+        return Err(ApiError(AppError::permanent_mailer(format!(
+            "Event {event_id} was skipped at validation time and has no deliverable recipients. \
+             The publisher must re-publish a corrected event."
+        ))));
+    }
 
     // ── 7. Deserialize typed fields from the detail ───────────────────────────
     // Use map_err + ? instead of .ok() so that a malformed stored JSONB value
@@ -356,7 +372,7 @@ pub async fn ready(State(state): State<ApiState>) -> impl IntoResponse {
 ///     { "email": "b@x.com", "status": "BLOCKED",  "retryCount": 0, ... },
 ///     { "email": "c@x.com", "status": "FAILED",   "retryCount": 3, ... }
 ///   ],
-///   "summary": { "total": 3, "sent": 1, "blocked": 1, "failed": 1, "pending": 0 }
+///   "summary": { "total": 3, "sent": 1, "blocked": 1, "failed": 1, "pending": 0, "skipped": 0 }
 /// }
 /// ```
 pub async fn get_email_status(
@@ -369,6 +385,7 @@ pub async fn get_email_status(
     let mut blocked = 0u32;
     let mut failed = 0u32;
     let mut pending = 0u32;
+    let mut skipped = 0u32;
 
     let recipients: Vec<_> = logs
         .iter()
@@ -378,6 +395,9 @@ pub async fn get_email_status(
                 EmailStatus::Blocked => blocked += 1,
                 EmailStatus::Failed => failed += 1,
                 EmailStatus::Pending => pending += 1,
+                // SKIPPED rows use a sentinel recipient_id ("event:{uuid}") —
+                // they are counted in the summary but not eligible for retry.
+                EmailStatus::Skipped => skipped += 1,
             }
             json!({
                 "email":         log.recipient_email,
@@ -385,6 +405,10 @@ pub async fn get_email_status(
                 "retryCount":    log.retry_count,
                 "totalAttempts": log.total_attempts,
                 "lastError":     log.last_error,
+                // Non-null only for group sends with group_retry_mode = "whole":
+                // the primary row carries the full To: list so operators can
+                // see every recipient without querying each address individually.
+                "toRecipients":  log.to_recipients,
                 "createdAt":     log.created_at,
                 "updatedAt":     log.updated_at,
             })
@@ -400,6 +424,7 @@ pub async fn get_email_status(
             "blocked": blocked,
             "failed":  failed,
             "pending": pending,
+            "skipped": skipped,
         }
     })))
 }
@@ -500,6 +525,18 @@ pub async fn retry_event(
     let reset = state.store.reset_all_failed_for_event(event_id).await?;
 
     if reset.is_empty() {
+        // Distinguish "event was skipped at validation time" from "event
+        // never arrived" — both look like a 404 to the caller otherwise,
+        // but the remediation is completely different.
+        let logs = state.store.get_by_event_id(event_id).await?;
+        let has_skipped = logs.iter().any(|l| l.status == EmailStatus::Skipped);
+        if has_skipped {
+            return Err(ApiError(AppError::permanent_mailer(format!(
+                "Event {event_id} was skipped at validation time (no email channel, \
+                 empty recipients, or recipient count exceeded limit) and cannot be retried. \
+                 The publisher must re-publish a corrected event."
+            ))));
+        }
         return Err(ApiError(AppError::NotFound(format!(
             "No FAILED recipients for event {event_id}"
         ))));
