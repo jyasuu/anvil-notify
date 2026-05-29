@@ -62,7 +62,7 @@ AnvilNotify sits between your business services and your mail provider. Business
 | `outbox`           | Outbox worker — polls business DB and publishes events to RabbitMQ        |
 | `rate_limiter`     | Token-bucket rate limiter for outbound mail throughput                    |
 | `recipient_filter` | Block/allow-list filtering (config-file and DB-backed)                    |
-| `ns-cli`           | Operator CLI: `send`, `retry`, `status`, `logs`, `template`, `blocklist`  |
+| `anctl`            | Operator CLI: `send`, `retry`, `status`, `logs`, `template`, `blocklist`  |
 
 ---
 
@@ -154,7 +154,7 @@ Publish an event to the `email.requested` RabbitMQ queue:
 Or use the CLI to send a test event directly:
 
 ```bash
-cargo run --bin ns -- send \
+cargo run --bin anctl -- send \
   --event-type ORDER_CONFIRMATION \
   --recipient alice@example.com \
   --payload '{"orderId":"123","amount":"99.90","name":"Alice"}'
@@ -163,7 +163,7 @@ cargo run --bin ns -- send \
 Check delivery status:
 
 ```bash
-cargo run --bin ns -- status --event-id 550e8400-e29b-41d4-a716-446655440000
+cargo run --bin anctl -- status --event-id 550e8400-e29b-41d4-a716-446655440000
 ```
 
 ### Using the Transactional Outbox from your business service
@@ -324,7 +324,7 @@ curl -X DELETE http://localhost:8080/templates/INVOICE_READY/cache \
   -H "Authorization: Bearer your-api-key"
 
 # or via the CLI
-cargo run --bin ns -- template flush --event-type INVOICE_READY
+cargo run --bin anctl -- template flush --event-type INVOICE_READY
 ```
 
 Templates use [minijinja](https://docs.rs/minijinja/latest/minijinja/) (Jinja2-compatible) syntax. HTML templates are **auto-escaped** — `{{ user_input }}` is safe from XSS by default. Plain-text templates (subject, body_text) have escaping disabled.
@@ -333,9 +333,9 @@ Built-in templates (`ORDER_CONFIRMATION`, `PASSWORD_RESET`, `WELCOME`, `GENERIC_
 
 ---
 
-## 🛠️ CLI (`ns`)
+## 🛠️ CLI (`anctl`)
 
-The `ns` binary provides operator commands for inspecting and recovering state without touching the DB directly.
+The `anctl` binary provides operator commands for inspecting and recovering state without touching the DB directly.
 
 ```bash
 # Build the CLI
