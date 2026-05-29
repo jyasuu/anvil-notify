@@ -339,31 +339,31 @@ The `anctl` binary provides operator commands for inspecting and recovering stat
 
 ```bash
 # Build the CLI
-cargo build --bin ns
+cargo build --bin anctl
 
 # Check delivery status
-ns status --event-id <uuid>
+anctl status --event-id <uuid>
 
 # View recent delivery logs
-ns logs --limit 20 --status FAILED
+anctl logs --limit 20 --status FAILED
 
 # Retry a failed event
-ns retry --event-id <uuid>
+anctl retry --event-id <uuid>
 
 # Send a test event
-ns send --event-type ORDER_CONFIRMATION --recipient user@example.com --payload '{}'
+anctl send --event-type ORDER_CONFIRMATION --recipient user@example.com --payload '{}'
 
 # Manage templates
-ns template list
-ns template flush --event-type ORDER_CONFIRMATION
+anctl template list
+anctl template flush --event-type ORDER_CONFIRMATION
 
 # Manage the runtime blocklist
-ns blocklist list
-ns blocklist add --email unsubscribed@example.com
-ns blocklist remove --id <entry-id>
+anctl blocklist list
+anctl blocklist add --email unsubscribed@example.com
+anctl blocklist remove --id <entry-id>
 
 # Health check
-ns health
+anctl health
 ```
 
 ---

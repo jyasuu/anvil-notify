@@ -79,7 +79,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.migrate
-    image: ns-migrate:latest
+    image: migrate:latest
     restart: "no" # run once and exit — do NOT restart on success
     depends_on:
       postgres:
