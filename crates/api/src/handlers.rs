@@ -420,16 +420,27 @@ pub async fn get_email_status(
         })
         .collect();
 
+    // Capture the count before `recipients` is moved into the json! macro.
+    // `get_by_event_id` caps the query at 500 rows; surface this as a
+    // `truncated` flag so callers can detect the cut-off rather than
+    // silently receiving an incomplete list.
+    let total = recipients.len();
+    let truncated = total >= 500;
+
     Ok(Json(json!({
         "eventId":    event_id,
         "recipients": recipients,
         "summary": {
-            "total":   recipients.len(),
-            "sent":    sent,
-            "blocked": blocked,
-            "failed":  failed,
-            "pending": pending,
-            "skipped": skipped,
+            "total":     total,
+            "sent":      sent,
+            "blocked":   blocked,
+            "failed":    failed,
+            "pending":   pending,
+            "skipped":   skipped,
+            // true when the 500-row safety cap was hit; the actual recipient
+            // count may be higher. Query individual recipients via
+            // GET /emails/{event_id}/recipients/{email} for full detail.
+            "truncated": truncated,
         }
     })))
 }
@@ -501,6 +512,16 @@ pub async fn retry_recipient(
     State(state): State<ApiState>,
     Path((event_id, email)): Path<(Uuid, String)>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // Reject obviously invalid addresses before touching the DB.
+    // URL-decoding is handled by axum's Path extractor; `is_valid_email`
+    // guards against malformed path segments that would otherwise produce
+    // a confusing 404 from `reset_for_retry`.
+    if !is_valid_email(&email) {
+        return Err(ApiError(AppError::permanent_mailer(format!(
+            "'{email}' is not a valid email address"
+        ))));
+    }
+
     // Atomic UPDATE: only succeeds when status = 'FAILED'.
     // Replaces the old fetch-then-update pattern that had a TOCTOU race.
     state.store.reset_for_retry(event_id, &email).await?;
@@ -617,6 +638,35 @@ pub async fn add_blocklist_entry(
             "invalid kind '{kind}' — must be one of: {}",
             valid_kinds.join(", ")
         ))));
+    }
+
+    // Validate the value field is non-empty and structurally plausible.
+    // Email kinds must pass the same format check used in the consumer;
+    // domain kinds must be non-empty and contain at least one dot.
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ApiError(AppError::permanent_mailer(
+            "'value' must not be empty",
+        )));
+    }
+    match kind {
+        "blocked_email" | "allowed_email" => {
+            if !is_valid_email(value) {
+                return Err(ApiError(AppError::permanent_mailer(format!(
+                    "'{value}' is not a valid email address for kind '{kind}'"
+                ))));
+            }
+        }
+        "blocked_domain" | "allowed_domain" => {
+            // Simple structural check: must contain a dot and no '@'.
+            if value.contains('@') || !value.contains('.') {
+                return Err(ApiError(AppError::permanent_mailer(format!(
+                    "'{value}' is not a valid domain for kind '{kind}' \
+                     (expected format: 'example.com')"
+                ))));
+            }
+        }
+        _ => unreachable!("kind already validated above"),
     }
 
     let entry = state

@@ -1057,12 +1057,21 @@ fn error_reason_label(err: &AppError) -> &'static str {
             ..
         } => "permanent",
         AppError::Mailer { .. } => "transient",
+        // `Blocked` should never reach `execute_send` — recipients are
+        // filtered before that call — but if the code path ever changes
+        // this ensures the metric label is accurate rather than silently
+        // falling through to "other".
+        AppError::Blocked(_) => "blocked",
         AppError::Database(_) => "database",
         AppError::Template(_) => "template",
         AppError::Queue(_) => "queue",
         AppError::NotFound(_) => "not_found",
         AppError::Deserialize(_) => "deserialize",
         AppError::UnknownStatus(_) => "unknown_status",
-        _ => "other",
+        // These variants do not represent send-path failures; they are
+        // included here to make the match exhaustive so a future new
+        // AppError variant triggers a compile error rather than silently
+        // labelling metrics as "other".
+        AppError::Duplicate(_) => "other",
     }
 }

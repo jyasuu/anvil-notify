@@ -1,0 +1,4 @@
+[advisories]
+ignore = [
+    "RUSTSEC-2023-0071"  # 忽略 rsa 的 Marvin Attack 漏洞
+]
