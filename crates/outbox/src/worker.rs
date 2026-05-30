@@ -12,7 +12,13 @@ use metrics;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+/// Maximum time to wait for a broker publish-confirm before treating the
+/// publish as failed.  Under RabbitMQ flow control or disk pressure the
+/// broker may stop sending Ack/Nack frames; without this timeout the poll
+/// loop would block indefinitely, stalling all outbox row processing.
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
 use uuid::Uuid;
 
 use crate::OutboxConfig;
@@ -142,6 +148,17 @@ async fn connect_amqp_and_poll(
 ) -> anyhow::Result<()> {
     let conn = Connection::connect(&cfg.amqp_url, ConnectionProperties::default()).await?;
     let channel = conn.create_channel().await?;
+
+    // Enable publisher confirms so the `.await?.await?` in `publish_and_mark`
+    // actually waits for a broker Ack/Nack frame rather than returning immediately
+    // with a dummy value.  Without `confirm_select` the second `.await?` on
+    // `basic_publish` resolves immediately — giving a false impression that the
+    // broker persisted the message — and `PUBLISHED` rows may be lost if the
+    // broker restarts before flushing its write-ahead log.
+    channel
+        .confirm_select(lapin::options::ConfirmSelectOptions::default())
+        .await
+        .context("Outbox worker: failed to enable publisher confirms")?;
 
     channel
         .exchange_declare(
@@ -455,7 +472,7 @@ async fn publish_and_mark(
     // This is an intentional at-least-once delivery tradeoff: the alternative
     // (mark first, then publish) risks losing events if the publish fails after
     // the row has already been marked PUBLISHED and the reaper won't retry it.
-    channel
+    let confirm_fut = channel
         .basic_publish(
             &cfg.exchange,
             &cfg.routing_key,
@@ -465,8 +482,24 @@ async fn publish_and_mark(
                 .with_content_type("application/json".into())
                 .with_delivery_mode(2), // persistent
         )
-        .await?
-        .await?; // wait for broker confirm
+        .await?;
+
+    // Wait for broker Ack/Nack with a timeout so that a broker under flow
+    // control or disk pressure cannot stall the poll loop indefinitely.
+    // A Nack is treated as a publish failure — the row stays IN_PROGRESS and
+    // `record_publish_failure` will reset it to PENDING on the next cycle.
+    let confirm = tokio::time::timeout(CONFIRM_TIMEOUT, confirm_fut)
+        .await
+        .map_err(|_| anyhow::anyhow!(
+            "broker publish confirm timed out after {}s — broker may be under flow              control or disk pressure; row will be retried by the reaper",
+            CONFIRM_TIMEOUT.as_secs()
+        ))??;
+    if !confirm.is_ack() {
+        return Err(anyhow::anyhow!(
+            "broker returned Nack for outbox row {} — message was not persisted",
+            row.id
+        ));
+    }
 
     // Mark as PUBLISHED — uses IN_PROGRESS guard so only this worker can flip it.
     // Clear locked_at so the reaper ignores this row going forward.
@@ -497,19 +530,33 @@ async fn publish_and_mark(
 /// because `fetch_pending_batch` now sets rows to IN_PROGRESS atomically;
 /// leaving them IN_PROGRESS after a failure would strand them forever.
 async fn record_publish_failure(pool: &PgPool, id: Uuid, max_failures: i32) -> anyhow::Result<()> {
-    sqlx::query!(
+    let result = sqlx::query!(
         r#"
         UPDATE outbox
         SET    fail_count = fail_count + 1,
                locked_at  = NULL,
                status     = CASE WHEN fail_count + 1 >= $2 THEN 'FAILED' ELSE 'PENDING' END
         WHERE  id = $1
+        RETURNING fail_count, status
         "#,
         id,
         max_failures,
     )
-    .execute(pool)
+    .fetch_one(pool)
     .await?;
+
+    if result.status == "FAILED" {
+        // The row has exhausted all retry attempts and will never be
+        // re-published by the outbox worker.  Alert operators so they can
+        // investigate and re-drive the event manually if needed.
+        warn!(
+            outbox_id    = %id,
+            fail_count   = result.fail_count,
+            max_failures = max_failures,
+            "Outbox row permanently failed after exhausting all publish attempts —              manual intervention required (re-insert the row or republish the event)"
+        );
+    }
+
     Ok(())
 }
 

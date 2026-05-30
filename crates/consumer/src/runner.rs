@@ -253,14 +253,16 @@ async fn declare_topology(
         {
             Ok(_) => {
                 // Queue exists — active declare below will be a no-op (same args).
-                info!(
+                // debug-level: this fires on every startup and is not actionable.
+                tracing::debug!(
                     queue = queue_name,
                     "Queue already exists — skipping active declare"
                 );
             }
             Err(ref e) if is_not_found(e) => {
                 // Queue does not exist yet — normal first-run path.
-                info!(
+                // debug-level: expected on first deployment, not actionable.
+                tracing::debug!(
                     queue = queue_name,
                     "Queue does not exist yet — will declare"
                 );
