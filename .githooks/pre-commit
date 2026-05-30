@@ -22,7 +22,7 @@ fi
 # 3. Clippy Lints
 # Treats warnings as errors so sloppy code can't get through
 echo "--- 🔬 Running linter (cargo clippy) ---"
-SQLX_OFFLINE="1" cargo clippy --all-targets --all-features --all -- -D warnings
+cargo clippy --all-targets --all-features --all -- -D warnings
 
 # 4. Build Check
 # Ensures everything actually compiles cleanly
