@@ -964,8 +964,20 @@ impl NotificationStore for EmailNotificationStore {
 
     async fn reap_stale_pending(&self, timeout_secs: u64) -> Result<Vec<Uuid>, AppError> {
         // Mark PENDING rows that are older than `timeout_secs` as FAILED and
-        // return their event_ids so the caller can log them for operator
-        // diagnosis and targeted manual recovery.
+        // return their *distinct* event_ids so the caller can log them for
+        // operator diagnosis and targeted manual recovery.
+        //
+        // Interval arithmetic: `make_interval(secs => $2)` is the idiomatic
+        // Postgres form and avoids the string-concatenation approach
+        // (`($2 || ' seconds')::interval`) used previously, which is fragile
+        // against locale or type-coercion edge cases.  The outbox reaper uses
+        // the same `make_interval` pattern.
+        //
+        // Deduplication: multiple recipients in the same event each have their
+        // own row.  Returning all row-level event_ids would produce repeated
+        // UUIDs in the warn log (one per recipient), making it hard to see how
+        // many distinct events were affected.  Collecting into a HashSet and
+        // then into a Vec gives one entry per event.
         let rows = sqlx::query!(
             r#"
             UPDATE notification_log
@@ -974,16 +986,25 @@ impl NotificationStore for EmailNotificationStore {
                    updated_at = now()
              WHERE status     = 'PENDING'
                AND channel    = $1
-               AND updated_at < now() - ($2 || ' seconds')::interval
+               AND updated_at < now() - make_interval(secs => $2::float8)
             RETURNING event_id
             "#,
             CHANNEL_EMAIL,
-            timeout_secs.to_string(),
+            timeout_secs as f64,
         )
         .fetch_all(&self.pool)
         .await
         .map_err(AppError::Database)?;
-        Ok(rows.into_iter().map(|r| r.event_id).collect())
+
+        // Deduplicate: one group-send event produces one row per recipient;
+        // callers want the count and list of distinct affected *events*, not rows.
+        let mut seen = std::collections::HashSet::new();
+        let unique_ids: Vec<Uuid> = rows
+            .into_iter()
+            .map(|r| r.event_id)
+            .filter(|id| seen.insert(*id))
+            .collect();
+        Ok(unique_ids)
     }
 
     fn pool(&self) -> &PgPool {
@@ -1029,7 +1050,7 @@ mod tests {
         let ts = Utc::now();
 
         // ── Insert stale PENDING row ──────────────────────────────────────────
-        let eid_stale = Uuid::new_v4();
+        let eid_stale = Uuid::now_v7();
         assert!(matches!(
             store
                 .insert_pending(&EmailInsertPendingArgs {
@@ -1064,7 +1085,7 @@ mod tests {
         .unwrap();
 
         // ── Insert fresh PENDING row (should not be reaped) ───────────────────
-        let eid_fresh = Uuid::new_v4();
+        let eid_fresh = Uuid::now_v7();
         store
             .insert_pending(&EmailInsertPendingArgs {
                 event_id: eid_fresh,
@@ -1086,7 +1107,7 @@ mod tests {
             .unwrap();
 
         // ── Insert a row, back-date it, then transition to pre-existing FAILED ─
-        let eid_failed = Uuid::new_v4();
+        let eid_failed = Uuid::now_v7();
         store
             .insert_pending(&EmailInsertPendingArgs {
                 event_id: eid_failed,
@@ -1125,7 +1146,7 @@ mod tests {
             .unwrap();
 
         // ── Insert a row, back-date it, then mark SENT ────────────────────────
-        let eid_sent = Uuid::new_v4();
+        let eid_sent = Uuid::now_v7();
         store
             .insert_pending(&EmailInsertPendingArgs {
                 event_id: eid_sent,
@@ -1233,7 +1254,7 @@ mod tests {
         let store = EmailNotificationStore::new(pool.clone());
         let payload = serde_json::json!({});
         let ts = Utc::now();
-        let eid = Uuid::new_v4();
+        let eid = Uuid::now_v7();
 
         store
             .insert_pending(&EmailInsertPendingArgs {

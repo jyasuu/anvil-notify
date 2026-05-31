@@ -176,7 +176,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 use uuid::Uuid;
 
-use store::{EmailInsertPendingArgs, NotificationStore};
+use store::{EmailInsertPendingArgs, InsertResult, NotificationStore};
 
 use crate::{
     config::ConsumerConfig,
@@ -703,6 +703,12 @@ pub(crate) async fn process_one_recipient(
             // Transient failure — normal exponential backoff
             RecipientOutcome::Failed(ref e) => {
                 attempt += 1;
+                // Reset rl_count so a future RateLimited error after a transient
+                // failure gets the full max_rl_waits budget again.  Without this
+                // reset, alternating transient and rate-limit errors would never
+                // accumulate toward the ceiling — but the ceiling would also never
+                // be cleanly enforced.  Resetting here is the simpler invariant:
+                // max_rl_waits counts *consecutive* rate-limit waits only.
                 rl_count = 0;
                 // The `.min(10)` caps the *shift* (not `attempt` itself) so the
                 // multiplier never exceeds 1024.  `attempt` may legitimately exceed
@@ -919,15 +925,53 @@ pub(crate) async fn process_one_group(
             // `To:` header shows only their own address; the shared-`To:`
             // visibility of the original group email is not preserved on retry.
             RecipientOutcome::GroupFailedWithIndividualRows(ref e) => {
+                // Build the set of already-terminal addresses so we can skip
+                // spawning tasks for them.  The idempotency guard inside
+                // process_one_recipient would catch them too, but these DB
+                // round-trips have zero value and add latency proportional to
+                // the number of already-delivered recipients.
+                //
+                // For GroupRetryMode::Whole only the primary row exists, so
+                // this set is typically empty and the loop is a no-op.
+                // For GroupRetryMode::Individual the partial-send strip in
+                // process_group already excluded these addresses from the To:
+                // header; we mirror that here at the task-spawn level.
+                use common::NotificationStatus;
+                let mut already_terminal: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for r in &email_opts.recipients {
+                    if let Ok(log) = ctx
+                        .store
+                        .get_by_event_and_recipient(event.event_id, &r.email)
+                        .await
+                    {
+                        if matches!(
+                            log.status,
+                            NotificationStatus::Sent | NotificationStatus::Blocked
+                        ) {
+                            already_terminal.insert(r.email.clone());
+                        }
+                    }
+                }
+
+                let unsent_count = email_opts
+                    .recipients
+                    .len()
+                    .saturating_sub(already_terminal.len());
                 warn!(
                     event_id         = %event.event_id,
                     error            = %e,
                     recipient_count  = email_opts.recipients.len(),
+                    already_terminal = already_terminal.len(),
+                    unsent           = unsent_count,
                     "Group send failed after per-recipient rows written \
                      — falling back to individual retry path"
                 );
                 let mut join_set = tokio::task::JoinSet::new();
                 for recipient in email_opts.recipients.clone() {
+                    if already_terminal.contains(&recipient.email) {
+                        continue;
+                    }
                     let ctx = ctx.clone();
                     let event = event.clone();
                     let opts = email_opts.clone();
@@ -973,6 +1017,8 @@ pub(crate) async fn process_one_group(
 
             RecipientOutcome::Failed(ref e) => {
                 attempt += 1;
+                // Reset rl_count — same reasoning as process_one_recipient:
+                // max_rl_waits counts consecutive rate-limit waits only.
                 rl_count = 0;
                 // Same cap and saturating_mul as process_one_recipient — see comment there.
                 let delay = Duration::from_millis(
@@ -1042,7 +1088,36 @@ async fn insert_failed_for_all_recipients(
             to_recipients: None,
         };
         match store.insert_pending(&args).await {
-            Ok(_) => {
+            Ok(InsertResult::Duplicate { ref status, .. }) => {
+                use common::NotificationStatus;
+                // Row already exists in a terminal state — do not overwrite it.
+                // Calling mark_failed on a SENT row would silently reset it to
+                // FAILED, which is incorrect.  Skip and log at debug level.
+                match NotificationStatus::try_from(status.as_str()) {
+                    Ok(NotificationStatus::Sent) | Ok(NotificationStatus::Blocked) => {
+                        tracing::debug!(
+                            event_id = %event.event_id,
+                            email    = %r.email,
+                            status,
+                            "insert_failed_for_all_recipients: row already terminal — skipping"
+                        );
+                        continue;
+                    }
+                    _ => {} // non-terminal duplicate — fall through to mark_failed
+                }
+                if let Err(e) = store
+                    .mark_failed(event.event_id, &r.email, reason, true)
+                    .await
+                {
+                    error!(
+                        event_id  = %event.event_id,
+                        email     = %r.email,
+                        error     = %e,
+                        "insert_failed_for_all_recipients: mark_failed error (duplicate row)"
+                    );
+                }
+            }
+            Ok(InsertResult::Inserted) => {
                 if let Err(e) = store
                     .mark_failed(event.event_id, &r.email, reason, true)
                     .await

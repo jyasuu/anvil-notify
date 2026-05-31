@@ -164,9 +164,14 @@ pub async fn process_recipient(
             if let Err(ref e) = tr {
                 tracing::warn!(component = "body_text", error = %e, "Template render failed");
             }
-            let first_err = sr.err().or(hr.err()).or(tr.err()).unwrap_or_else(|| {
-                unreachable!("match arm requires at least one Err among (sr, hr, tr)")
-            });
+            // The match arm fires only when at least one result is Err, so this
+            // chain always yields Some.  expect() states the invariant without
+            // the panic-in-release footgun of unreachable! inside unwrap_or_else.
+            let first_err = sr
+                .err()
+                .or(hr.err())
+                .or(tr.err())
+                .expect("match arm requires at least one Err among (sr, hr, tr)");
             return RecipientOutcome::Failed(first_err);
         }
     };
@@ -247,19 +252,27 @@ pub async fn process_recipient(
     }
 
     // ── 4. Recipient filter (config-file) ────────────────────────────────────
-    if let Err(AppError::Blocked(reason)) = ctx.filter.check(&recipient.email) {
-        warn!(reason = %reason, "Recipient blocked by config filter — dropping");
-        let _ = ctx
-            .store
-            .mark_blocked(event.event_id, &recipient.email, &reason)
-            .await;
-        counter!("emails_blocked_total", "event_type" => event.event_type.clone()).increment(1);
-        return RecipientOutcome::Blocked(reason);
+    // Skip entirely when no filter rules are configured: `is_passthrough` is
+    // O(1) and avoids the string-lowercasing and HashSet lookups inside `check`.
+    if !ctx.filter.is_passthrough() {
+        if let Err(AppError::Blocked(reason)) = ctx.filter.check(&recipient.email) {
+            warn!(reason = %reason, "Recipient blocked by config filter — dropping");
+            let _ = ctx
+                .store
+                .mark_blocked(event.event_id, &recipient.email, &reason)
+                .await;
+            counter!("emails_blocked_total", "event_type" => event.event_type.clone()).increment(1);
+            return RecipientOutcome::Blocked(reason);
+        }
     }
 
     // ── 4b. DB-backed block/allow-list ────────────────────────────────────────
     // Checked after the static filter so config-file rules always win.
     // DB entries can be added/removed at runtime via the HTTP API.
+    // We do NOT call is_empty() here as a guard — is_empty() itself calls
+    // snapshot() which is a cache hit; calling it before check() would double
+    // the cache accesses.  check() handles the empty/passthrough case
+    // correctly and efficiently in one snapshot() call.
     if let Err(AppError::Blocked(reason)) = ctx.block_list_store.check(&recipient.email).await {
         warn!(reason = %reason, "Recipient blocked by DB block_list — dropping");
         let _ = ctx
@@ -452,9 +465,13 @@ pub async fn process_group(
             if let Err(ref e) = tr {
                 tracing::warn!(component = "body_text", error = %e, "Template render failed");
             }
-            let first_err = sr.err().or(hr.err()).or(tr.err()).unwrap_or_else(|| {
-                unreachable!("match arm requires at least one Err among (sr, hr, tr)")
-            });
+            // Same reasoning as process_recipient: the arm fires only when
+            // at least one result is Err, so expect() is safe and clearer.
+            let first_err = sr
+                .err()
+                .or(hr.err())
+                .or(tr.err())
+                .expect("match arm requires at least one Err among (sr, hr, tr)");
             return RecipientOutcome::Failed(first_err);
         }
     };
@@ -1057,12 +1074,21 @@ fn error_reason_label(err: &AppError) -> &'static str {
             ..
         } => "permanent",
         AppError::Mailer { .. } => "transient",
+        // `Blocked` should never reach `execute_send` — recipients are
+        // filtered before that call — but if the code path ever changes
+        // this ensures the metric label is accurate rather than silently
+        // falling through to "other".
+        AppError::Blocked(_) => "blocked",
         AppError::Database(_) => "database",
         AppError::Template(_) => "template",
         AppError::Queue(_) => "queue",
         AppError::NotFound(_) => "not_found",
         AppError::Deserialize(_) => "deserialize",
         AppError::UnknownStatus(_) => "unknown_status",
-        _ => "other",
+        // These variants do not represent send-path failures; they are
+        // included here to make the match exhaustive so a future new
+        // AppError variant triggers a compile error rather than silently
+        // labelling metrics as "other".
+        AppError::Duplicate(_) => "other",
     }
 }

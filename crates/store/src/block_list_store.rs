@@ -250,7 +250,7 @@ impl BlockListStore {
             }
         }
 
-        info!(
+        debug!(
             blocked_emails = snap.blocked_emails.len(),
             blocked_domains = snap.blocked_domains.len(),
             allowed_emails = snap.allowed_emails.len(),

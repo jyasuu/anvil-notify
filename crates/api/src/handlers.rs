@@ -420,16 +420,27 @@ pub async fn get_email_status(
         })
         .collect();
 
+    // Capture the count before `recipients` is moved into the json! macro.
+    // `get_by_event_id` caps the query at 500 rows; surface this as a
+    // `truncated` flag so callers can detect the cut-off rather than
+    // silently receiving an incomplete list.
+    let total = recipients.len();
+    let truncated = total >= 500;
+
     Ok(Json(json!({
         "eventId":    event_id,
         "recipients": recipients,
         "summary": {
-            "total":   recipients.len(),
-            "sent":    sent,
-            "blocked": blocked,
-            "failed":  failed,
-            "pending": pending,
-            "skipped": skipped,
+            "total":     total,
+            "sent":      sent,
+            "blocked":   blocked,
+            "failed":    failed,
+            "pending":   pending,
+            "skipped":   skipped,
+            // true when the 500-row safety cap was hit; the actual recipient
+            // count may be higher. Query individual recipients via
+            // GET /emails/{event_id}/recipients/{email} for full detail.
+            "truncated": truncated,
         }
     })))
 }
@@ -501,6 +512,16 @@ pub async fn retry_recipient(
     State(state): State<ApiState>,
     Path((event_id, email)): Path<(Uuid, String)>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // Reject obviously invalid addresses before touching the DB.
+    // URL-decoding is handled by axum's Path extractor; `is_valid_email`
+    // guards against malformed path segments that would otherwise produce
+    // a confusing 404 from `reset_for_retry`.
+    if !is_valid_email(&email) {
+        return Err(ApiError(AppError::permanent_mailer(format!(
+            "'{email}' is not a valid email address"
+        ))));
+    }
+
     // Atomic UPDATE: only succeeds when status = 'FAILED'.
     // Replaces the old fetch-then-update pattern that had a TOCTOU race.
     state.store.reset_for_retry(event_id, &email).await?;
@@ -619,6 +640,35 @@ pub async fn add_blocklist_entry(
         ))));
     }
 
+    // Validate the value field is non-empty and structurally plausible.
+    // Email kinds must pass the same format check used in the consumer;
+    // domain kinds must be non-empty and contain at least one dot.
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ApiError(AppError::permanent_mailer(
+            "'value' must not be empty",
+        )));
+    }
+    match kind {
+        "blocked_email" | "allowed_email" => {
+            if !is_valid_email(value) {
+                return Err(ApiError(AppError::permanent_mailer(format!(
+                    "'{value}' is not a valid email address for kind '{kind}'"
+                ))));
+            }
+        }
+        "blocked_domain" | "allowed_domain" => {
+            // Simple structural check: must contain a dot and no '@'.
+            if value.contains('@') || !value.contains('.') {
+                return Err(ApiError(AppError::permanent_mailer(format!(
+                    "'{value}' is not a valid domain for kind '{kind}' \
+                     (expected format: 'example.com')"
+                ))));
+            }
+        }
+        _ => unreachable!("kind already validated above"),
+    }
+
     let entry = state
         .block_list_store
         .add_entry(kind, value, reason)
@@ -688,4 +738,177 @@ pub async fn reload_blocklist_cache(State(state): State<ApiState>) -> impl IntoR
                 .into_response()
         }
     }
+}
+
+// ── Send mail ─────────────────────────────────────────────────────────────────
+
+/// Request body for `POST /emails/send`.
+///
+/// The caller supplies the full notification event inline rather than going
+/// through the outbox.  This is the direct-send path: the API validates the
+/// request, publishes the event to RabbitMQ, and returns 202 immediately.  The
+/// consumer picks it up and handles template rendering, sending, and retries
+/// exactly as it would for any outbox-sourced event.
+///
+/// # When to use this endpoint
+///
+/// Use it for low-volume, operator-initiated or integration-test sends where
+/// writing to an outbox table is inconvenient.  For high-volume transactional
+/// mail from a business service, the outbox pattern is preferred because it
+/// gives you at-least-once delivery guarantees without a synchronous RabbitMQ
+/// dependency at write time.
+///
+/// # Idempotency
+///
+/// Callers may supply `event_id` to make the call idempotent: if a
+/// `notification_log` row already exists for that `event_id` + recipient, the
+/// consumer will skip the duplicate on delivery (the idempotency guard in
+/// `process_recipient`).  When `event_id` is omitted a fresh UUID is generated.
+#[derive(Debug, serde::Deserialize)]
+pub struct SendEmailRequest {
+    /// Optional stable ID.  Omit to let the service generate one.
+    #[serde(default)]
+    pub event_id: Option<Uuid>,
+
+    /// Logical event type driving template selection (e.g. `"ORDER_CONFIRMATION"`).
+    pub event_type: String,
+
+    /// Arbitrary key/value template variables forwarded to the Handlebars renderer.
+    pub payload: serde_json::Value,
+
+    /// Email-specific options: recipients, CC/BCC, attachments, sender account, etc.
+    pub email: EmailOptions,
+
+    /// Optional source tag stored in `notification_log.metadata` for tracing.
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// POST /emails/send
+///
+/// Directly enqueue a notification event for immediate delivery.
+///
+/// Validates the request (non-empty recipients, valid addresses, valid
+/// `from_override` if present, non-empty `event_type`), assigns or uses the
+/// supplied `event_id`, then publishes the event to RabbitMQ and returns 202.
+///
+/// Returns:
+/// * 202 — event accepted and enqueued; `event_id` is in the response body
+/// * 400 — validation failure (empty recipients, bad address, etc.)
+/// * 422 — permanently invalid field (e.g. malformed `from_override` email)
+/// * 503 — RabbitMQ unavailable
+pub async fn send_email(
+    State(state): State<ApiState>,
+    Json(req): Json<SendEmailRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    // ── 1. Basic validation ────────────────────────────────────────────────────
+    if req.event_type.trim().is_empty() {
+        return Err(ApiError(AppError::permanent_mailer(
+            "event_type must not be empty",
+        )));
+    }
+
+    if req.email.recipients.is_empty() {
+        return Err(ApiError(AppError::permanent_mailer(
+            "email.recipients must contain at least one entry",
+        )));
+    }
+
+    // Validate every TO recipient address up-front so the caller gets a clear
+    // 422 rather than a silent FAILED row in the consumer.
+    for r in &req.email.recipients {
+        if !is_valid_email(&r.email) {
+            return Err(ApiError(AppError::permanent_mailer(format!(
+                "invalid recipient email address: '{}'",
+                r.email
+            ))));
+        }
+    }
+
+    // Validate CC addresses.
+    for r in &req.email.cc {
+        if !is_valid_email(&r.email) {
+            return Err(ApiError(AppError::permanent_mailer(format!(
+                "invalid cc email address: '{}'",
+                r.email
+            ))));
+        }
+    }
+
+    // Validate BCC addresses.
+    for r in &req.email.bcc {
+        if !is_valid_email(&r.email) {
+            return Err(ApiError(AppError::permanent_mailer(format!(
+                "invalid bcc email address: '{}'",
+                r.email
+            ))));
+        }
+    }
+
+    // Validate from_override if present.
+    if let Some(ref ov) = req.email.from_override {
+        if !is_valid_email(&ov.email) {
+            return Err(ApiError(AppError::permanent_mailer(format!(
+                "invalid from_override email address: '{}'",
+                ov.email
+            ))));
+        }
+    }
+
+    // ── 2. Validate attachment refs ────────────────────────────────────────────
+    // Use now() as both event_timestamp and check_time so max_age_secs checks
+    // are meaningful: a caller-supplied future timestamp would let an already-
+    // expired URL slip through, so we anchor validation to the actual send time.
+    let now = Utc::now();
+    for att in &req.email.attachments {
+        att.validate(&now, now)
+            .map_err(|e| ApiError(AppError::permanent_mailer(e)))?;
+    }
+
+    // ── 3. Build the NotificationEvent ────────────────────────────────────────
+    let event_id = req.event_id.unwrap_or_else(Uuid::now_v7);
+    let id_source = if req.event_id.is_some() {
+        "caller-supplied"
+    } else {
+        "generated"
+    };
+    // Clone event_type before consuming req so the log and response body can
+    // reference it after req.email is moved into channel_overrides.
+    let event_type = req.event_type.clone();
+    let event = NotificationEvent {
+        event_id,
+        timestamp: now,
+        event_type: req.event_type,
+        payload: req.payload,
+        metadata: Metadata { source: req.source },
+        channel_overrides: ChannelOverrides {
+            email: Some(req.email),
+        },
+    };
+
+    // ── 4. Publish ─────────────────────────────────────────────────────────────
+    let body = serde_json::to_vec(&event).map_err(|e| {
+        ApiError(AppError::permanent_mailer(format!(
+            "failed to serialize event: {e}"
+        )))
+    })?;
+
+    counter!("api_send_email_total").increment(1);
+    state.publisher.publish(body).await?;
+
+    tracing::info!(
+        event_id        = %event_id,
+        event_type      = %event_type,
+        event_id_source = id_source,
+        "send_email: event enqueued"
+    );
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "message":   "Event accepted and enqueued for delivery.",
+            "eventId":   event_id,
+            "eventType": event_type,
+        })),
+    ))
 }

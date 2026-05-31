@@ -348,8 +348,14 @@ async fn main() -> anyhow::Result<()> {
                                 timeout_secs = reaper_timeout,
                                 event_ids    = %event_ids.join(", "),
                                 "Stale-PENDING reaper: marked {} orphaned rows as FAILED — \
-                                 use `anctl retry --event-id <id>` to recover",
+                                 rows were PENDING with no AMQP message to drive them (e.g. \
+                                 broker blip during a retry-API call). \
+                                 Wait at least {}s before retrying to ensure any in-flight \
+                                 consumer task for the same event_id has completed, then use \
+                                 `anctl retry --event-id <id>` to recover. \
+                                 The consumer idempotency guard prevents double-sends.",
                                 ids.len(),
+                                reaper_timeout,
                             )
                         }
                         Ok(_) => {}

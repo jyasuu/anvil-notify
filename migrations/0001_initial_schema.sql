@@ -417,3 +417,34 @@ ALTER TABLE notification_log
 ALTER TABLE notification_log
     ADD CONSTRAINT notification_log_status_check
         CHECK (status IN ('PENDING', 'SENT', 'FAILED', 'BLOCKED', 'SKIPPED'));
+
+
+-- Migration: composite partial index for the stale-PENDING reaper
+--
+-- The `reap_stale_pending` query filters:
+--
+--   WHERE status = 'PENDING'
+--     AND channel = 'email'
+--     AND updated_at < now() - make_interval(secs => ...)
+--
+-- The existing single-column `notification_log_status_idx` and
+-- `notification_log_channel_idx` indexes do not cover this predicate
+-- efficiently.  At scale (millions of rows, many SENT/FAILED), Postgres
+-- may fall back to a sequential scan or choose a suboptimal plan.
+--
+-- A composite partial index on (channel, updated_at) scoped to
+-- status = 'PENDING' rows gives the planner a compact, purpose-built
+-- structure: it only includes PENDING rows, so it stays small even when
+-- the table is large, and it supports both the equality filter on
+-- `channel` and the range predicate on `updated_at` in a single index scan.
+--
+-- The `get_recipients_for_event` and `reset_all_failed_for_event` queries
+-- also benefit from the existing `notification_log_event_status_idx`
+-- (event_id, status), which is already present in migration 0001.
+
+CREATE INDEX IF NOT EXISTS notification_log_pending_reaper_idx
+    ON notification_log (channel, updated_at ASC)
+    WHERE status = 'PENDING';
+
+COMMENT ON INDEX notification_log_pending_reaper_idx IS
+    'Supports reap_stale_pending: WHERE status = ''PENDING'' AND channel = $1 AND updated_at < threshold';
