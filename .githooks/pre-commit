@@ -6,12 +6,6 @@ TARGET="x86_64-unknown-linux-musl"
 
 echo "🦀 Running Rust Quality Gate..."
 
-# 1. Format Check
-# --check returns a non-zero exit code if the code isn't formatted, blocking the commit
-echo "--- 🎨 Checking code formatting (cargo fmt) ---"
-cargo fmt --all
-cargo fmt -- --check
-
 # 2. Cargo SQLx Prepare Check
 # Ensures your offline database savings are up to date with your actual models
 if [ -d ".sqlx" ]; then
@@ -26,6 +20,13 @@ fi
 echo "--- 🔬 Running linter (cargo clippy) ---"
 cargo clippy --all-targets --all-features --all --fix --allow-dirty
 cargo clippy --all-targets --all-features --all -- -D warnings
+
+# 1. Format Check
+# --check returns a non-zero exit code if the code isn't formatted, blocking the commit
+echo "--- 🎨 Checking code formatting (cargo fmt) ---"
+cargo fmt --all
+cargo fmt -- --check
+
 
 # 4. Build Check
 # Ensures everything actually compiles cleanly

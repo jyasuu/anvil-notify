@@ -247,19 +247,27 @@ pub async fn process_recipient(
     }
 
     // ── 4. Recipient filter (config-file) ────────────────────────────────────
-    if let Err(AppError::Blocked(reason)) = ctx.filter.check(&recipient.email) {
-        warn!(reason = %reason, "Recipient blocked by config filter — dropping");
-        let _ = ctx
-            .store
-            .mark_blocked(event.event_id, &recipient.email, &reason)
-            .await;
-        counter!("emails_blocked_total", "event_type" => event.event_type.clone()).increment(1);
-        return RecipientOutcome::Blocked(reason);
+    // Skip entirely when no filter rules are configured: `is_passthrough` is
+    // O(1) and avoids the string-lowercasing and HashSet lookups inside `check`.
+    if !ctx.filter.is_passthrough() {
+        if let Err(AppError::Blocked(reason)) = ctx.filter.check(&recipient.email) {
+            warn!(reason = %reason, "Recipient blocked by config filter — dropping");
+            let _ = ctx
+                .store
+                .mark_blocked(event.event_id, &recipient.email, &reason)
+                .await;
+            counter!("emails_blocked_total", "event_type" => event.event_type.clone()).increment(1);
+            return RecipientOutcome::Blocked(reason);
+        }
     }
 
     // ── 4b. DB-backed block/allow-list ────────────────────────────────────────
     // Checked after the static filter so config-file rules always win.
     // DB entries can be added/removed at runtime via the HTTP API.
+    // We do NOT call is_empty() here as a guard — is_empty() itself calls
+    // snapshot() which is a cache hit; calling it before check() would double
+    // the cache accesses.  check() handles the empty/passthrough case
+    // correctly and efficiently in one snapshot() call.
     if let Err(AppError::Blocked(reason)) = ctx.block_list_store.check(&recipient.email).await {
         warn!(reason = %reason, "Recipient blocked by DB block_list — dropping");
         let _ = ctx
