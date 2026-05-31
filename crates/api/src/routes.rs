@@ -26,18 +26,17 @@ use crate::{
         add_blocklist_entry, get_email_status, get_recipient_status, health,
         invalidate_all_template_cache, invalidate_blocklist_cache, invalidate_template_cache,
         list_blocklist, ready, reload_blocklist_cache, remove_blocklist_entry, retry_event,
-        retry_recipient,
+        retry_recipient, send_email,
     },
     state::ApiState,
 };
 
-/// Hard cap on incoming request bodies (64 KiB).
+/// Hard cap on incoming request bodies (1 MiB).
 ///
-/// All current API endpoints either have no body (GET / DELETE) or accept a
-/// body-less POST (retry endpoints reconstruct the event from DB, so no body
-/// is sent at all). 64 KiB is generous enough to tolerate any future body
-/// that might be added while preventing memory exhaustion from oversized uploads.
-const MAX_BODY_BYTES: usize = 64 * 1024;
+/// The send endpoint accepts a full NotificationEvent body including payload
+/// and attachment refs. 1 MiB is comfortably above any realistic request
+/// while still guarding against accidental large uploads.
+const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// Maximum retry-endpoint calls per minute.
 ///
@@ -78,6 +77,10 @@ pub fn build_router(state: ApiState) -> Router {
     // `api_key` is configured. When `api_key` is `None` (network-isolated
     // deployments), the middleware passes every request through.
     let protected = Router::new()
+        // ── Direct send ───────────────────────────────────────────────────
+        // Enqueue a notification event inline without writing to an outbox.
+        // Useful for low-volume sends, operator tooling, and integration tests.
+        .route("/emails/send", post(send_email))
         .route("/emails/{event_id}", get(get_email_status))
         .route(
             "/emails/{event_id}/recipients/{email}",

@@ -164,9 +164,14 @@ pub async fn process_recipient(
             if let Err(ref e) = tr {
                 tracing::warn!(component = "body_text", error = %e, "Template render failed");
             }
-            let first_err = sr.err().or(hr.err()).or(tr.err()).unwrap_or_else(|| {
-                unreachable!("match arm requires at least one Err among (sr, hr, tr)")
-            });
+            // The match arm fires only when at least one result is Err, so this
+            // chain always yields Some.  expect() states the invariant without
+            // the panic-in-release footgun of unreachable! inside unwrap_or_else.
+            let first_err = sr
+                .err()
+                .or(hr.err())
+                .or(tr.err())
+                .expect("match arm requires at least one Err among (sr, hr, tr)");
             return RecipientOutcome::Failed(first_err);
         }
     };
@@ -460,9 +465,13 @@ pub async fn process_group(
             if let Err(ref e) = tr {
                 tracing::warn!(component = "body_text", error = %e, "Template render failed");
             }
-            let first_err = sr.err().or(hr.err()).or(tr.err()).unwrap_or_else(|| {
-                unreachable!("match arm requires at least one Err among (sr, hr, tr)")
-            });
+            // Same reasoning as process_recipient: the arm fires only when
+            // at least one result is Err, so expect() is safe and clearer.
+            let first_err = sr
+                .err()
+                .or(hr.err())
+                .or(tr.err())
+                .expect("match arm requires at least one Err among (sr, hr, tr)");
             return RecipientOutcome::Failed(first_err);
         }
     };

@@ -33,7 +33,7 @@ metrics            = "0.23"
 metrics-exporter-prometheus = { version = "0.15", default-features = false, features = ["http-listener"] }
 
 # Misc
-uuid   = { version = "1", features = ["v4", "serde"] }
+uuid   = { version = "1.23.1", features = ["v7", "serde"] }
 base64 = "0.22"
 moka  = { version = "0.12", features = ["future"] }  # async-aware TTL cache
 chrono = { version = "0.4", features = ["serde"] }

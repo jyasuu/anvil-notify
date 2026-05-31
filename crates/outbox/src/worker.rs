@@ -146,7 +146,12 @@ async fn connect_amqp_and_poll(
     pool: &PgPool,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    let conn = Connection::connect(&cfg.amqp_url, ConnectionProperties::default()).await?;
+    // Inject heartbeat=60 for the same reason the consumer does: long-running
+    // poll cycles or slow publishes can make the broker think the connection is
+    // idle and close it, stranding rows in IN_PROGRESS until the reaper fires.
+    let amqp_url_with_heartbeat = append_heartbeat_param(&cfg.amqp_url, 60);
+    let conn =
+        Connection::connect(&amqp_url_with_heartbeat, ConnectionProperties::default()).await?;
     let channel = conn.create_channel().await?;
 
     // Enable publisher confirms so the `.await?.await?` in `publish_and_mark`
@@ -623,6 +628,21 @@ async fn run_reaper(pool: PgPool, timeout: Duration, shutdown: CancellationToken
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Append `?heartbeat=<secs>` to an AMQP URL if not already present.
+///
+/// Mirrors the same helper in `consumer/src/runner.rs`. Kept here rather than
+/// moved to `common` to avoid pulling AMQP concerns into the common crate.
+fn append_heartbeat_param(url: &str, heartbeat_secs: u16) -> String {
+    if url.contains("heartbeat=") {
+        return url.to_owned();
+    }
+    if url.contains('?') {
+        format!("{url}&heartbeat={heartbeat_secs}")
+    } else {
+        format!("{url}?heartbeat={heartbeat_secs}")
+    }
+}
 
 /// Promote the `recipient` / `recipients` field from an outbox payload into
 /// the canonical `recipients` array form expected by the consumer.

@@ -1050,7 +1050,7 @@ mod tests {
         let ts = Utc::now();
 
         // ── Insert stale PENDING row ──────────────────────────────────────────
-        let eid_stale = Uuid::new_v4();
+        let eid_stale = Uuid::now_v7();
         assert!(matches!(
             store
                 .insert_pending(&EmailInsertPendingArgs {
@@ -1085,7 +1085,7 @@ mod tests {
         .unwrap();
 
         // ── Insert fresh PENDING row (should not be reaped) ───────────────────
-        let eid_fresh = Uuid::new_v4();
+        let eid_fresh = Uuid::now_v7();
         store
             .insert_pending(&EmailInsertPendingArgs {
                 event_id: eid_fresh,
@@ -1107,7 +1107,7 @@ mod tests {
             .unwrap();
 
         // ── Insert a row, back-date it, then transition to pre-existing FAILED ─
-        let eid_failed = Uuid::new_v4();
+        let eid_failed = Uuid::now_v7();
         store
             .insert_pending(&EmailInsertPendingArgs {
                 event_id: eid_failed,
@@ -1146,7 +1146,7 @@ mod tests {
             .unwrap();
 
         // ── Insert a row, back-date it, then mark SENT ────────────────────────
-        let eid_sent = Uuid::new_v4();
+        let eid_sent = Uuid::now_v7();
         store
             .insert_pending(&EmailInsertPendingArgs {
                 event_id: eid_sent,
@@ -1254,7 +1254,7 @@ mod tests {
         let store = EmailNotificationStore::new(pool.clone());
         let payload = serde_json::json!({});
         let ts = Utc::now();
-        let eid = Uuid::new_v4();
+        let eid = Uuid::now_v7();
 
         store
             .insert_pending(&EmailInsertPendingArgs {

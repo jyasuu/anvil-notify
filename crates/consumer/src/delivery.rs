@@ -703,6 +703,12 @@ pub(crate) async fn process_one_recipient(
             // Transient failure — normal exponential backoff
             RecipientOutcome::Failed(ref e) => {
                 attempt += 1;
+                // Reset rl_count so a future RateLimited error after a transient
+                // failure gets the full max_rl_waits budget again.  Without this
+                // reset, alternating transient and rate-limit errors would never
+                // accumulate toward the ceiling — but the ceiling would also never
+                // be cleanly enforced.  Resetting here is the simpler invariant:
+                // max_rl_waits counts *consecutive* rate-limit waits only.
                 rl_count = 0;
                 // The `.min(10)` caps the *shift* (not `attempt` itself) so the
                 // multiplier never exceeds 1024.  `attempt` may legitimately exceed
@@ -1011,6 +1017,8 @@ pub(crate) async fn process_one_group(
 
             RecipientOutcome::Failed(ref e) => {
                 attempt += 1;
+                // Reset rl_count — same reasoning as process_one_recipient:
+                // max_rl_waits counts consecutive rate-limit waits only.
                 rl_count = 0;
                 // Same cap and saturating_mul as process_one_recipient — see comment there.
                 let delay = Duration::from_millis(
