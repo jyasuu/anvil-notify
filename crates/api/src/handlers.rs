@@ -471,6 +471,61 @@ pub async fn get_recipient_status(
 
 // ── Template cache ────────────────────────────────────────────────────────────
 
+/// GET /templates
+///
+/// Returns all rows from `notification_template` (including inactive) ordered
+/// by type then channel.  Inactive rows are included so operators can inspect
+/// the full table state without direct DB access.
+pub async fn list_templates(State(state): State<ApiState>) -> Result<impl IntoResponse, ApiError> {
+    let rows = state.template_store.list().await?;
+    let body: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "event_type": r.event_type,
+                "channel":    r.channel,
+                "subject":    r.subject,
+                "version":    r.version,
+                "active":     r.active,
+                "updated_at": r.updated_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "templates": body })))
+}
+
+/// GET /templates/:event_type
+///
+/// Returns all channel variants for a single event type (including inactive).
+/// Returns 404 when no rows exist for that type.
+pub async fn get_template(
+    State(state): State<ApiState>,
+    Path(event_type): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let rows = state.template_store.get(&event_type).await?;
+    if rows.is_empty() {
+        return Err(ApiError(AppError::NotFound(format!(
+            "No template found for event type '{event_type}'"
+        ))));
+    }
+    let body: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "event_type": r.event_type,
+                "channel":    r.channel,
+                "subject":    r.subject,
+                "body_html":  r.body_html,
+                "body_text":  r.body_text,
+                "version":    r.version,
+                "active":     r.active,
+                "updated_at": r.updated_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "templates": body })))
+}
+
 /// POST /templates
 ///
 /// Upsert a template row for `(event_type, channel)`.  Inserts on first call;
@@ -484,10 +539,12 @@ pub async fn get_recipient_status(
 ///   "channel":    "email",
 ///   "subject":    "Order {{ orderId }} confirmed",
 ///   "body_html":  "<h1>Hi {{ name }}</h1>...",
-///   "body_text":  "Hi {{ name }}, ..."
+///   "body_text":  "Hi {{ name }}, ...",
+///   "active":     true
 /// }
 /// ```
 /// `channel` defaults to `"email"` when omitted.
+/// `active` defaults to `true` when omitted.
 ///
 /// Returns:
 /// * 201 — new row inserted
@@ -522,6 +579,7 @@ pub async fn upsert_template(
         .and_then(|v| v.as_str())
         .ok_or_else(|| ApiError(AppError::permanent_mailer("missing field 'body_text'")))?
         .trim();
+    let active = body.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
 
     if event_type.is_empty() {
         return Err(ApiError(AppError::permanent_mailer(
@@ -541,7 +599,7 @@ pub async fn upsert_template(
 
     let (version, inserted) = state
         .template_store
-        .upsert(event_type, channel, subject, body_html, body_text)
+        .upsert(event_type, channel, subject, body_html, body_text, active)
         .await?;
 
     let status = if inserted {
@@ -556,6 +614,7 @@ pub async fn upsert_template(
             "event_type": event_type,
             "channel":    channel,
             "version":    version,
+            "active":     active,
             "inserted":   inserted,
         })),
     ))

@@ -23,10 +23,10 @@ use tower_http::trace::TraceLayer;
 
 use crate::{
     handlers::{
-        add_blocklist_entry, get_email_status, get_recipient_status, health,
+        add_blocklist_entry, get_email_status, get_recipient_status, get_template, health,
         invalidate_all_template_cache, invalidate_blocklist_cache, invalidate_template_cache,
-        list_blocklist, ready, reload_blocklist_cache, remove_blocklist_entry, retry_event,
-        retry_recipient, send_email, upsert_template,
+        list_blocklist, list_templates, ready, reload_blocklist_cache, remove_blocklist_entry,
+        retry_event, retry_recipient, send_email, upsert_template,
     },
     state::ApiState,
 };
@@ -87,7 +87,8 @@ pub fn build_router(state: ApiState) -> Router {
             get(get_recipient_status),
         )
         // Template management — create/upsert and cache invalidation.
-        .route("/templates", post(upsert_template))
+        .route("/templates", get(list_templates).post(upsert_template))
+        .route("/templates/{event_type}", get(get_template))
         // Template cache invalidation — useful after editing notification_template rows
         // without restarting the service.
         .route("/templates/cache", delete(invalidate_all_template_cache))

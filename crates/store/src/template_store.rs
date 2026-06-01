@@ -4,9 +4,20 @@
 //! after `cache_ttl` (default 5 minutes).  For immediate invalidation call
 //! [`TemplateStore::invalidate`] or [`TemplateStore::invalidate_all`] via the
 //! `DELETE /templates/{event_type}/cache` or `DELETE /templates/cache` endpoints.
+//!
+//! # `.sqlx` offline cache
+//!
+//! Every `sqlx::query!` call site in this file has a corresponding entry in
+//! `.sqlx/query-<sha256>.json` at the workspace root.  The hash is the
+//! SHA-256 of the **exact** query string as it appears in the macro — including
+//! all whitespace and newlines.  If you reformat a query string (even just
+//! re-indenting), the hash will no longer match and `SQLX_OFFLINE=true` builds
+//! will fail with "query not found in offline data".  Run `cargo sqlx prepare`
+//! after any query edit to regenerate the cache file.
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use common::AppError;
 use moka::future::Cache;
 use sqlx::PgPool;
@@ -22,6 +33,19 @@ pub struct NotificationTemplate {
 
 // Back-compat alias.
 pub use NotificationTemplate as EmailTemplate;
+
+/// A full template row returned by [`TemplateStore::list`] and [`TemplateStore::get`].
+#[derive(Debug, Clone)]
+pub struct TemplateRow {
+    pub event_type: String,
+    pub channel: String,
+    pub subject: String,
+    pub body_html: String,
+    pub body_text: String,
+    pub version: i32,
+    pub active: bool,
+    pub updated_at: DateTime<Utc>,
+}
 
 /// DB-backed template store with a moka TTL cache.
 ///
@@ -98,6 +122,70 @@ impl TemplateStore {
         Ok(tpl)
     }
 
+    /// Return all template rows ordered by type then channel.
+    ///
+    /// Unlike [`resolve`], this returns inactive templates too so operators
+    /// can inspect the full state of the table.
+    pub async fn list(&self) -> Result<Vec<TemplateRow>, AppError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT type, channel, subject, body_html, body_text, version, active, updated_at
+            FROM   notification_template
+            ORDER  BY type, channel
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(AppError::Database)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| TemplateRow {
+                event_type: r.r#type,
+                channel: r.channel,
+                subject: r.subject,
+                body_html: r.body_html,
+                body_text: r.body_text,
+                version: r.version,
+                active: r.active,
+                updated_at: r.updated_at,
+            })
+            .collect())
+    }
+
+    /// Return all channel variants for a single event type.
+    ///
+    /// Returns an empty `Vec` when no rows exist for that type (caller decides
+    /// whether to surface a 404).
+    pub async fn get(&self, event_type: &str) -> Result<Vec<TemplateRow>, AppError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT type, channel, subject, body_html, body_text, version, active, updated_at
+            FROM   notification_template
+            WHERE  type = $1
+            ORDER  BY channel
+            "#,
+            event_type,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(AppError::Database)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| TemplateRow {
+                event_type: r.r#type,
+                channel: r.channel,
+                subject: r.subject,
+                body_html: r.body_html,
+                body_text: r.body_text,
+                version: r.version,
+                active: r.active,
+                updated_at: r.updated_at,
+            })
+            .collect())
+    }
+
     /// Evict all cache entries for `event_type` across every channel.
     ///
     /// Cache keys are `"{channel}:{event_type}"` so a plain `remove(event_type)`
@@ -127,9 +215,12 @@ impl TemplateStore {
 
     /// Upsert a template row for `(event_type, channel)`.
     ///
-    /// Inserts a new row or, on conflict, updates subject/body fields and bumps
-    /// `version` only when content has actually changed (mirrors the migration's
-    /// `ON CONFLICT DO UPDATE` logic).
+    /// Inserts a new row or, on conflict, updates subject/body/active fields
+    /// and bumps `version` only when content has actually changed (mirrors the
+    /// migration's `ON CONFLICT DO UPDATE` logic).
+    ///
+    /// `active = false` lets operators stage a disabled template without it
+    /// being picked up by the consumer until explicitly enabled.
     ///
     /// Returns `(version, inserted)` where `inserted` is `true` for a new row
     /// and `false` for an update.
@@ -140,15 +231,17 @@ impl TemplateStore {
         subject: &str,
         body_html: &str,
         body_text: &str,
+        active: bool,
     ) -> Result<(i32, bool), AppError> {
         let row = sqlx::query!(
             r#"
-            INSERT INTO notification_template (type, channel, subject, body_html, body_text)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO notification_template (type, channel, subject, body_html, body_text, active)
+            VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (type, channel) DO UPDATE
                 SET subject    = EXCLUDED.subject,
                     body_html  = EXCLUDED.body_html,
                     body_text  = EXCLUDED.body_text,
+                    active     = EXCLUDED.active,
                     version    = CASE
                                      WHEN notification_template.subject   IS DISTINCT FROM EXCLUDED.subject
                                        OR notification_template.body_html IS DISTINCT FROM EXCLUDED.body_html
@@ -170,6 +263,7 @@ impl TemplateStore {
             subject,
             body_html,
             body_text,
+            active,
         )
         .fetch_one(&self.pool)
         .await
@@ -186,5 +280,10 @@ impl TemplateStore {
         self.cache.invalidate_all();
         self.cache.run_pending_tasks().await;
         info!("Template cache cleared");
+    }
+
+    /// Expose the underlying pool for use by the readiness probe.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
     }
 }
