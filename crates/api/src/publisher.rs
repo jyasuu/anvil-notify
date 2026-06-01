@@ -94,7 +94,21 @@ impl Publisher {
                 .basic_publish(
                     &self.exchange,
                     &self.routing_key,
-                    BasicPublishOptions::default(),
+                    BasicPublishOptions {
+                        // mandatory: true causes the broker to return a basic.return
+                        // frame (surfaced as an error by lapin) when no queue is bound
+                        // to this exchange+routing_key, rather than silently discarding
+                        // the message and still sending a confirm Ack.
+                        //
+                        // Without this flag, publishing before the consumer has declared
+                        // the queue topology (e.g. a cold-start race or a deployment
+                        // where the API and worker run as separate processes) yields a
+                        // successful publish-confirm while the message is permanently
+                        // lost. mandatory: true converts that silent data loss into a
+                        // 503 the caller can retry.
+                        mandatory: true,
+                        ..Default::default()
+                    },
                     &body,
                     BasicProperties::default()
                         .with_content_type("application/json".into())

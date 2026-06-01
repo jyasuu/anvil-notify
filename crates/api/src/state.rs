@@ -20,4 +20,8 @@ pub struct ApiState {
     /// Static recipient filter (config-file entries). The BlockListStore covers
     /// the DB-backed entries.
     pub filter: RecipientFilter,
+    /// Mirror of `amqp.max_recipients_per_event`. Enforced here at the API
+    /// layer so callers get a 400 immediately rather than a silent FAILED row
+    /// written by the consumer after the message has already been enqueued.
+    pub max_recipients_per_event: usize,
 }
