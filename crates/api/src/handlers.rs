@@ -814,6 +814,17 @@ pub async fn send_email(
         )));
     }
 
+    // Enforce the same recipient ceiling the consumer applies so callers get a
+    // 400 here rather than a 202 followed by a silent FAILED row written by the
+    // consumer after the message has already been enqueued and dequeued.
+    if req.email.recipients.len() > state.max_recipients_per_event {
+        return Err(ApiError(AppError::permanent_mailer(format!(
+            "recipient count {} exceeds max_recipients_per_event {}",
+            req.email.recipients.len(),
+            state.max_recipients_per_event,
+        ))));
+    }
+
     // Validate every TO recipient address up-front so the caller gets a clear
     // 422 rather than a silent FAILED row in the consumer.
     for r in &req.email.recipients {

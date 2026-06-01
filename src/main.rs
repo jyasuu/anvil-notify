@@ -303,6 +303,7 @@ async fn main() -> anyhow::Result<()> {
         publisher,
         api_key: cfg.http.api_key.clone(),
         filter: filter.clone(),
+        max_recipients_per_event: cfg.amqp.max_recipients_per_event,
     };
     let router = build_router(api_state);
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.http.port));
