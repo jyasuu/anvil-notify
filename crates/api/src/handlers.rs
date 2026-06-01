@@ -471,6 +471,96 @@ pub async fn get_recipient_status(
 
 // ── Template cache ────────────────────────────────────────────────────────────
 
+/// POST /templates
+///
+/// Upsert a template row for `(event_type, channel)`.  Inserts on first call;
+/// on subsequent calls updates the content and bumps `version` when any field
+/// has changed (no-op when content is identical, matching the migration logic).
+///
+/// Request body:
+/// ```json
+/// {
+///   "event_type": "ORDER_CONFIRMATION",
+///   "channel":    "email",
+///   "subject":    "Order {{ orderId }} confirmed",
+///   "body_html":  "<h1>Hi {{ name }}</h1>...",
+///   "body_text":  "Hi {{ name }}, ..."
+/// }
+/// ```
+/// `channel` defaults to `"email"` when omitted.
+///
+/// Returns:
+/// * 201 — new row inserted
+/// * 200 — existing row updated (or unchanged)
+/// * 400 — validation failure
+pub async fn upsert_template(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, ApiError> {
+    let event_type = body
+        .get("event_type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError(AppError::permanent_mailer("missing field 'event_type'")))?
+        .trim();
+    let channel = body
+        .get("channel")
+        .and_then(|v| v.as_str())
+        .unwrap_or("email")
+        .trim();
+    let subject = body
+        .get("subject")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError(AppError::permanent_mailer("missing field 'subject'")))?
+        .trim();
+    let body_html = body
+        .get("body_html")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError(AppError::permanent_mailer("missing field 'body_html'")))?
+        .trim();
+    let body_text = body
+        .get("body_text")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError(AppError::permanent_mailer("missing field 'body_text'")))?
+        .trim();
+
+    if event_type.is_empty() {
+        return Err(ApiError(AppError::permanent_mailer(
+            "'event_type' must not be empty",
+        )));
+    }
+    if channel.is_empty() {
+        return Err(ApiError(AppError::permanent_mailer(
+            "'channel' must not be empty",
+        )));
+    }
+    if subject.is_empty() {
+        return Err(ApiError(AppError::permanent_mailer(
+            "'subject' must not be empty",
+        )));
+    }
+
+    let (version, inserted) = state
+        .template_store
+        .upsert(event_type, channel, subject, body_html, body_text)
+        .await?;
+
+    let status = if inserted {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+
+    Ok((
+        status,
+        Json(json!({
+            "event_type": event_type,
+            "channel":    channel,
+            "version":    version,
+            "inserted":   inserted,
+        })),
+    ))
+}
+
 /// DELETE /templates/:event_type/cache
 ///
 /// Evicts one entry from the in-memory template cache, forcing the next

@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO notification_template (type, channel, subject, body_html, body_text)\n            VALUES ($1, $2, $3, $4, $5)\n            ON CONFLICT (type, channel) DO UPDATE\n                SET subject    = EXCLUDED.subject,\n                    body_html  = EXCLUDED.body_html,\n                    body_text  = EXCLUDED.body_text,\n                    version    = CASE\n                                     WHEN notification_template.subject   IS DISTINCT FROM EXCLUDED.subject\n                                       OR notification_template.body_html IS DISTINCT FROM EXCLUDED.body_html\n                                       OR notification_template.body_text IS DISTINCT FROM EXCLUDED.body_text\n                                     THEN notification_template.version + 1\n                                     ELSE notification_template.version\n                                 END,\n                    updated_at = CASE\n                                     WHEN notification_template.subject   IS DISTINCT FROM EXCLUDED.subject\n                                       OR notification_template.body_html IS DISTINCT FROM EXCLUDED.body_html\n                                       OR notification_template.body_text IS DISTINCT FROM EXCLUDED.body_text\n                                     THEN now()\n                                     ELSE notification_template.updated_at\n                                 END\n            RETURNING version, (xmax = 0) AS \"inserted!: bool\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "version",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "inserted!: bool",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "5d47b61ab7c517ceb7d93f479c69f75bd47a31d1d12f66e26b429e6ceead8765"
+}

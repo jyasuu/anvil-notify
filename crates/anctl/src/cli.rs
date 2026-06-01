@@ -316,6 +316,46 @@ pub enum TemplateAction {
         event_type: String,
     },
 
+    /// Create or update a template from a .j2 file.
+    ///
+    /// The file must contain three named sections separated by Jinja2 comment
+    /// markers on their own line:
+    ///
+    ///   {# subject #}
+    ///   Order {{ orderId }} confirmed
+    ///
+    ///   {# body_text #}
+    ///   Hi {{ name }}, your order {{ orderId }} is confirmed.
+    ///
+    ///   {# body_html #}
+    ///   <h1>Hi {{ name }}</h1>
+    ///   <p>Order <strong>{{ orderId }}</strong> confirmed.</p>
+    ///
+    /// Sections may appear in any order. Whitespace around section content is
+    /// trimmed. If the template already exists the content is updated and the
+    /// version is bumped; if content is identical the row is unchanged.
+    Create {
+        /// Event type key, e.g. ORDER_CONFIRMATION
+        #[arg(long, short = 't')]
+        event_type: String,
+
+        /// Path to the .j2 template file.
+        #[arg(long, short)]
+        file: String,
+
+        /// Notification channel (default: email).
+        #[arg(long, short, default_value = "email")]
+        channel: String,
+
+        /// Print the parsed sections and exit without calling the API.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
     /// Evict one or all templates from the in-memory cache.
     Flush {
         /// Specific event type to evict. Omit to flush all.

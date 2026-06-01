@@ -125,6 +125,62 @@ impl TemplateStore {
         );
     }
 
+    /// Upsert a template row for `(event_type, channel)`.
+    ///
+    /// Inserts a new row or, on conflict, updates subject/body fields and bumps
+    /// `version` only when content has actually changed (mirrors the migration's
+    /// `ON CONFLICT DO UPDATE` logic).
+    ///
+    /// Returns `(version, inserted)` where `inserted` is `true` for a new row
+    /// and `false` for an update.
+    pub async fn upsert(
+        &self,
+        event_type: &str,
+        channel: &str,
+        subject: &str,
+        body_html: &str,
+        body_text: &str,
+    ) -> Result<(i32, bool), AppError> {
+        let row = sqlx::query!(
+            r#"
+            INSERT INTO notification_template (type, channel, subject, body_html, body_text)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (type, channel) DO UPDATE
+                SET subject    = EXCLUDED.subject,
+                    body_html  = EXCLUDED.body_html,
+                    body_text  = EXCLUDED.body_text,
+                    version    = CASE
+                                     WHEN notification_template.subject   IS DISTINCT FROM EXCLUDED.subject
+                                       OR notification_template.body_html IS DISTINCT FROM EXCLUDED.body_html
+                                       OR notification_template.body_text IS DISTINCT FROM EXCLUDED.body_text
+                                     THEN notification_template.version + 1
+                                     ELSE notification_template.version
+                                 END,
+                    updated_at = CASE
+                                     WHEN notification_template.subject   IS DISTINCT FROM EXCLUDED.subject
+                                       OR notification_template.body_html IS DISTINCT FROM EXCLUDED.body_html
+                                       OR notification_template.body_text IS DISTINCT FROM EXCLUDED.body_text
+                                     THEN now()
+                                     ELSE notification_template.updated_at
+                                 END
+            RETURNING version, (xmax = 0) AS "inserted!: bool"
+            "#,
+            event_type,
+            channel,
+            subject,
+            body_html,
+            body_text,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(AppError::Database)?;
+
+        // Invalidate the cache entry so the next delivery picks up the new content.
+        self.invalidate(event_type).await;
+
+        Ok((row.version, row.inserted))
+    }
+
     /// Clear the entire template cache.
     pub async fn invalidate_all(&self) {
         self.cache.invalidate_all();
