@@ -23,10 +23,10 @@ use tower_http::trace::TraceLayer;
 
 use crate::{
     handlers::{
-        add_blocklist_entry, get_email_status, get_recipient_status, health,
+        add_blocklist_entry, get_email_status, get_recipient_status, get_template, health,
         invalidate_all_template_cache, invalidate_blocklist_cache, invalidate_template_cache,
-        list_blocklist, ready, reload_blocklist_cache, remove_blocklist_entry, retry_event,
-        retry_recipient, send_email,
+        list_blocklist, list_templates, patch_template, ready, reload_blocklist_cache,
+        remove_blocklist_entry, retry_event, retry_recipient, send_email, upsert_template,
     },
     state::ApiState,
 };
@@ -86,11 +86,18 @@ pub fn build_router(state: ApiState) -> Router {
             "/emails/{event_id}/recipients/{email}",
             get(get_recipient_status),
         )
-        // Template cache invalidation — useful after editing notification_template rows
-        // without restarting the service.
-        .route("/templates/cache", delete(invalidate_all_template_cache))
+        // Template management — list, create/upsert, partial update.
+        //
+        // Cache routes use the /template-cache prefix (not /templates/{x}/cache)
+        // to avoid Axum ambiguously matching "cache" as an {event_type} capture.
+        .route("/templates", get(list_templates).post(upsert_template))
         .route(
-            "/templates/{event_type}/cache",
+            "/templates/{event_type}",
+            get(get_template).patch(patch_template),
+        )
+        .route("/template-cache", delete(invalidate_all_template_cache))
+        .route(
+            "/template-cache/{event_type}",
             delete(invalidate_template_cache),
         )
         // ── DB-backed blocklist admin ─────────────────────────────────────

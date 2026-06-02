@@ -4,9 +4,20 @@
 //! after `cache_ttl` (default 5 minutes).  For immediate invalidation call
 //! [`TemplateStore::invalidate`] or [`TemplateStore::invalidate_all`] via the
 //! `DELETE /templates/{event_type}/cache` or `DELETE /templates/cache` endpoints.
+//!
+//! # `.sqlx` offline cache
+//!
+//! Every `sqlx::query!` call site in this file has a corresponding entry in
+//! `.sqlx/query-<sha256>.json` at the workspace root.  The hash is the
+//! SHA-256 of the **exact** query string as it appears in the macro — including
+//! all whitespace and newlines.  If you reformat a query string (even just
+//! re-indenting), the hash will no longer match and `SQLX_OFFLINE=true` builds
+//! will fail with "query not found in offline data".  Run `cargo sqlx prepare`
+//! after any query edit to regenerate the cache file.
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use common::AppError;
 use moka::future::Cache;
 use sqlx::PgPool;
@@ -22,6 +33,19 @@ pub struct NotificationTemplate {
 
 // Back-compat alias.
 pub use NotificationTemplate as EmailTemplate;
+
+/// A full template row returned by [`TemplateStore::list`] and [`TemplateStore::get`].
+#[derive(Debug, Clone)]
+pub struct TemplateRow {
+    pub event_type: String,
+    pub channel: String,
+    pub subject: String,
+    pub body_html: String,
+    pub body_text: String,
+    pub version: i32,
+    pub active: bool,
+    pub updated_at: DateTime<Utc>,
+}
 
 /// DB-backed template store with a moka TTL cache.
 ///
@@ -98,6 +122,70 @@ impl TemplateStore {
         Ok(tpl)
     }
 
+    /// Return all template rows ordered by type then channel.
+    ///
+    /// Unlike [`resolve`], this returns inactive templates too so operators
+    /// can inspect the full state of the table.
+    pub async fn list(&self) -> Result<Vec<TemplateRow>, AppError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT type, channel, subject, body_html, body_text, version, active, updated_at
+            FROM   notification_template
+            ORDER  BY type, channel
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(AppError::Database)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| TemplateRow {
+                event_type: r.r#type,
+                channel: r.channel,
+                subject: r.subject,
+                body_html: r.body_html,
+                body_text: r.body_text,
+                version: r.version,
+                active: r.active,
+                updated_at: r.updated_at,
+            })
+            .collect())
+    }
+
+    /// Return all channel variants for a single event type.
+    ///
+    /// Returns an empty `Vec` when no rows exist for that type (caller decides
+    /// whether to surface a 404).
+    pub async fn get(&self, event_type: &str) -> Result<Vec<TemplateRow>, AppError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT type, channel, subject, body_html, body_text, version, active, updated_at
+            FROM   notification_template
+            WHERE  type = $1
+            ORDER  BY channel
+            "#,
+            event_type,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(AppError::Database)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| TemplateRow {
+                event_type: r.r#type,
+                channel: r.channel,
+                subject: r.subject,
+                body_html: r.body_html,
+                body_text: r.body_text,
+                version: r.version,
+                active: r.active,
+                updated_at: r.updated_at,
+            })
+            .collect())
+    }
+
     /// Evict all cache entries for `event_type` across every channel.
     ///
     /// Cache keys are `"{channel}:{event_type}"` so a plain `remove(event_type)`
@@ -125,10 +213,136 @@ impl TemplateStore {
         );
     }
 
+    /// Upsert a template row for `(event_type, channel)`.
+    ///
+    /// Inserts a new row or, on conflict, updates subject/body/active fields
+    /// and bumps `version` only when content has actually changed (mirrors the
+    /// migration's `ON CONFLICT DO UPDATE` logic).
+    ///
+    /// `active = false` lets operators stage a disabled template without it
+    /// being picked up by the consumer until explicitly enabled.
+    ///
+    /// Returns `(version, inserted)` where `inserted` is `true` for a new row
+    /// and `false` for an update.
+    pub async fn upsert(
+        &self,
+        event_type: &str,
+        channel: &str,
+        subject: &str,
+        body_html: &str,
+        body_text: &str,
+        active: bool,
+    ) -> Result<(i32, bool), AppError> {
+        let row = sqlx::query!(
+            r#"
+            INSERT INTO notification_template (type, channel, subject, body_html, body_text, active)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (type, channel) DO UPDATE
+                SET subject    = EXCLUDED.subject,
+                    body_html  = EXCLUDED.body_html,
+                    body_text  = EXCLUDED.body_text,
+                    active     = EXCLUDED.active,
+                    version    = CASE
+                                     WHEN notification_template.subject   IS DISTINCT FROM EXCLUDED.subject
+                                       OR notification_template.body_html IS DISTINCT FROM EXCLUDED.body_html
+                                       OR notification_template.body_text IS DISTINCT FROM EXCLUDED.body_text
+                                     THEN notification_template.version + 1
+                                     ELSE notification_template.version
+                                 END,
+                    updated_at = CASE
+                                     WHEN notification_template.subject   IS DISTINCT FROM EXCLUDED.subject
+                                       OR notification_template.body_html IS DISTINCT FROM EXCLUDED.body_html
+                                       OR notification_template.body_text IS DISTINCT FROM EXCLUDED.body_text
+                                     THEN now()
+                                     ELSE notification_template.updated_at
+                                 END
+            RETURNING version, (xmax = 0) AS "inserted!: bool"
+            "#,
+            event_type,
+            channel,
+            subject,
+            body_html,
+            body_text,
+            active,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(AppError::Database)?;
+
+        // Invalidate the cache entry so the next delivery picks up the new content.
+        self.invalidate(event_type).await;
+
+        Ok((row.version, row.inserted))
+    }
+
     /// Clear the entire template cache.
     pub async fn invalidate_all(&self) {
         self.cache.invalidate_all();
         self.cache.run_pending_tasks().await;
         info!("Template cache cleared");
+    }
+
+    /// Expose the underlying pool for use by the readiness probe.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// Atomically patch a template row for `(event_type, channel)`.
+    ///
+    /// Only fields supplied as `Some(...)` are written; `None` leaves the
+    /// existing column value unchanged.  `version` is bumped and `updated_at`
+    /// advanced only when the content columns actually change.
+    ///
+    /// Returns `Some((version, active))` for the updated row, or `None` when
+    /// no row exists for `(event_type, channel)`.
+    pub async fn patch(
+        &self,
+        event_type: &str,
+        channel: &str,
+        subject: Option<&str>,
+        body_html: Option<&str>,
+        body_text: Option<&str>,
+        active: Option<bool>,
+    ) -> Result<Option<(i32, bool)>, AppError> {
+        let row = sqlx::query!(
+            r#"
+            UPDATE notification_template
+            SET subject    = COALESCE($3, subject),
+                body_html  = COALESCE($4, body_html),
+                body_text  = COALESCE($5, body_text),
+                active     = COALESCE($6::boolean, active),
+                version    = CASE
+                                 WHEN subject   IS DISTINCT FROM COALESCE($3, subject)
+                                   OR body_html IS DISTINCT FROM COALESCE($4, body_html)
+                                   OR body_text IS DISTINCT FROM COALESCE($5, body_text)
+                                 THEN version + 1
+                                 ELSE version
+                             END,
+                updated_at = CASE
+                                 WHEN subject   IS DISTINCT FROM COALESCE($3, subject)
+                                   OR body_html IS DISTINCT FROM COALESCE($4, body_html)
+                                   OR body_text IS DISTINCT FROM COALESCE($5, body_text)
+                                 THEN now()
+                                 ELSE updated_at
+                             END
+            WHERE type = $1 AND channel = $2
+            RETURNING version, active
+            "#,
+            event_type,
+            channel,
+            subject,
+            body_html,
+            body_text,
+            active,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(AppError::Database)?;
+
+        if row.is_some() {
+            self.invalidate(event_type).await;
+        }
+
+        Ok(row.map(|r| (r.version, r.active)))
     }
 }

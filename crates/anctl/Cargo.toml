@@ -27,10 +27,13 @@ lapin        = "2"
 reqwest = { version = "0.12", features = ["json"] }
 
 # CLI
-clap        = { version = "4", features = ["derive", "env"] }
+clap        = { version = "4", features = ["derive", "env", "cargo"] }
 tabled      = "0.16"          # pretty tables in terminal output
 dialoguer   = "0.11"          # interactive confirmation prompts
 indicatif   = "0.17"          # progress spinners
+
+# Template syntax validation
+minijinja = { version = "2", features = ["speedups"] }
 
 # Config (re-use the same file format as the service)
 config = "0.14"

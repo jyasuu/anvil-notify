@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT type, channel, subject, body_html, body_text, version, active, updated_at\n            FROM   notification_template\n            WHERE  type = $1\n            ORDER  BY channel\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "channel",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "subject",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "body_html",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "body_text",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "version",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "active",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 7,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "9e13d7cbd438f20e501da3409ef76ed8b3154a9cc664b87471862d5cb212daa6"
+}

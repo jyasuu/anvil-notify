@@ -165,7 +165,7 @@ spec:
               echo "RabbitMQ ready."
       containers:
         - name: anvil-notify
-          image: anvil-notify:latest   # ← replace with your registry image
+          image: ghcr.io/jyasuu/anvil-notify:main   # ← replace with your registry image
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -273,7 +273,7 @@ spec:
               echo "RabbitMQ ready."
       containers:
         - name: outbox-worker
-          image: anvil-notify:latest   # ← same image as anvil-notify, different entrypoint
+          image: ghcr.io/jyasuu/anvil-notify:main   # ← same image as anvil-notify, different entrypoint
           imagePullPolicy: IfNotPresent
           command: ["outbox-worker"]
           envFrom:

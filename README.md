@@ -44,10 +44,14 @@ AnvilNotify sits between your business services and your mail provider. Business
                                             └── Retry / DLQ          (exponential backoff)
 
                                           [anvil-notify HTTP API]
-                                            ├── GET  /emails/:id          (delivery status)
-                                            ├── POST /emails/:id/retry    (manual recovery)
-                                            ├── CRUD /templates/cache     (cache management)
-                                            └── CRUD /admin/blocklist     (runtime filtering)
+                                            ├── GET    /emails/:id              (delivery status)
+                                            ├── POST   /emails/:id/retry        (manual recovery)
+                                            ├── GET    /templates               (list all)
+                                            ├── POST   /templates               (create/upsert)
+                                            ├── GET    /templates/:type         (show with bodies)
+                                            ├── PATCH  /templates/:type         (partial update)
+                                            ├── DELETE /template-cache[/:type]  (cache flush)
+                                            └── CRUD   /admin/blocklist         (runtime filtering)
 ```
 
 ### Workspace crates
@@ -282,21 +286,27 @@ The publisher selects an account by setting `"sender_account": "billing"` in the
 
 All endpoints except `/health` and `/ready` require `Authorization: Bearer <api_key>` when `http.api_key` is configured.
 
-| Method   | Path                                        | Description                                              |
-| -------- | ------------------------------------------- | -------------------------------------------------------- |
-| `GET`    | `/health`                                   | Liveness check — always `200` if the process is up       |
-| `GET`    | `/ready`                                    | Readiness probe — performs a live DB ping                |
-| `GET`    | `/emails/:event_id`                         | Delivery status for all recipients in an event           |
-| `GET`    | `/emails/:event_id/recipients/:email`       | Delivery status for one recipient                        |
-| `POST`   | `/emails/:event_id/retry`                   | Reset all `FAILED` recipients → `PENDING` and re-enqueue |
-| `POST`   | `/emails/:event_id/recipients/:email/retry` | Reset one `FAILED` recipient and re-enqueue              |
-| `DELETE` | `/templates/:event_type/cache`              | Evict one template from the in-memory cache              |
-| `DELETE` | `/templates/cache`                          | Clear the entire template cache                          |
-| `GET`    | `/admin/blocklist`                          | List all active block/allow-list entries                 |
-| `POST`   | `/admin/blocklist`                          | Add or reactivate a block/allow-list entry               |
-| `DELETE` | `/admin/blocklist/:id`                      | Soft-delete an entry by ID                               |
-| `DELETE` | `/admin/blocklist/cache`                    | Evict the blocklist cache (triggers lazy reload)         |
-| `POST`   | `/admin/blocklist/cache`                    | Evict and eagerly reload the blocklist cache             |
+| Method    | Path                                        | Description                                              |
+| --------- | ------------------------------------------- | -------------------------------------------------------- |
+| `GET`     | `/health`                                   | Liveness check — always `200` if the process is up       |
+| `GET`     | `/ready`                                    | Readiness probe — performs a live DB ping                |
+| `GET`     | `/emails/:event_id`                         | Delivery status for all recipients in an event           |
+| `GET`     | `/emails/:event_id/recipients/:email`       | Delivery status for one recipient                        |
+| `POST`    | `/emails/:event_id/retry`                   | Reset all `FAILED` recipients → `PENDING` and re-enqueue |
+| `POST`    | `/emails/:event_id/recipients/:email/retry` | Reset one `FAILED` recipient and re-enqueue              |
+| `GET`     | `/templates`                                | List all templates (including inactive), no body fields  |
+| `POST`    | `/templates`                                | Create or upsert a template                              |
+| `GET`     | `/templates/:event_type`                    | Full content of all channel variants for one event type  |
+| `PATCH`   | `/templates/:event_type`                    | Partial update — toggle `active`, change subject, etc.   |
+| `DELETE`  | `/template-cache`                           | Clear the entire template cache                          |
+| `DELETE`  | `/template-cache/:event_type`               | Evict one event type from the template cache             |
+| `GET`     | `/admin/blocklist`                          | List all active block/allow-list entries                 |
+| `POST`    | `/admin/blocklist`                          | Add or reactivate a block/allow-list entry               |
+| `DELETE`  | `/admin/blocklist/:id`                      | Soft-delete an entry by ID                               |
+| `DELETE`  | `/admin/blocklist/cache`                    | Evict the blocklist cache (triggers lazy reload)         |
+| `POST`    | `/admin/blocklist/cache`                    | Evict and eagerly reload the blocklist cache             |
+
+> **Note:** Cache routes use the `/template-cache` prefix (not `/templates/…/cache`) to avoid path-parameter ambiguity with `GET /templates/:event_type`.
 
 > **Kubernetes probes:** use `/ready` for `readinessProbe` (it pings the DB) and `/health` for `livenessProbe` (shallow process check only).
 
@@ -304,32 +314,99 @@ All endpoints except `/health` and `/ready` require `Authorization: Bearer <api_
 
 ## 🎨 Templates
 
-Templates are stored in the `notification_template` table. Add a new template with a SQL `INSERT` — no code change or service restart required:
+Templates are stored in the `notification_template` table and managed via the HTTP API or `anctl`. No code change or service restart is required.
 
-```sql
-INSERT INTO notification_template (type, channel, subject, body_html, body_text)
-VALUES (
-  'INVOICE_READY',
-  'email',
-  'Your invoice #{{ invoiceId }} is ready',
-  '<h1>Hi {{ name }},</h1><p>Invoice <strong>#{{ invoiceId }}</strong> for ${{ amount }} is ready.</p>',
-  'Hi {{ name }}, invoice #{{ invoiceId }} for ${{ amount }} is ready.'
-);
+### Template file format (`.j2`)
+
+Create a single `.j2` file with three named sections separated by Jinja2 comment markers:
+
+```jinja
+{# subject #}
+Order {{ orderId }} confirmed
+
+{# body_text #}
+Hi {{ name }}, your order {{ orderId }} has been confirmed.
+
+{# body_html #}
+<h1>Hi {{ name }},</h1>
+<p>Your order <strong>{{ orderId }}</strong> has been confirmed.</p>
 ```
 
-Then flush the cache so the service picks it up immediately:
+Sections may appear in any order. Whitespace around each section's content is trimmed.
+
+### Creating and updating templates
 
 ```bash
-curl -X DELETE http://localhost:8080/templates/INVOICE_READY/cache \
-  -H "Authorization: Bearer your-api-key"
+# Upload a new template (validates Jinja2 syntax before sending)
+anctl template create --event-type ORDER_CONFIRMATION --file order.j2
 
-# or via the CLI
-cargo run --bin anctl -- template flush --event-type INVOICE_READY
+# Dry-run: parse and validate without uploading
+anctl template create --event-type ORDER_CONFIRMATION --file order.j2 --dry-run
+
+# Stage a template as inactive (won't be picked up by the consumer)
+anctl template create --event-type ORDER_CONFIRMATION --file order.j2 --inactive
+
+# Activate a staged template
+anctl template activate ORDER_CONFIRMATION
+
+# Deactivate without deleting
+anctl template activate ORDER_CONFIRMATION --disable
+
+# Or use the API directly
+curl -X POST http://localhost:8080/templates \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "event_type": "ORDER_CONFIRMATION",
+    "channel":    "email",
+    "subject":    "Order {{ orderId }} confirmed",
+    "body_html":  "<h1>Hi {{ name }}</h1>",
+    "body_text":  "Hi {{ name }}, order {{ orderId }} confirmed.",
+    "active":     true
+  }'
+
+# Partial update (e.g. toggle active only)
+curl -X PATCH http://localhost:8080/templates/ORDER_CONFIRMATION \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"active": true}'
 ```
 
-Templates use [minijinja](https://docs.rs/minijinja/latest/minijinja/) (Jinja2-compatible) syntax. HTML templates are **auto-escaped** — `{{ user_input }}` is safe from XSS by default. Plain-text templates (subject, body_text) have escaping disabled.
+### Inspecting templates
 
-Built-in templates (`ORDER_CONFIRMATION`, `PASSWORD_RESET`, `WELCOME`, `GENERIC_TEXT`, `GENERIC_HTML`) are seeded and kept up to date by migrations.
+```bash
+# List all templates (table or JSON)
+anctl template list
+anctl template list --output json | jq '.[] | select(.active == false)'
+
+# Show full content of one template
+anctl template show ORDER_CONFIRMATION
+anctl template show ORDER_CONFIRMATION --output json | jq '.templates[0].body_html'
+```
+
+### Cache management
+
+The service caches templates in memory for 5 minutes. After uploading via the API or `anctl`, the cache is invalidated automatically. To force a flush manually:
+
+```bash
+# Flush one event type
+anctl template flush --event-type ORDER_CONFIRMATION
+
+# Flush all
+anctl template flush
+
+# Or via the API
+curl -X DELETE http://localhost:8080/template-cache/ORDER_CONFIRMATION \
+  -H "Authorization: Bearer your-api-key"
+```
+
+> **Note:** The cache endpoints are at `/template-cache/…`, not `/templates/…/cache`, to avoid path-parameter conflicts with `GET /templates/:event_type`.
+
+### Template syntax
+
+Templates use [minijinja](https://docs.rs/minijinja/latest/minijinja/) (Jinja2-compatible) syntax. HTML templates are **auto-escaped** — `{{ user_input }}` is safe from XSS by default. Plain-text templates (`subject`, `body_text`) have escaping disabled.
+
+Built-in templates (`ORDER_CONFIRMATION`, `PASSWORD_RESET`, `WELCOME`, `GENERIC_TEXT`, `GENERIC_HTML`) are seeded by migrations.
 
 ---
 
@@ -355,7 +432,16 @@ anctl send --event-type ORDER_CONFIRMATION --to user@example.com --payload '{}'
 
 # Manage templates
 anctl template list
+anctl template list --output json
+anctl template show ORDER_CONFIRMATION
+anctl template show ORDER_CONFIRMATION --output json
+anctl template create --event-type ORDER_CONFIRMATION --file order.j2
+anctl template create --event-type ORDER_CONFIRMATION --file order.j2 --dry-run
+anctl template create --event-type ORDER_CONFIRMATION --file order.j2 --inactive
+anctl template activate ORDER_CONFIRMATION
+anctl template activate ORDER_CONFIRMATION --disable
 anctl template flush --event-type ORDER_CONFIRMATION
+anctl template flush
 
 # Manage the runtime blocklist
 anctl blocklist list

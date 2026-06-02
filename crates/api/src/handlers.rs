@@ -471,8 +471,213 @@ pub async fn get_recipient_status(
 
 // ── Template cache ────────────────────────────────────────────────────────────
 
-/// DELETE /templates/:event_type/cache
+/// GET /templates
 ///
+/// Returns all rows from `notification_template` (including inactive) ordered
+/// by type then channel.  Body fields (`body_html`, `body_text`) are
+/// intentionally omitted from the list response — use `GET /templates/{event_type}`
+/// to retrieve the full content of a specific template.
+pub async fn list_templates(State(state): State<ApiState>) -> Result<impl IntoResponse, ApiError> {
+    let rows = state.template_store.list().await?;
+    let body: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "event_type": r.event_type,
+                "channel":    r.channel,
+                "subject":    r.subject,
+                "version":    r.version,
+                "active":     r.active,
+                "updated_at": r.updated_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "templates": body })))
+}
+
+/// GET /templates/:event_type
+///
+/// Returns all channel variants for a single event type (including inactive).
+/// Returns 404 when no rows exist for that type.
+pub async fn get_template(
+    State(state): State<ApiState>,
+    Path(event_type): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let rows = state.template_store.get(&event_type).await?;
+    if rows.is_empty() {
+        return Err(ApiError(AppError::NotFound(format!(
+            "No template found for event type '{event_type}'"
+        ))));
+    }
+    let body: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "event_type": r.event_type,
+                "channel":    r.channel,
+                "subject":    r.subject,
+                "body_html":  r.body_html,
+                "body_text":  r.body_text,
+                "version":    r.version,
+                "active":     r.active,
+                "updated_at": r.updated_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "templates": body })))
+}
+
+/// POST /templates
+///
+/// Upsert a template row for `(event_type, channel)`.  Inserts on first call;
+/// on subsequent calls updates the content and bumps `version` when any field
+/// has changed (no-op when content is identical, matching the migration logic).
+///
+/// Request body:
+/// ```json
+/// {
+///   "event_type": "ORDER_CONFIRMATION",
+///   "channel":    "email",
+///   "subject":    "Order {{ orderId }} confirmed",
+///   "body_html":  "<h1>Hi {{ name }}</h1>...",
+///   "body_text":  "Hi {{ name }}, ...",
+///   "active":     true
+/// }
+/// ```
+/// `channel` defaults to `"email"` when omitted.
+/// `active` defaults to `true` when omitted.
+///
+/// Returns:
+/// * 201 — new row inserted
+/// * 200 — existing row updated (or unchanged)
+/// * 400 — validation failure
+pub async fn upsert_template(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, ApiError> {
+    let event_type = body
+        .get("event_type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError(AppError::permanent_mailer("missing field 'event_type'")))?
+        .trim();
+    let channel = body
+        .get("channel")
+        .and_then(|v| v.as_str())
+        .unwrap_or("email")
+        .trim();
+    let subject = body
+        .get("subject")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError(AppError::permanent_mailer("missing field 'subject'")))?
+        .trim();
+    let body_html = body
+        .get("body_html")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError(AppError::permanent_mailer("missing field 'body_html'")))?
+        .trim();
+    let body_text = body
+        .get("body_text")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError(AppError::permanent_mailer("missing field 'body_text'")))?
+        .trim();
+    let active = body.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    if event_type.is_empty() {
+        return Err(ApiError(AppError::permanent_mailer(
+            "'event_type' must not be empty",
+        )));
+    }
+    if channel.is_empty() {
+        return Err(ApiError(AppError::permanent_mailer(
+            "'channel' must not be empty",
+        )));
+    }
+    if subject.is_empty() {
+        return Err(ApiError(AppError::permanent_mailer(
+            "'subject' must not be empty",
+        )));
+    }
+
+    let (version, inserted) = state
+        .template_store
+        .upsert(event_type, channel, subject, body_html, body_text, active)
+        .await?;
+
+    let status = if inserted {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+
+    Ok((
+        status,
+        Json(json!({
+            "event_type": event_type,
+            "channel":    channel,
+            "version":    version,
+            "active":     active,
+            "inserted":   inserted,
+        })),
+    ))
+}
+
+/// PATCH /templates/:event_type
+///
+/// Partially update a template row identified by `(event_type, channel)`.
+/// Only the fields present in the request body are applied; absent fields are
+/// left unchanged.  The update is a single atomic `UPDATE … RETURNING` — no
+/// read-then-write race condition.
+///
+/// Request body (all fields optional):
+/// ```json
+/// {
+///   "channel":   "email",
+///   "subject":   "New subject line",
+///   "body_html": "<p>Updated HTML</p>",
+///   "body_text": "Updated text",
+///   "active":    true
+/// }
+/// ```
+/// `channel` defaults to `"email"` when omitted.
+///
+/// Returns 404 when the `(event_type, channel)` row does not exist —
+/// use `POST /templates` to create it first.
+pub async fn patch_template(
+    State(state): State<ApiState>,
+    Path(event_type): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, ApiError> {
+    let channel = body
+        .get("channel")
+        .and_then(|v| v.as_str())
+        .unwrap_or("email")
+        .trim();
+
+    // Extract only the fields that were explicitly supplied.
+    let subject = body.get("subject").and_then(|v| v.as_str());
+    let body_html = body.get("body_html").and_then(|v| v.as_str());
+    let body_text = body.get("body_text").and_then(|v| v.as_str());
+    let active = body.get("active").and_then(|v| v.as_bool());
+
+    let result = state
+        .template_store
+        .patch(&event_type, channel, subject, body_html, body_text, active)
+        .await?;
+
+    match result {
+        None => Err(ApiError(AppError::NotFound(format!(
+            "No template found for event type '{event_type}' channel '{channel}'"
+        )))),
+        Some((version, active)) => Ok(Json(json!({
+            "event_type": event_type,
+            "channel":    channel,
+            "version":    version,
+            "active":     active,
+        }))),
+    }
+}
+
+/// DELETE /template-cache/:event_type///
 /// Evicts one entry from the in-memory template cache, forcing the next
 /// delivery attempt for that event type to re-fetch from the database.
 /// Use this after editing a row in the `notification_template` table so the change
