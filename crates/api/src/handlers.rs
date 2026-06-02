@@ -474,8 +474,9 @@ pub async fn get_recipient_status(
 /// GET /templates
 ///
 /// Returns all rows from `notification_template` (including inactive) ordered
-/// by type then channel.  Inactive rows are included so operators can inspect
-/// the full table state without direct DB access.
+/// by type then channel.  Body fields (`body_html`, `body_text`) are
+/// intentionally omitted from the list response — use `GET /templates/{event_type}`
+/// to retrieve the full content of a specific template.
 pub async fn list_templates(State(state): State<ApiState>) -> Result<impl IntoResponse, ApiError> {
     let rows = state.template_store.list().await?;
     let body: Vec<_> = rows
@@ -620,8 +621,78 @@ pub async fn upsert_template(
     ))
 }
 
-/// DELETE /templates/:event_type/cache
+/// PATCH /templates/:event_type
 ///
+/// Partially update a template row identified by `(event_type, channel)`.
+/// Only the fields present in the request body are applied; absent fields are
+/// left unchanged.  This is the intended path for toggling `active` without
+/// re-uploading the full template body.
+///
+/// Request body (all fields optional):
+/// ```json
+/// {
+///   "channel": "email",
+///   "subject": "New subject line",
+///   "body_html": "<p>Updated HTML</p>",
+///   "body_text": "Updated text",
+///   "active": true
+/// }
+/// ```
+/// `channel` defaults to `"email"` when omitted.
+///
+/// Returns 404 when the `(event_type, channel)` row does not exist —
+/// use `POST /templates` to create it first.
+pub async fn patch_template(
+    State(state): State<ApiState>,
+    Path(event_type): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, ApiError> {
+    let channel = body
+        .get("channel")
+        .and_then(|v| v.as_str())
+        .unwrap_or("email")
+        .trim();
+
+    // Load the current row so we can apply partial updates on top of it.
+    let rows = state.template_store.get(&event_type).await?;
+    let current = rows.iter().find(|r| r.channel == channel).ok_or_else(|| {
+        ApiError(AppError::NotFound(format!(
+            "No template found for event type '{event_type}' channel '{channel}'"
+        )))
+    })?;
+
+    // Apply only the fields that were supplied.
+    let subject = body
+        .get("subject")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&current.subject);
+    let body_html = body
+        .get("body_html")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&current.body_html);
+    let body_text = body
+        .get("body_text")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&current.body_text);
+    let active = body
+        .get("active")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(current.active);
+
+    let (version, _inserted) = state
+        .template_store
+        .upsert(&event_type, channel, subject, body_html, body_text, active)
+        .await?;
+
+    Ok(Json(json!({
+        "event_type": event_type,
+        "channel":    channel,
+        "version":    version,
+        "active":     active,
+    })))
+}
+
+/// DELETE /template-cache/:event_type///
 /// Evicts one entry from the in-memory template cache, forcing the next
 /// delivery attempt for that event type to re-fetch from the database.
 /// Use this after editing a row in the `notification_template` table so the change

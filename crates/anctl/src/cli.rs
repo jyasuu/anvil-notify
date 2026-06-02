@@ -365,6 +365,23 @@ pub enum TemplateAction {
         inactive: bool,
     },
 
+    /// Activate or deactivate a template without re-uploading it.
+    ///
+    /// Calls `PATCH /templates/{event_type}` with just `{"active": true/false}`.
+    /// The template content is left unchanged.
+    Activate {
+        /// Event type key, e.g. ORDER_CONFIRMATION
+        event_type: String,
+
+        /// Channel (default: email).
+        #[arg(long, short, default_value = "email")]
+        channel: String,
+
+        /// Deactivate instead of activate.
+        #[arg(long)]
+        disable: bool,
+    },
+
     /// Evict one or all templates from the in-memory cache.
     Flush {
         /// Specific event type to evict. Omit to flush all.

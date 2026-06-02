@@ -183,7 +183,7 @@ fn maybe_auth(req: reqwest::RequestBuilder, cfg: &CliConfig) -> reqwest::Request
 
 // ── subcommand dispatch ───────────────────────────────────────────────────────
 
-pub async fn run(args: TemplateArgs, cfg: CliConfig, _fmt: OutputFormat) -> Result<()> {
+pub async fn run(args: TemplateArgs, cfg: CliConfig, fmt: OutputFormat) -> Result<()> {
     match args.action {
         // ── list: GET /templates ───────────────────────────────────────────
         TemplateAction::List => {
@@ -219,7 +219,10 @@ pub async fn run(args: TemplateArgs, cfg: CliConfig, _fmt: OutputFormat) -> Resu
                 })
                 .collect();
 
-            output::print_table(&rows);
+            match fmt {
+                OutputFormat::Json => output::print_json(&rows),
+                OutputFormat::Table => output::print_table(&rows),
+            }
         }
 
         // ── show: GET /templates/{event_type} ──────────────────────────────
@@ -361,12 +364,49 @@ pub async fn run(args: TemplateArgs, cfg: CliConfig, _fmt: OutputFormat) -> Resu
             }
         }
 
-        // ── flush: DELETE /templates[/{event_type}]/cache ──────────────────
+        // ── activate: PATCH /templates/{event_type} ────────────────────────
+        TemplateAction::Activate {
+            event_type,
+            channel,
+            disable,
+        } => {
+            let active = !disable;
+            let (client, base) = build_client(&cfg);
+            let req = maybe_auth(
+                client
+                    .patch(format!("{base}/templates/{event_type}"))
+                    .json(&serde_json::json!({
+                        "channel": channel,
+                        "active":  active,
+                    })),
+                &cfg,
+            );
+
+            let resp = req.send().await.context("HTTP request failed")?;
+            let status = resp.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                bail!(
+                    "No template found for '{event_type}' ({channel}). \
+                     Create it first with `anctl template create`."
+                );
+            }
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                bail!("Activate failed (HTTP {status}): {body}");
+            }
+
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            let version = body.get("version").and_then(|v| v.as_i64()).unwrap_or(0);
+            let label = if active { "activated" } else { "deactivated" };
+            println!("✓ Template {label} (v{version}, HTTP {status})");
+        }
+
+        // ── flush: DELETE /template-cache[/{event_type}] ──────────────────
         TemplateAction::Flush { event_type } => {
             let (client, base) = build_client(&cfg);
             let url = match &event_type {
-                Some(et) => format!("{base}/templates/{et}/cache"),
-                None => format!("{base}/templates/cache"),
+                Some(et) => format!("{base}/template-cache/{et}"),
+                None => format!("{base}/template-cache"),
             };
 
             let resp = maybe_auth(client.delete(&url), &cfg)
