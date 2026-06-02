@@ -101,6 +101,7 @@ dependencies = [
  "dialoguer",
  "indicatif",
  "lapin",
+ "minijinja",
  "reqwest",
  "serde",
  "serde_json",

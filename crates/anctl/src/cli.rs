@@ -354,6 +354,15 @@ pub enum TemplateAction {
         /// Skip the confirmation prompt.
         #[arg(long, short = 'y')]
         yes: bool,
+
+        /// Upload the template with active = false.
+        ///
+        /// The template is stored in the DB but will not be picked up by the
+        /// consumer until it is re-uploaded without this flag (or manually
+        /// activated in the DB).  Useful for staging a template before a
+        /// coordinated deploy.
+        #[arg(long)]
+        inactive: bool,
     },
 
     /// Evict one or all templates from the in-memory cache.

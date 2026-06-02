@@ -7,7 +7,7 @@ pub use notification_log::{
     EmailInsertPendingArgs, EmailNotificationStore, EventDeliveryDetail, InsertResult,
     NotificationStore, CHANNEL_EMAIL,
 };
-pub use template_store::{EmailTemplate, NotificationTemplate, TemplateStore};
+pub use template_store::{EmailTemplate, NotificationTemplate, TemplateRow, TemplateStore};
 
 pub mod block_list_store;
 pub use block_list_store::{BlockListEntry, BlockListStore};
