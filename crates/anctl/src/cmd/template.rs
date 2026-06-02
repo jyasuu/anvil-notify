@@ -243,24 +243,30 @@ pub async fn run(args: TemplateArgs, cfg: CliConfig, fmt: OutputFormat) -> Resul
             }
 
             let json: serde_json::Value = resp.json().await.context("Invalid JSON response")?;
-            let templates = json
-                .get("templates")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| anyhow::anyhow!("Unexpected response shape"))?;
 
-            for t in templates {
-                let channel = t.get("channel").and_then(|v| v.as_str()).unwrap_or("?");
-                let version = t.get("version").and_then(|v| v.as_i64()).unwrap_or(0);
-                let active = t.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
-                let subject = t.get("subject").and_then(|v| v.as_str()).unwrap_or("");
-                let html = t.get("body_html").and_then(|v| v.as_str()).unwrap_or("");
-                let text = t.get("body_text").and_then(|v| v.as_str()).unwrap_or("");
+            match fmt {
+                OutputFormat::Json => output::print_json(&json),
+                OutputFormat::Table => {
+                    let templates = json
+                        .get("templates")
+                        .and_then(|v| v.as_array())
+                        .ok_or_else(|| anyhow::anyhow!("Unexpected response shape"))?;
 
-                println!("── {event_type} / {channel}  (v{version}, active={active}) ──");
-                println!("Subject:\n{subject}\n");
-                println!("HTML body:\n{html}\n");
-                println!("Text body:\n{text}");
-                println!("{}", "─".repeat(60));
+                    for t in templates {
+                        let channel = t.get("channel").and_then(|v| v.as_str()).unwrap_or("?");
+                        let version = t.get("version").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let active = t.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let subject = t.get("subject").and_then(|v| v.as_str()).unwrap_or("");
+                        let html = t.get("body_html").and_then(|v| v.as_str()).unwrap_or("");
+                        let text = t.get("body_text").and_then(|v| v.as_str()).unwrap_or("");
+
+                        println!("── {event_type} / {channel}  (v{version}, active={active}) ──");
+                        println!("Subject:\n{subject}\n");
+                        println!("HTML body:\n{html}\n");
+                        println!("Text body:\n{text}");
+                        println!("{}", "─".repeat(60));
+                    }
+                }
             }
         }
 

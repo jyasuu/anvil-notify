@@ -625,17 +625,17 @@ pub async fn upsert_template(
 ///
 /// Partially update a template row identified by `(event_type, channel)`.
 /// Only the fields present in the request body are applied; absent fields are
-/// left unchanged.  This is the intended path for toggling `active` without
-/// re-uploading the full template body.
+/// left unchanged.  The update is a single atomic `UPDATE … RETURNING` — no
+/// read-then-write race condition.
 ///
 /// Request body (all fields optional):
 /// ```json
 /// {
-///   "channel": "email",
-///   "subject": "New subject line",
+///   "channel":   "email",
+///   "subject":   "New subject line",
 ///   "body_html": "<p>Updated HTML</p>",
 ///   "body_text": "Updated text",
-///   "active": true
+///   "active":    true
 /// }
 /// ```
 /// `channel` defaults to `"email"` when omitted.
@@ -653,43 +653,28 @@ pub async fn patch_template(
         .unwrap_or("email")
         .trim();
 
-    // Load the current row so we can apply partial updates on top of it.
-    let rows = state.template_store.get(&event_type).await?;
-    let current = rows.iter().find(|r| r.channel == channel).ok_or_else(|| {
-        ApiError(AppError::NotFound(format!(
-            "No template found for event type '{event_type}' channel '{channel}'"
-        )))
-    })?;
+    // Extract only the fields that were explicitly supplied.
+    let subject = body.get("subject").and_then(|v| v.as_str());
+    let body_html = body.get("body_html").and_then(|v| v.as_str());
+    let body_text = body.get("body_text").and_then(|v| v.as_str());
+    let active = body.get("active").and_then(|v| v.as_bool());
 
-    // Apply only the fields that were supplied.
-    let subject = body
-        .get("subject")
-        .and_then(|v| v.as_str())
-        .unwrap_or(&current.subject);
-    let body_html = body
-        .get("body_html")
-        .and_then(|v| v.as_str())
-        .unwrap_or(&current.body_html);
-    let body_text = body
-        .get("body_text")
-        .and_then(|v| v.as_str())
-        .unwrap_or(&current.body_text);
-    let active = body
-        .get("active")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(current.active);
-
-    let (version, _inserted) = state
+    let result = state
         .template_store
-        .upsert(&event_type, channel, subject, body_html, body_text, active)
+        .patch(&event_type, channel, subject, body_html, body_text, active)
         .await?;
 
-    Ok(Json(json!({
-        "event_type": event_type,
-        "channel":    channel,
-        "version":    version,
-        "active":     active,
-    })))
+    match result {
+        None => Err(ApiError(AppError::NotFound(format!(
+            "No template found for event type '{event_type}' channel '{channel}'"
+        )))),
+        Some((version, active)) => Ok(Json(json!({
+            "event_type": event_type,
+            "channel":    channel,
+            "version":    version,
+            "active":     active,
+        }))),
+    }
 }
 
 /// DELETE /template-cache/:event_type///

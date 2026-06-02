@@ -286,4 +286,63 @@ impl TemplateStore {
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
+
+    /// Atomically patch a template row for `(event_type, channel)`.
+    ///
+    /// Only fields supplied as `Some(...)` are written; `None` leaves the
+    /// existing column value unchanged.  `version` is bumped and `updated_at`
+    /// advanced only when the content columns actually change.
+    ///
+    /// Returns `Some((version, active))` for the updated row, or `None` when
+    /// no row exists for `(event_type, channel)`.
+    pub async fn patch(
+        &self,
+        event_type: &str,
+        channel: &str,
+        subject: Option<&str>,
+        body_html: Option<&str>,
+        body_text: Option<&str>,
+        active: Option<bool>,
+    ) -> Result<Option<(i32, bool)>, AppError> {
+        let row = sqlx::query!(
+            r#"
+            UPDATE notification_template
+            SET subject    = COALESCE($3, subject),
+                body_html  = COALESCE($4, body_html),
+                body_text  = COALESCE($5, body_text),
+                active     = COALESCE($6, active),
+                version    = CASE
+                                 WHEN subject   IS DISTINCT FROM COALESCE($3, subject)
+                                   OR body_html IS DISTINCT FROM COALESCE($4, body_html)
+                                   OR body_text IS DISTINCT FROM COALESCE($5, body_text)
+                                 THEN version + 1
+                                 ELSE version
+                             END,
+                updated_at = CASE
+                                 WHEN subject   IS DISTINCT FROM COALESCE($3, subject)
+                                   OR body_html IS DISTINCT FROM COALESCE($4, body_html)
+                                   OR body_text IS DISTINCT FROM COALESCE($5, body_text)
+                                 THEN now()
+                                 ELSE updated_at
+                             END
+            WHERE type = $1 AND channel = $2
+            RETURNING version, active
+            "#,
+            event_type,
+            channel,
+            subject,
+            body_html,
+            body_text,
+            active,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(AppError::Database)?;
+
+        if row.is_some() {
+            self.invalidate(event_type).await;
+        }
+
+        Ok(row.map(|r| (r.version, r.active)))
+    }
 }
