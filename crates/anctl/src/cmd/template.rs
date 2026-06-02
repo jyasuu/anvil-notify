@@ -211,7 +211,7 @@ pub async fn run(args: TemplateArgs, cfg: CliConfig, fmt: OutputFormat) -> Resul
                     Some(TemplateListRow {
                         event_type: t.get("event_type")?.as_str()?.to_owned(),
                         channel: t.get("channel")?.as_str()?.to_owned(),
-                        subject: t.get("subject")?.as_str()?.to_owned(),
+                        subject: output::truncate(t.get("subject")?.as_str()?, 60),
                         version: t.get("version")?.as_i64()?,
                         active: t.get("active")?.as_bool()?,
                         updated_at: t.get("updated_at")?.as_str()?.to_owned(),

@@ -310,7 +310,7 @@ impl TemplateStore {
             SET subject    = COALESCE($3, subject),
                 body_html  = COALESCE($4, body_html),
                 body_text  = COALESCE($5, body_text),
-                active     = COALESCE($6, active),
+                active     = COALESCE($6::boolean, active),
                 version    = CASE
                                  WHEN subject   IS DISTINCT FROM COALESCE($3, subject)
                                    OR body_html IS DISTINCT FROM COALESCE($4, body_html)

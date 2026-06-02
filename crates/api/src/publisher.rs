@@ -37,6 +37,21 @@ pub struct Publisher {
 }
 
 impl Publisher {
+    /// Construct a `Publisher` that holds no AMQP connection.
+    ///
+    /// Calling `publish()` on this instance will always return an error.
+    /// Intended for use in integration tests that exercise handler paths
+    /// which do not call `publish()` (e.g. all template endpoints).
+    #[cfg(any(test, feature = "integration"))]
+    pub fn disconnected() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(None)),
+            amqp_url: String::new(),
+            exchange: String::new(),
+            routing_key: String::new(),
+        }
+    }
+
     pub async fn connect(
         amqp_url: &str,
         exchange: &str,
