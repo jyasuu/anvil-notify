@@ -30,3 +30,4 @@ minijinja = { version = "2", features = ["speedups"] }
 
 base64 = { workspace = true }
 metrics = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt"] }

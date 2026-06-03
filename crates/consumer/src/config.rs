@@ -62,3 +62,24 @@ impl Default for ConsumerConfig {
         }
     }
 }
+
+impl ConsumerConfig {
+    /// Validate that config values are internally consistent.
+    ///
+    /// Returns an error for values that would cause runtime panics or
+    /// deadlocks (e.g. `max_concurrency == 0` would create a
+    /// `Semaphore::new(0)` that can never acquire a permit).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.max_concurrency > 0,
+            "ConsumerConfig.max_concurrency must be > 0, got {}",
+            self.max_concurrency,
+        );
+        anyhow::ensure!(
+            self.max_recipients_per_event > 0,
+            "ConsumerConfig.max_recipients_per_event must be > 0, got {}",
+            self.max_recipients_per_event,
+        );
+        Ok(())
+    }
+}

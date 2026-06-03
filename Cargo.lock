@@ -184,6 +184,7 @@ dependencies = [
  "config",
  "consumer",
  "mailer",
+ "metrics",
  "metrics-exporter-prometheus",
  "openssl",
  "outbox",
@@ -2137,6 +2138,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -4214,6 +4216,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

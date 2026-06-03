@@ -33,6 +33,7 @@ use futures::future::join_all;
 use metrics::{counter, histogram};
 use reqwest::{Client, StatusCode};
 use tokio::time::{sleep, Duration};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
 
 use crate::message::ResolvedAttachment;
@@ -51,27 +52,52 @@ const FETCH_MAX_RETRIES: u32 = 3;
 /// Metadata and expiry checks run before any network calls.
 ///
 /// The returned `Vec` preserves the same order as `refs`.
+///
+/// When `shutdown` is cancelled, in-flight fetches that have not yet started
+/// or are between retry attempts will be skipped.  Already-running HTTP
+/// requests complete under their own timeout (30 s on the shared client)
+/// rather than being torn down — reqwest does not support mid-request
+/// cancellation.
 pub async fn fetch_attachments(
     client: &Client,
     refs: &[AttachmentRef],
     event_timestamp: &chrono::DateTime<chrono::Utc>,
+    shutdown: CancellationToken,
 ) -> Result<Vec<ResolvedAttachment>, AppError> {
-    fetch_attachments_with_limit(client, refs, event_timestamp, MAX_ATTACHMENT_BYTES).await
+    fetch_attachments_with_limit(
+        client,
+        refs,
+        event_timestamp,
+        MAX_ATTACHMENT_BYTES,
+        shutdown,
+    )
+    .await
 }
 
 /// Like [`fetch_attachments`] but with an explicit per-attachment byte cap.
-#[instrument(skip(client, refs, event_timestamp), fields(count = refs.len()))]
+///
+/// Accepts a `CancellationToken` so that the caller can abort in-flight
+/// fetches during graceful shutdown.  Already-running HTTP requests are not
+/// preempted (reqwest does not support mid-request cancellation), but retry
+/// sleeps and the post-fetch error collection are all short-circuited.
+#[instrument(skip(client, refs, event_timestamp, shutdown), fields(count = refs.len()))]
 pub async fn fetch_attachments_with_limit(
     client: &Client,
     refs: &[AttachmentRef],
     event_timestamp: &chrono::DateTime<chrono::Utc>,
     max_bytes: usize,
+    shutdown: CancellationToken,
 ) -> Result<Vec<ResolvedAttachment>, AppError> {
     // ── 1. Validate metadata for every attachment before any network call ─────
     for att_ref in refs {
         att_ref
             .validate(event_timestamp, chrono::Utc::now())
             .map_err(AppError::permanent_mailer)?;
+        if shutdown.is_cancelled() {
+            return Err(AppError::transient_mailer(
+                "shutdown requested during attachment validation",
+            ));
+        }
     }
 
     // ── 2. Fetch all URLs concurrently, each with independent retry ───────────
@@ -79,9 +105,16 @@ pub async fn fetch_attachments_with_limit(
     // `join_all` (not `try_join_all`) is used here so every attachment gets
     // its own retry budget. A transient 5xx on attachment B no longer cancels
     // the already-in-flight fetch for attachment A.
+    //
+    // The shutdown token is forwarded to each retry task so that retry sleeps
+    // are interrupted promptly.  Futures that are mid-HTTP-request when the
+    // token fires will complete normally under the client timeout rather than
+    // being torn down, which is an acceptable trade-off (a few 30 s pauses at
+    // shutdown time are far better than the unbounded join_all wait we had
+    // before).
     let futures: Vec<_> = refs
         .iter()
-        .map(|att_ref| fetch_one_with_retry(client, att_ref, max_bytes))
+        .map(|att_ref| fetch_one_with_retry(client, att_ref, max_bytes, shutdown.clone()))
         .collect();
 
     let results = join_all(futures).await;
@@ -132,15 +165,26 @@ pub async fn fetch_attachments_with_limit(
 ///
 /// Permanent failures (4xx, size exceeded, URL expired) are returned
 /// immediately without consuming retry slots.
+///
+/// When `shutdown` is cancelled during a retry sleep, the current attempt
+/// is aborted with a transient error so the caller can surface the shutdown
+/// signal rather than blocking on a fetch that the service will not complete.
 async fn fetch_one_with_retry(
     client: &Client,
     att_ref: &AttachmentRef,
     max_bytes: usize,
+    shutdown: CancellationToken,
 ) -> Result<ResolvedAttachment, AppError> {
     let mut last_err = None;
     let fetch_start = std::time::Instant::now();
 
     for attempt in 0..=FETCH_MAX_RETRIES {
+        if shutdown.is_cancelled() {
+            return Err(AppError::transient_mailer(format!(
+                "shutdown requested during fetch of '{}'",
+                att_ref.filename
+            )));
+        }
         if attempt > 0 {
             let delay = Duration::from_secs(1u64 << (attempt - 1).min(3));
             warn!(
@@ -150,7 +194,15 @@ async fn fetch_one_with_retry(
                 "Attachment fetch transient failure — retrying"
             );
             counter!("attachment_fetch_retries_total").increment(1);
-            sleep(delay).await;
+            tokio::select! {
+                _ = sleep(delay) => {}
+                _ = shutdown.cancelled() => {
+                    return Err(AppError::transient_mailer(format!(
+                        "shutdown requested during fetch retry of '{}'",
+                        att_ref.filename
+                    )));
+                }
+            }
         }
 
         match fetch_one(client, att_ref, max_bytes).await {

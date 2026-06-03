@@ -432,11 +432,9 @@ impl NotificationStore for EmailNotificationStore {
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 0 {
-            tracing::warn!(
-                %event_id,
-                recipient_id,
-                "mark_sent matched no rows — row may have been deleted or recipient_id is wrong"
-            );
+            return Err(AppError::NotFound(format!(
+                "mark_sent: no row for {event_id}/{recipient_id}"
+            )));
         }
         Ok(())
     }
@@ -471,12 +469,9 @@ impl NotificationStore for EmailNotificationStore {
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 0 {
-            tracing::warn!(
-                %event_id,
-                recipient_id,
-                status,
-                "mark_failed matched no rows — row may have been deleted or recipient_id is wrong"
-            );
+            return Err(AppError::NotFound(format!(
+                "mark_failed: no row for {event_id}/{recipient_id}"
+            )));
         }
         Ok(())
     }
@@ -506,11 +501,9 @@ impl NotificationStore for EmailNotificationStore {
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 0 {
-            tracing::warn!(
-                %event_id,
-                recipient_id,
-                "mark_blocked matched no rows — row may have been deleted or recipient_id is wrong"
-            );
+            return Err(AppError::NotFound(format!(
+                "mark_blocked: no row for {event_id}/{recipient_id}"
+            )));
         }
         Ok(())
     }

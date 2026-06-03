@@ -89,6 +89,11 @@ impl MailRateLimiter {
         }
 
         let per_sec = NonZeroU32::new(cfg.emails_per_second).expect("emails_per_second > 0");
+        if cfg.burst_size == 0 {
+            tracing::warn!(
+                "rate_limit.burst_size is 0 — overriding to 1. Set burst_size >= 1 in config."
+            );
+        }
         let burst = NonZeroU32::new(cfg.burst_size.max(1)).expect("burst_size >= 1");
         let quota = Quota::per_second(per_sec).allow_burst(burst);
         let limiter = RateLimiter::direct(quota);

@@ -358,6 +358,7 @@ pub(crate) async fn handle_delivery(
             &email_opts.attachments,
             &event.timestamp,
             cfg.max_attachment_bytes,
+            shutdown.clone(),
         )
         .await
         {

@@ -74,7 +74,9 @@ async fn main() -> anyhow::Result<()> {
     PrometheusBuilder::new()
         .with_http_listener(metrics_addr)
         .add_global_label("service", "anvil-notify")
-        .set_buckets(&[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0])
+        .set_buckets(&[
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+        ])
         .context("Invalid bucket configuration")?
         .install()
         .context("Failed to install Prometheus metrics exporter")?;
@@ -433,6 +435,7 @@ async fn main() -> anyhow::Result<()> {
         max_rl_waits: cfg.amqp.max_rl_waits,
         max_recipients_per_event: cfg.amqp.max_recipients_per_event,
     };
+    consumer_cfg.validate().context("Invalid consumer config")?;
 
     // Warn when the product of max_concurrency and max_attachment_bytes exceeds
     // 512 MiB.  At that point a single burst of large-attachment events can OOM
