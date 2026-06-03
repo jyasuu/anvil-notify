@@ -73,9 +73,23 @@ async fn main() -> anyhow::Result<()> {
         .context("Invalid metrics port")?;
     PrometheusBuilder::new()
         .with_http_listener(metrics_addr)
+        .add_global_label("service", "anvil-notify")
+        .set_buckets(&[
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+        ])
+        .context("Invalid bucket configuration")?
         .install()
         .context("Failed to install Prometheus metrics exporter")?;
     info!(addr = %metrics_addr, "Prometheus /metrics endpoint listening");
+
+    // Bootstrap all metrics with zero values so they appear immediately
+    // in the /metrics output rather than waiting for first use.
+    api::bootstrap_metrics();
+    consumer::bootstrap_metrics();
+    mailer::bootstrap_metrics();
+    outbox::bootstrap_metrics();
+    metrics::counter!("stale_pending_reaped_total").increment(0);
+    info!("All metrics bootstrapped");
 
     // ── Database ──────────────────────────────────────────────────────────────
     let pool = PgPoolOptions::new()
@@ -360,6 +374,7 @@ async fn main() -> anyhow::Result<()> {
                 _ = interval.tick() => {
                     match reaper_store.reap_stale_pending(reaper_timeout).await {
                         Ok(ids) if !ids.is_empty() => {
+                            metrics::counter!("stale_pending_reaped_total").increment(ids.len() as u64);
                             let event_ids: Vec<String> =
                                 ids.iter().map(|id| id.to_string()).collect();
                             tracing::warn!(
@@ -420,6 +435,7 @@ async fn main() -> anyhow::Result<()> {
         max_rl_waits: cfg.amqp.max_rl_waits,
         max_recipients_per_event: cfg.amqp.max_recipients_per_event,
     };
+    consumer_cfg.validate().context("Invalid consumer config")?;
 
     // Warn when the product of max_concurrency and max_attachment_bytes exceeds
     // 512 MiB.  At that point a single burst of large-attachment events can OOM

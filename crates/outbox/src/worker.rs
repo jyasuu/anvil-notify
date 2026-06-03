@@ -372,28 +372,14 @@ async fn publish_and_mark(
     let recipients: Vec<Recipient> = serde_json::from_value(promote_recipients(&row.payload))
         .context("outbox row has malformed recipients field — skipping")?;
 
-    let from_override: Option<FromOverride> = row
-        .payload
-        .get("from_override")
-        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    let from_override: Option<FromOverride> = deserialize_optional(&row.payload, "from_override");
 
-    let attachments = row
-        .payload
-        .get("attachments")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
+    let attachments: Vec<common::AttachmentRef> =
+        deserialize_optional(&row.payload, "attachments").unwrap_or_default();
 
-    let cc: Vec<Recipient> = row
-        .payload
-        .get("cc")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
+    let cc: Vec<Recipient> = deserialize_optional(&row.payload, "cc").unwrap_or_default();
 
-    let bcc: Vec<Recipient> = row
-        .payload
-        .get("bcc")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
+    let bcc: Vec<Recipient> = deserialize_optional(&row.payload, "bcc").unwrap_or_default();
 
     let sender_account: Option<String> = row
         .payload
@@ -401,23 +387,12 @@ async fn publish_and_mark(
         .and_then(|v| v.as_str())
         .map(str::to_owned);
 
-    let send_mode: SendMode = row
-        .payload
-        .get("send_mode")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default(); // defaults to SendMode::Individual
+    let send_mode: SendMode = deserialize_optional(&row.payload, "send_mode").unwrap_or_default();
 
-    let group_retry_mode: GroupRetryMode = row
-        .payload
-        .get("group_retry_mode")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default(); // defaults to GroupRetryMode::Whole
+    let group_retry_mode: GroupRetryMode =
+        deserialize_optional(&row.payload, "group_retry_mode").unwrap_or_default();
 
-    let metadata: Metadata = row
-        .payload
-        .get("metadata")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
+    let metadata: Metadata = deserialize_optional(&row.payload, "metadata").unwrap_or_default();
 
     let template_payload = row
         .payload
@@ -641,6 +616,34 @@ fn append_heartbeat_param(url: &str, heartbeat_secs: u16) -> String {
         format!("{url}&heartbeat={heartbeat_secs}")
     } else {
         format!("{url}?heartbeat={heartbeat_secs}")
+    }
+}
+
+/// Deserialize an optional field from an outbox payload, logging a warning
+/// when the field is present but malformed.
+///
+/// Returns `None` when the field is absent or fails to deserialize — the
+/// caller supplies a fallback via `unwrap_or(default)` or similar.  The
+/// warning ensures a malformed field (e.g. a publisher write bug) is visible
+/// in the logs without aborting the publish of other outbox rows.
+fn deserialize_optional<T: serde::de::DeserializeOwned>(
+    payload: &serde_json::Value,
+    key: &str,
+) -> Option<T> {
+    match payload.get(key) {
+        None => None,
+        Some(v) => match serde_json::from_value(v.clone()) {
+            Ok(val) => Some(val),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    key,
+                    event_type = %payload.get("event_type").and_then(|v| v.as_str()).unwrap_or("?"),
+                    "Outbox payload field is present but malformed — using default"
+                );
+                None
+            }
+        },
     }
 }
 

@@ -105,6 +105,7 @@ services:
     ports:
       - "${RABBITMQ_AMQP_PORT:-5672}:5672"
       - "${RABBITMQ_MGMT_PORT:-15672}:15672"
+      - "${RABBITMQ_PROMETHEUS_PORT:-15692}:15692"
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     networks:
@@ -190,10 +191,14 @@ services:
       AN__OUTBOX__ROUTING_KEY: ${AMQP_ROUTING_KEY:-email.requested}
       AN__OUTBOX__POLL_INTERVAL_MS: ${OUTBOX_POLL_INTERVAL_MS:-1000}
       AN__OUTBOX__BATCH_SIZE: ${OUTBOX_BATCH_SIZE:-50}
+      AN__OUTBOX__METRICS_PORT: 9092
       RUST_LOG: ${RUST_LOG:-info}
       LOG_FORMAT: pretty
+    ports:
+      - "${OUTBOX_METRICS_PORT:-9092}:9092"
     networks:
       - business
+      - observability
 
   # ── Prometheus ────────────────────────────────────────────────────────────
   prometheus:

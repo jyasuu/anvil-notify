@@ -135,6 +135,34 @@
     },
 
     {
+      "id": 19,
+      "title": "Stale-PENDING reaped",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null },
+            { "color": "yellow", "value": 1 },
+            { "color": "red", "value": 10 }
+          ]},
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "auto", "textMode": "auto", "colorMode": "background", "graphMode": "area" },
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "expr": "sum(stale_pending_reaped_total)",
+        "legendFormat": "reaped",
+        "refId": "A"
+      }]
+    },
+
+    {
       "id": 5,
       "title": "Send throughput (rate/min)",
       "type": "timeseries",
@@ -152,7 +180,10 @@
           { "matcher": { "id": "byName", "options": "sent" }, "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] }
         ]
       },
-      "options": { "legend": { "calcs": ["rate"], "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "options": {
+        "legend": { "calcs": [], "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
@@ -226,7 +257,7 @@
         },
         "overrides": []
       },
-      "options": { "legend": { "calcs": ["rate"], "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "options": { "legend": { "calcs": [], "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
       "targets": [{
         "datasource": { "type": "prometheus", "uid": "${datasource}" },
         "expr": "sum by (reason) (rate(emails_failed_total[5m])) * 60",
@@ -249,7 +280,7 @@
         },
         "overrides": []
       },
-      "options": { "legend": { "calcs": ["rate"], "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "options": { "legend": { "calcs": [], "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
       "targets": [{
         "datasource": { "type": "prometheus", "uid": "${datasource}" },
         "expr": "sum by (event_type) (rate(emails_sent_total[1m])) * 60",
@@ -280,7 +311,7 @@
         },
         "overrides": []
       },
-      "options": { "legend": { "calcs": ["rate"], "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "options": { "legend": { "calcs": [], "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
       "targets": [{
         "datasource": { "type": "prometheus", "uid": "${datasource}" },
         "expr": "sum by (event_type) (rate(email_rate_limit_waits_total[1m])) * 60",
@@ -368,7 +399,7 @@
           { "matcher": { "id": "byName", "options": "transient_failure" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] }
         ]
       },
-      "options": { "legend": { "calcs": ["rate"], "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "options": { "legend": { "calcs": [], "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
       "targets": [{
         "datasource": { "type": "prometheus", "uid": "${datasource}" },
         "expr": "sum by (result) (rate(attachment_fetch_total[5m])) * 60",
@@ -428,7 +459,7 @@
         },
         "overrides": []
       },
-      "options": { "legend": { "calcs": ["rate"], "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "options": { "legend": { "calcs": [], "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
       "targets": [{
         "datasource": { "type": "prometheus", "uid": "${datasource}" },
         "expr": "sum(rate(attachment_fetch_retries_total[1m])) * 60",
@@ -462,7 +493,7 @@
           { "matcher": { "id": "byName", "options": "failed" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] }
         ]
       },
-      "options": { "legend": { "calcs": ["rate"], "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "options": { "legend": { "calcs": [], "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
@@ -527,7 +558,7 @@
         },
         "overrides": []
       },
-      "options": { "legend": { "calcs": ["rate"], "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "options": { "legend": { "calcs": [], "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
       "targets": [{
         "datasource": { "type": "prometheus", "uid": "${datasource}" },
         "expr": "sum(rate(api_send_email_total[1m])) * 60",
@@ -550,18 +581,18 @@
         },
         "overrides": []
       },
-      "options": { "legend": { "calcs": ["rate"], "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "options": { "legend": { "calcs": [], "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(email_mark_sent_failed_total[1m])) * 60",
-          "legendFormat": "mark_sent failures",
+          "expr": "sum by (event_type) (rate(email_mark_sent_failed_total[1m])) * 60",
+          "legendFormat": "mark_sent_failed - {{event_type}}",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(email_group_mark_sent_partial_total[1m])) * 60",
-          "legendFormat": "partial group failures",
+          "expr": "sum by (event_type) (rate(email_group_mark_sent_partial_total[1m])) * 60",
+          "legendFormat": "group_partial - {{event_type}}",
           "refId": "B"
         }
       ]
