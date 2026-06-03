@@ -8,6 +8,11 @@ scrape_configs:
       - targets: ["anvil-notify:9091"]
     metrics_path: /metrics
 
+  - job_name: outbox-worker
+    static_configs:
+      - targets: ["outbox-worker:9092"]
+    metrics_path: /metrics
+
   - job_name: rabbitmq
     static_configs:
       # Requires the RabbitMQ Prometheus plugin to be enabled:

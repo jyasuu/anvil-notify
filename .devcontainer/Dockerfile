@@ -2,4 +2,4 @@
 FROM mcr.microsoft.com/devcontainers/base:ubuntu-22.04
 
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && curl -fsSL https://opencode.ai/install | bash

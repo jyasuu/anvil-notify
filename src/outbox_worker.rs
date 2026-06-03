@@ -15,7 +15,10 @@
 //!   AN__OUTBOX__BATCH_SIZE            — default: 50
 //!   AN__OUTBOX__MAX_PUBLISH_FAILURES  — default: 5
 
+use std::net::SocketAddr;
+
 use anyhow::Context;
+use metrics_exporter_prometheus::PrometheusBuilder;
 use outbox::{run_outbox_worker, OutboxConfig};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -46,6 +49,9 @@ struct OutboxEnv {
     /// (AN__OUTBOX__MAX_PUBLISH_FAILURES, default: 5).
     #[serde(default = "default_max_publish_failures")]
     max_publish_failures: i32,
+    /// Port for the Prometheus /metrics endpoint (AN__OUTBOX__METRICS_PORT, default: 9092).
+    #[serde(default = "default_metrics_port")]
+    metrics_port: u16,
 }
 
 fn default_exchange() -> String {
@@ -68,6 +74,9 @@ fn default_stale_lock_timeout_secs() -> u64 {
 }
 fn default_max_publish_failures() -> i32 {
     5
+}
+fn default_metrics_port() -> u16 {
+    9092
 }
 
 impl OutboxEnv {
@@ -128,6 +137,23 @@ async fn main() -> anyhow::Result<()> {
         stale_lock_timeout_secs: env.stale_lock_timeout_secs,
         max_publish_failures: env.max_publish_failures,
     };
+
+    // ── Prometheus metrics ────────────────────────────────────────────────────
+    let metrics_addr: SocketAddr = format!("0.0.0.0:{}", env.metrics_port)
+        .parse()
+        .context("Invalid metrics port")?;
+    PrometheusBuilder::new()
+        .with_http_listener(metrics_addr)
+        .add_global_label("service", "outbox-worker")
+        .set_buckets(&[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0])
+        .context("Invalid bucket configuration")?
+        .install()
+        .context("Failed to install Prometheus metrics exporter")?;
+    info!(addr = %metrics_addr, "Prometheus /metrics endpoint listening");
+
+    // Bootstrap outbox metrics with zero values so they appear immediately.
+    outbox::bootstrap_metrics();
+    info!("Outbox metrics bootstrapped");
 
     // ── Graceful shutdown ─────────────────────────────────────────────────────
     let shutdown = CancellationToken::new();

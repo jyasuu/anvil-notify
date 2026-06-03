@@ -13,3 +13,11 @@ pub use sender::EmailSender;
 pub use smtp::{SmtpSender, SmtpTlsMode};
 pub use template::{render_html_template, render_template};
 pub use webhook::WebhookSender;
+
+/// Record initial zero values so all mailer metrics appear immediately
+/// in the Prometheus /metrics output, even before any attachments are fetched.
+pub fn bootstrap_metrics() {
+    metrics::counter!("attachment_fetch_total", "result" => "").increment(0);
+    metrics::histogram!("attachment_fetch_duration_seconds").record(0.0);
+    metrics::counter!("attachment_fetch_retries_total").increment(0);
+}
