@@ -294,6 +294,8 @@ mod processor_tests {
                     send_mode: common::SendMode::Individual,
                     group_retry_mode: common::GroupRetryMode::Individual,
                     retry_policy: common::RetryPolicy::Retry,
+                    send_at: None,
+                    priority: None,
                 }),
             },
         }
@@ -565,6 +567,8 @@ mod processor_tests {
                     send_mode: common::SendMode::Group,
                     group_retry_mode: common::GroupRetryMode::Whole,
                     retry_policy: common::RetryPolicy::Retry,
+                    send_at: None,
+                    priority: None,
                 }),
             },
         }

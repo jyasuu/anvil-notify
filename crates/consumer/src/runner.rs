@@ -177,11 +177,12 @@ async fn connect_and_consume(
                 let ctx    = ctx.clone();
                 let cfg    = cfg.clone();
                 let http   = Arc::clone(&http);
+                let ch     = channel.clone();
                 let shutdown = shutdown.clone();
 
                 tokio::spawn(async move {
                     let _permit = permit;
-                    handle_delivery(delivery, ctx, http, cfg, shutdown).await;
+                    handle_delivery(delivery, ctx, http, cfg, ch, shutdown).await;
                 });
             }
         }
@@ -318,6 +319,84 @@ async fn declare_topology(
             &dlq_name,
             &dlx_name,
             &cfg.queue,
+            QueueBindOptions::default(),
+            FieldTable::default(),
+        )
+        .await?;
+
+    // ── Delayed exchange/queue (for send_at scheduling) ────────────────────────
+    // When an event's `send_at` is in the future, the consumer re-publishes the
+    // raw message to this exchange with a per-message TTL.  After the TTL expires,
+    // RabbitMQ dead-letters the message back to the main exchange via the DLX
+    // mechanism, which routes it to the main queue for normal processing.
+    let delayed_exchange = format!("{}.delayed", cfg.exchange);
+    let delayed_queue = format!("{}.delayed", cfg.queue);
+
+    channel
+        .exchange_declare(
+            &delayed_exchange,
+            lapin::ExchangeKind::Fanout,
+            ExchangeDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await?;
+
+    let mut delayed_queue_args = FieldTable::default();
+    delayed_queue_args.insert(
+        "x-dead-letter-exchange".into(),
+        lapin::types::AMQPValue::LongString(cfg.exchange.clone().into()),
+    );
+    delayed_queue_args.insert(
+        "x-dead-letter-routing-key".into(),
+        lapin::types::AMQPValue::LongString(cfg.routing_key.clone().into()),
+    );
+
+    // Passive check (same pattern as DLQ/Main above)
+    let probe = conn.create_channel().await?;
+    match probe
+        .queue_declare(
+            &delayed_queue,
+            QueueDeclareOptions {
+                passive: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+    {
+        Ok(_) => {
+            tracing::debug!(
+                queue = &delayed_queue,
+                "Delayed queue already exists — skipping active declare"
+            );
+        }
+        Err(ref e) if is_not_found(e) => {
+            channel
+                .queue_declare(
+                    &delayed_queue,
+                    QueueDeclareOptions {
+                        durable: true,
+                        ..Default::default()
+                    },
+                    delayed_queue_args,
+                )
+                .await?;
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "Passive queue check for '{delayed_queue}' failed: {e}"
+            ));
+        }
+    }
+
+    channel
+        .queue_bind(
+            &delayed_queue,
+            &delayed_exchange,
+            "",
             QueueBindOptions::default(),
             FieldTable::default(),
         )

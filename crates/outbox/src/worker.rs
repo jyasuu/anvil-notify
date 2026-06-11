@@ -240,7 +240,15 @@ async fn poll_once(cfg: &OutboxConfig, pool: &PgPool, channel: &Channel) -> anyh
             // Nothing to do this cycle — signal the caller to back off.
             return Ok(false);
         }
-        Ok(rows) => {
+        Ok(mut rows) => {
+            // Stable sort: equal-priority rows keep their insertion order
+            // (created_at ASC from the SQL query) as the tiebreaker.
+            rows.sort_by_key(|r| {
+                r.payload
+                    .get("priority")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(u64::MAX)
+            });
             let count = rows.len();
             info!(count, "Outbox: processing batch");
             for row in rows {
@@ -392,6 +400,11 @@ async fn publish_and_mark(
     let group_retry_mode: GroupRetryMode =
         deserialize_optional(&row.payload, "group_retry_mode").unwrap_or_default();
 
+    let send_at: Option<chrono::DateTime<chrono::Utc>> =
+        deserialize_optional(&row.payload, "send_at");
+
+    let priority: Option<u32> = deserialize_optional(&row.payload, "priority");
+
     let metadata: Metadata = deserialize_optional(&row.payload, "metadata").unwrap_or_default();
 
     let template_payload = row
@@ -428,6 +441,8 @@ async fn publish_and_mark(
                 sender_account,
                 group_retry_mode,
                 retry_policy: RetryPolicy::default(),
+                send_at,
+                priority,
             }),
         },
     };
@@ -820,6 +835,8 @@ mod tests {
                     send_mode: common::SendMode::Individual,
                     group_retry_mode: common::GroupRetryMode::Individual,
                     retry_policy: common::RetryPolicy::Retry,
+                    send_at: None,
+                    priority: None,
                 }),
             },
         };

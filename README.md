@@ -155,6 +155,13 @@ Publish an event to the `email.requested` RabbitMQ queue:
 }
 ```
 
+Optional fields on `channel_overrides.email`:
+
+| Field        | Type                 | Description                                                          |
+| ------------ | -------------------- | -------------------------------------------------------------------- |
+| `send_at`    | `ISO-8601` timestamp | If set to a future time, delivery is deferred until then             |
+| `priority`   | integer              | Lower values are dispatched first; affects outbox ordering only      |
+
 Or use the CLI to send a test event directly:
 
 ```bash

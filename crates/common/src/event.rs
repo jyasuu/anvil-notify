@@ -296,6 +296,16 @@ pub struct EmailOptions {
     /// the global `[mailer]` settings.
     #[serde(default)]
     pub sender_account: Option<String>,
+
+    /// If set, the email will not be sent before this time.
+    /// Messages are held in a delayed queue and released when the time elapses.
+    #[serde(default)]
+    pub send_at: Option<DateTime<Utc>>,
+
+    /// Priority value affecting outbox ordering (lower = higher priority).
+    /// Messages with lower priority values are dispatched first.
+    #[serde(default)]
+    pub priority: Option<u32>,
 }
 
 // ── Backwards-compatibility shim ─────────────────────────────────────────────
@@ -358,6 +368,8 @@ impl EmailEvent {
                     send_mode: SendMode::Individual,
                     group_retry_mode: GroupRetryMode::Whole,
                     retry_policy: RetryPolicy::default(),
+                    send_at: None,
+                    priority: None,
                 }),
             },
         }
