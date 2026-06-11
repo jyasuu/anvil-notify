@@ -143,6 +143,8 @@ pub async fn run(args: SendArgs, cfg: CliConfig) -> Result<()> {
                 send_mode: common::SendMode::Individual,
                 group_retry_mode: GroupRetryMode::default(),
                 retry_policy: RetryPolicy::default(),
+                send_at: None,
+                priority: None,
             }),
         },
     };

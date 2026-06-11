@@ -163,10 +163,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Utc;
 use common::{
     is_valid_email, AppError, GroupRetryMode, NotificationEvent, Recipient, RetryPolicy, SendMode,
 };
-use lapin::{message::Delivery, options::*};
+use lapin::{message::Delivery, options::*, BasicProperties, Channel};
 use mailer::fetch_attachments_with_limit;
 use mailer::message::ResolvedAttachment;
 use reqwest::Client;
@@ -219,6 +220,7 @@ pub(crate) async fn handle_delivery(
     ctx: ProcessorContext,
     http: Arc<Client>,
     cfg: ConsumerConfig,
+    channel: Channel,
     shutdown: CancellationToken,
 ) {
     // ── Deserialize — try new NotificationEvent shape, fall back to legacy EmailEvent ──
@@ -347,6 +349,78 @@ pub(crate) async fn handle_delivery(
         insert_sentinel_failed_row(&ctx.store, &event, &email_opts, &reason).await;
         let _ = delivery.ack(BasicAckOptions::default()).await;
         return;
+    }
+
+    // ── Scheduled delivery (send_at) ──────────────────────────────────────────
+    // If the event has a future `send_at`, defer it by re-publishing the raw
+    // bytes to the delayed exchange with a per-message TTL.  After the TTL
+    // expires, RabbitMQ dead-letters the message back to the main exchange via
+    // the DLX mechanism, where it is routed to the main queue and processed
+    // normally.  This avoids the need for a separate scheduler process and
+    // survives consumer restarts — the message is safely stored in RabbitMQ
+    // until its scheduled time.
+    if let Some(send_at) = email_opts.send_at {
+        let now = Utc::now();
+        if send_at > now {
+            let ttl_ms = (send_at - now).num_milliseconds().max(1) as u64;
+
+            tracing::info!(
+                event_id = %event.event_id,
+                send_at  = %send_at,
+                ttl_ms,
+                "Deferring delivery to delayed queue"
+            );
+
+            let delayed_exchange = format!("{}.delayed", cfg.exchange);
+            match channel
+                .basic_publish(
+                    &delayed_exchange,
+                    "",
+                    BasicPublishOptions::default(),
+                    &delivery.data,
+                    BasicProperties::default()
+                        .with_content_type("application/json".into())
+                        .with_delivery_mode(2)
+                        .with_expiration(ttl_ms.to_string().into()),
+                )
+                .await
+            {
+                Ok(confirm) => {
+                    // Wait for broker confirmation before ACKing the original.
+                    match confirm.await {
+                        Ok(ack) if ack.is_ack() => {
+                            let _ = delivery.ack(BasicAckOptions::default()).await;
+                        }
+                        _ => {
+                            tracing::error!(
+                                event_id = %event.event_id,
+                                "Delayed publish was nacked — re-queueing original"
+                            );
+                            let _ = delivery
+                                .nack(BasicNackOptions {
+                                    requeue: true,
+                                    ..Default::default()
+                                })
+                                .await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        event_id = %event.event_id,
+                        error    = %e,
+                        "Failed to publish to delayed exchange — re-queueing original"
+                    );
+                    let _ = delivery
+                        .nack(BasicNackOptions {
+                            requeue: true,
+                            ..Default::default()
+                        })
+                        .await;
+                }
+            }
+            return;
+        }
     }
 
     // ── Fetch attachments once for the whole event ───────────────────────────

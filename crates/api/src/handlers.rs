@@ -292,6 +292,8 @@ async fn republish_event(
                 send_mode,
                 group_retry_mode,
                 retry_policy: RetryPolicy::default(),
+                send_at: None,
+                priority: None,
             }),
         },
     };
