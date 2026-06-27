@@ -1,0 +1,38 @@
+[package]
+name = "mcp-server"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mcp_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "anvil-notify-mcp"
+path = "src/main.rs"
+
+[dependencies]
+common           = { path = "../common", features = ["schemars"] }
+store            = { path = "../store" }
+api              = { path = "../api" }
+recipient_filter = { path = "../recipient_filter" }
+
+tokio       = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+tracing     = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow      = { workspace = true }
+uuid        = { workspace = true }
+chrono      = { workspace = true }
+sqlx        = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }
+
+rmcp = { version = "0.16", features = [
+    "server", "macros", "transport-io", "transport-streamable-http-server",
+] }
+schemars = { version = "1", features = ["uuid1", "chrono04"] }
+
+axum   = "0.8"
+tower  = "0.5"
+
+config = "0.14"

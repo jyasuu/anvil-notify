@@ -13,6 +13,7 @@ use mailer::{EmailSender, SenderRegistry, SmtpSender, WebhookSender};
 use metrics_exporter_prometheus::PrometheusBuilder;
 
 use rate_limiter::MailRateLimiter;
+use mcp_server;
 use recipient_filter::RecipientFilter;
 use reqwest::Client;
 use sqlx::postgres::PgPoolOptions;
@@ -310,6 +311,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    let mcp_publisher = publisher.clone();
     let api_state = ApiState {
         store: Arc::new(store.clone()) as Arc<dyn NotificationStore>,
         template_store: template_store.clone(),
@@ -320,6 +322,14 @@ async fn main() -> anyhow::Result<()> {
         max_recipients_per_event: cfg.amqp.max_recipients_per_event,
     };
     let router = build_router(api_state);
+    let router = router.merge(mcp_server::build_mcp_route(
+        Arc::new(store.clone()) as Arc<dyn NotificationStore>,
+        template_store.clone(),
+        block_list_store.clone(),
+        mcp_publisher,
+        cfg.amqp.max_recipients_per_event,
+        "/mcp",
+    ));
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.http.port));
     info!(addr = %addr, "Starting HTTP API");
 

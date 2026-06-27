@@ -395,6 +395,7 @@ impl EmailEvent {
 /// }
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct AttachmentRef {
     pub url: String,
     pub filename: String,
@@ -495,12 +496,14 @@ where
 // ── Supporting types ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FromOverride {
     pub email: String,
     pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Recipient {
     pub email: String,
     #[serde(default)]
