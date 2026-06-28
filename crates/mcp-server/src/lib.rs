@@ -738,7 +738,7 @@ pub fn build_mcp_route(
 
     let config = StreamableHttpServerConfig {
         sse_keep_alive: Some(Duration::from_secs(15)),
-        sse_retry: None,
+        sse_retry: Some(Duration::from_secs(3)),
         ..Default::default()
     };
 
