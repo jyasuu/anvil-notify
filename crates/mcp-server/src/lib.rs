@@ -8,9 +8,9 @@ use common::{
 };
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    serve_server,
+    serve_server, tool, tool_handler, tool_router,
     transport::io,
-    tool, tool_handler, tool_router, ServerHandler,
+    ServerHandler,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -119,7 +119,21 @@ pub struct McpHandler {
 }
 
 #[tool_handler(router = self.tool_router)]
-impl ServerHandler for McpHandler {}
+impl ServerHandler for McpHandler {
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        rmcp::model::ServerInfo {
+            instructions: Some(
+                "Anvil Notify MCP Server. Send email notifications, manage templates, \
+                 view delivery status, and manage blocklists."
+                    .into(),
+            ),
+            capabilities: rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+            ..Default::default()
+        }
+    }
+}
 
 #[tool_router]
 impl McpHandler {
@@ -176,7 +190,9 @@ impl McpHandler {
             timestamp: Utc::now(),
             event_type: input.event_type,
             payload: input.payload,
-            metadata: Metadata { source: input.source },
+            metadata: Metadata {
+                source: input.source,
+            },
             channel_overrides: ChannelOverrides {
                 email: Some(EmailOptions {
                     send_mode,
@@ -264,29 +280,24 @@ impl McpHandler {
 
     /// Get delivery status for a single recipient within an event.
     #[tool(description = "Get delivery status for a single recipient within an event")]
-    async fn get_recipient_status(
-        &self,
-        params: Parameters<RecipientStatusInput>,
-    ) -> String {
+    async fn get_recipient_status(&self, params: Parameters<RecipientStatusInput>) -> String {
         let input = params.0;
         match self
             .store
             .get_by_event_and_recipient(input.event_id, &input.email)
             .await
         {
-            Ok(log) => {
-                json!({
-                    "eventId": log.event_id,
-                    "email": log.recipient_email,
-                    "status": log.status.as_str(),
-                    "retryCount": log.retry_count,
-                    "totalAttempts": log.total_attempts,
-                    "lastError": log.last_error,
-                    "createdAt": log.created_at,
-                    "updatedAt": log.updated_at,
-                })
-                .to_string()
-            }
+            Ok(log) => json!({
+                "eventId": log.event_id,
+                "email": log.recipient_email,
+                "status": log.status.as_str(),
+                "retryCount": log.retry_count,
+                "totalAttempts": log.total_attempts,
+                "lastError": log.last_error,
+                "createdAt": log.created_at,
+                "updatedAt": log.updated_at,
+            })
+            .to_string(),
             Err(e) => error_json(&e.to_string()),
         }
     }
@@ -320,9 +331,10 @@ impl McpHandler {
     async fn get_template(&self, params: Parameters<EventTypeInput>) -> String {
         let input = params.0;
         match self.template_store.get(&input.event_type).await {
-            Ok(rows) if rows.is_empty() => {
-                error_json(&format!("No template found for event type '{}'", input.event_type))
-            }
+            Ok(rows) if rows.is_empty() => error_json(&format!(
+                "No template found for event type '{}'",
+                input.event_type
+            )),
             Ok(rows) => {
                 let templates: Vec<_> = rows
                     .iter()
@@ -361,7 +373,11 @@ impl McpHandler {
             .template_store
             .upsert(
                 &input.event_type,
-                &if input.channel.is_empty() { "email" } else { &input.channel },
+                &if input.channel.is_empty() {
+                    "email"
+                } else {
+                    &input.channel
+                },
                 &input.subject,
                 &input.body_html,
                 &input.body_text,
@@ -390,7 +406,11 @@ impl McpHandler {
             .template_store
             .patch(
                 &input.event_type,
-                &if input.channel.is_empty() { "email" } else { &input.channel },
+                &if input.channel.is_empty() {
+                    "email"
+                } else {
+                    &input.channel
+                },
                 input.subject.as_deref(),
                 input.body_html.as_deref(),
                 input.body_text.as_deref(),
@@ -408,7 +428,11 @@ impl McpHandler {
             Ok(None) => error_json(&format!(
                 "No template found for event type '{}' channel '{}'",
                 input.event_type,
-                if input.channel.is_empty() { "email" } else { &input.channel }
+                if input.channel.is_empty() {
+                    "email"
+                } else {
+                    &input.channel
+                }
             )),
             Err(e) => error_json(&e.to_string()),
         }
@@ -439,10 +463,7 @@ impl McpHandler {
 
     /// Add an entry to the blocklist or allowlist.
     #[tool(description = "Add an entry to the blocklist or allowlist")]
-    async fn add_blocklist_entry(
-        &self,
-        params: Parameters<AddBlocklistInput>,
-    ) -> String {
+    async fn add_blocklist_entry(&self, params: Parameters<AddBlocklistInput>) -> String {
         let input = params.0;
 
         let valid_kinds = [
@@ -478,10 +499,7 @@ impl McpHandler {
 
     /// Remove an entry from the blocklist by id.
     #[tool(description = "Remove an entry from the blocklist by id")]
-    async fn remove_blocklist_entry(
-        &self,
-        params: Parameters<RemoveBlocklistInput>,
-    ) -> String {
+    async fn remove_blocklist_entry(&self, params: Parameters<RemoveBlocklistInput>) -> String {
         let input = params.0;
         match self.block_list_store.remove_entry(input.id).await {
             Ok(()) => json!({ "status": "deleted", "id": input.id }).to_string(),
@@ -491,10 +509,7 @@ impl McpHandler {
 
     /// Retry delivery for a single failed recipient.
     #[tool(description = "Retry delivery for a single failed recipient within an event")]
-    async fn retry_recipient(
-        &self,
-        params: Parameters<RetryRecipientInput>,
-    ) -> String {
+    async fn retry_recipient(&self, params: Parameters<RetryRecipientInput>) -> String {
         let input = params.0;
 
         if !is_valid_email(&input.email) {
@@ -518,14 +533,11 @@ impl McpHandler {
     async fn retry_event(&self, params: Parameters<EventIdInput>) -> String {
         let input = params.0;
 
-        match self
-            .store
-            .reset_all_failed_for_event(input.event_id)
-            .await
-        {
-            Ok(reset) if reset.is_empty() => {
-                error_json(&format!("No FAILED recipients for event {}", input.event_id))
-            }
+        match self.store.reset_all_failed_for_event(input.event_id).await {
+            Ok(reset) if reset.is_empty() => error_json(&format!(
+                "No FAILED recipients for event {}",
+                input.event_id
+            )),
             Ok(reset) => self.republish_event(input.event_id, Some(reset)).await,
             Err(e) => error_json(&e.to_string()),
         }
@@ -677,10 +689,9 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
 use std::sync::Arc as StdArc;
 use std::time::Duration;
 
-use axum::{Router, http::HeaderValue, middleware};
+use axum::{http::HeaderValue, middleware, Router};
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpService, StreamableHttpServerConfig,
-    session::local::LocalSessionManager,
+    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 
 /// Axum middleware that ensures the `Accept` header includes BOTH
@@ -727,16 +738,13 @@ pub fn build_mcp_route(
 
     let config = StreamableHttpServerConfig {
         sse_keep_alive: Some(Duration::from_secs(15)),
+        sse_retry: None,
         ..Default::default()
     };
 
     let session_manager = StdArc::new(LocalSessionManager::default());
 
-    let service = StreamableHttpService::new(
-        move || Ok(handler.clone()),
-        session_manager,
-        config,
-    );
+    let service = StreamableHttpService::new(move || Ok(handler.clone()), session_manager, config);
 
     Router::new()
         .nest_service(mcp_path, service)
