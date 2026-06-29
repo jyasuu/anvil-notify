@@ -1,3 +1,4 @@
+use crate::config::McpConfig;
 use chrono::Utc;
 use common::{
     ChannelOverrides, EmailOptions, FromOverride, GroupRetryMode, Metadata, NotificationEvent,
@@ -9,17 +10,13 @@ use lapin::{
     BasicProperties, Connection, ConnectionProperties,
 };
 use rmcp::{
-    handler::server::router::tool::ToolRouter,
-    handler::server::tool::ToolCallContext,
-    handler::server::wrapper::Parameters,
-    model::*,
-    schemars, service::RequestContext, tool, tool_router, ErrorData as McpError, RoleServer,
-    ServerHandler,
+    handler::server::router::tool::ToolRouter, handler::server::tool::ToolCallContext,
+    handler::server::wrapper::Parameters, model::*, schemars, service::RequestContext, tool,
+    tool_router, ErrorData as McpError, RoleServer, ServerHandler,
 };
 use sqlx::PgPool;
 use store::cli_queries;
 use uuid::Uuid;
-use crate::config::McpConfig;
 
 #[derive(Debug, Clone)]
 pub struct NotifyServer {
@@ -55,32 +52,28 @@ impl NotifyServer {
             name: args.name.clone(),
         };
 
-        let payload: serde_json::Value = if args.subject.is_some()
-            && args.body_html.is_some()
-            && args.body_text.is_some()
-        {
-            serde_json::json!({
-                "subject": args.subject.as_deref().unwrap_or_default(),
-                "body_html": args.body_html.as_deref().unwrap_or_default(),
-                "body_text": args.body_text.as_deref().unwrap_or_default(),
-            })
-        } else {
-            serde_json::from_str(&args.payload).unwrap_or(serde_json::Value::Null)
-        };
+        let payload: serde_json::Value =
+            if args.subject.is_some() && args.body_html.is_some() && args.body_text.is_some() {
+                serde_json::json!({
+                    "subject": args.subject.as_deref().unwrap_or_default(),
+                    "body_html": args.body_html.as_deref().unwrap_or_default(),
+                    "body_text": args.body_text.as_deref().unwrap_or_default(),
+                })
+            } else {
+                serde_json::from_str(&args.payload).unwrap_or(serde_json::Value::Null)
+            };
 
         let event_id: Uuid = args
             .event_id
             .as_deref()
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(uuid::Uuid::new_v4);
-        let event_type = if args.subject.is_some()
-            && args.body_html.is_some()
-            && args.body_text.is_some()
-        {
-            "GENERIC_HTML".to_string()
-        } else {
-            args.event_type.clone()
-        };
+        let event_type =
+            if args.subject.is_some() && args.body_html.is_some() && args.body_text.is_some() {
+                "GENERIC_HTML".to_string()
+            } else {
+                args.event_type.clone()
+            };
 
         let event = NotificationEvent {
             event_id,
@@ -178,10 +171,9 @@ impl NotifyServer {
                 None::<serde_json::Value>,
             )
         })?;
-        let rows =
-            cli_queries::get_status_for_event(&self.pool, event_id)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None::<serde_json::Value>))?;
+        let rows = cli_queries::get_status_for_event(&self.pool, event_id)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None::<serde_json::Value>))?;
 
         if rows.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(format!(
@@ -239,10 +231,7 @@ impl NotifyServer {
 
     #[tool(description = "Check the health of the notification service database")]
     async fn health_check(&self) -> Result<CallToolResult, McpError> {
-        let db_ok = sqlx::query("SELECT 1")
-            .execute(&self.pool)
-            .await
-            .is_ok();
+        let db_ok = sqlx::query("SELECT 1").execute(&self.pool).await.is_ok();
 
         let result = serde_json::json!({
             "status": if db_ok { "healthy" } else { "unhealthy" },

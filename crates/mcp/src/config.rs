@@ -20,10 +20,20 @@ pub struct AmqpConfig {
 }
 
 impl McpConfig {
-    pub fn new(database_url: String, amqp_url: String, exchange: String, routing_key: String) -> Self {
+    #[allow(dead_code)]
+    pub fn new(
+        database_url: String,
+        amqp_url: String,
+        exchange: String,
+        routing_key: String,
+    ) -> Self {
         Self {
             database: DatabaseConfig { url: database_url },
-            amqp: AmqpConfig { url: amqp_url, exchange, routing_key },
+            amqp: AmqpConfig {
+                url: amqp_url,
+                exchange,
+                routing_key,
+            },
         }
     }
 }
