@@ -21,7 +21,35 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+#[cfg(feature = "mcp")]
+use axum::http::{header, HeaderValue, Method};
+#[cfg(feature = "mcp")]
+use axum::middleware;
+#[cfg(feature = "mcp")]
+use axum::response::Response;
+#[cfg(feature = "mcp")]
+use rmcp::transport::{
+    streamable_http_server::session::local::LocalSessionManager, StreamableHttpServerConfig,
+    StreamableHttpService,
+};
+#[cfg(feature = "mcp")]
+use tower_http::cors::{Any, CorsLayer};
+
 use config::{AppConfig, MailerConfig};
+
+#[cfg(feature = "mcp")]
+async fn ensure_mcp_accept(
+    mut req: axum::http::Request<axum::body::Body>,
+    next: middleware::Next,
+) -> Response {
+    if req.uri().path().starts_with("/mcp") && !req.headers().contains_key(header::ACCEPT) {
+        req.headers_mut().insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/json, text/event-stream"),
+        );
+    }
+    next.run(req).await
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -319,7 +347,59 @@ async fn main() -> anyhow::Result<()> {
         filter: filter.clone(),
         max_recipients_per_event: cfg.amqp.max_recipients_per_event,
     };
-    let router = build_router(api_state);
+    let router = {
+        #[cfg_attr(not(feature = "mcp"), allow(unused_mut))]
+        let mut r = build_router(api_state);
+
+        #[cfg(feature = "mcp")]
+        {
+            let mcp_cfg = mcp::config::McpConfig::new(
+                cfg.database.url.clone(),
+                cfg.amqp.url.clone(),
+                cfg.amqp.exchange.clone(),
+                cfg.amqp.routing_key.clone(),
+            );
+            let mcp_server = mcp::server::NotifyServer::new(pool.clone(), mcp_cfg);
+            let mcp_service = StreamableHttpService::new(
+                move || Ok(mcp_server.clone()),
+                Arc::new(LocalSessionManager::default()),
+                StreamableHttpServerConfig {
+                    stateful_mode: true,
+                    sse_keep_alive: Some(std::time::Duration::from_secs(15)),
+                    ..Default::default()
+                },
+            );
+
+            let mut mcp_router = axum::Router::new()
+                .fallback_service(mcp_service)
+                .layer(middleware::from_fn(ensure_mcp_accept));
+
+            if let Some(cors_origin) = &cfg.mcp_cors_origin {
+                let cors = if cors_origin == "*" {
+                    CorsLayer::new()
+                        .allow_origin(Any)
+                        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                        .allow_headers(Any)
+                } else {
+                    CorsLayer::new()
+                        .allow_origin(
+                            cors_origin
+                                .parse::<HeaderValue>()
+                                .expect("invalid CORS origin"),
+                        )
+                        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                        .allow_headers(Any)
+                };
+                mcp_router = mcp_router.layer(cors);
+            }
+
+            r = r.nest("/mcp", mcp_router);
+            info!("MCP endpoint mounted at /mcp");
+        }
+
+        r
+    };
+
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.http.port));
     info!(addr = %addr, "Starting HTTP API");
 

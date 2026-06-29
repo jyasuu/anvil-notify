@@ -58,6 +58,12 @@ path = "src/main.rs"
 name = "outbox-worker"
 path = "src/outbox_worker.rs"
 
+[features]
+default = []
+
+# Compile the MCP server into the binary (runtime-gated by config).
+mcp = ["dep:mcp", "dep:rmcp", "dep:tower-http"]
+
 [dependencies]
 common           = { path = "crates/common" }
 store            = { path = "crates/store" }
@@ -67,6 +73,11 @@ api              = { path = "crates/api" }
 outbox           = { path = "crates/outbox" }
 rate_limiter     = { path = "crates/rate_limiter" }
 recipient_filter = { path = "crates/recipient_filter" }
+
+# ── Optional: MCP server ─────────────────────────────────────────────
+mcp = { path = "crates/mcp", package = "anvil-notify-mcp", optional = true }
+rmcp = { version = "0.16", features = ["server", "transport-streamable-http-server"], optional = true }
+tower-http = { version = "0.6", features = ["cors"], optional = true }
 
 tokio       = { workspace = true }
 tracing     = { workspace = true }

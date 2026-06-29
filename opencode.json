@@ -11,8 +11,8 @@
       }
     },
     "anvil-notify-http": {
-      "type": "url",
-      "url": "http://localhost:8090/mcp",
+      "type": "remote",
+      "url": "http://localhost:8080/mcp",
       "enabled": true
     }
   }

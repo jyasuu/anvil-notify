@@ -52,6 +52,11 @@ port = 8080
 # Override via AN__HTTP__ALLOW_UNAUTHENTICATED=true.
 # allow_unauthenticated = false
 
+# CORS origin for the MCP /mcp endpoint (optional).
+# Set to "*" to allow any origin (browser-based MCP clients).
+# Requires the `mcp` cargo feature.
+# mcp_cors_origin = "*"
+
 # Port for the Prometheus /metrics endpoint (never expose this publicly).
 metrics_port = 9091
 

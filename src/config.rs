@@ -41,6 +41,11 @@ pub struct AppConfig {
     /// re-queued by the broker when the connection closes after this timeout.
     #[serde(default = "default_shutdown_timeout_secs")]
     pub shutdown_timeout_secs: u64,
+    /// CORS origin for the MCP `/mcp` endpoint (optional).
+    /// When set, the MCP endpoint includes CORS headers allowing the given
+    /// origin. Set to `"*"` to allow any origin. Requires the `mcp` feature.
+    #[cfg(feature = "mcp")]
+    pub mcp_cors_origin: Option<String>,
     /// Named SMTP sender accounts for multi-tenant / multi-brand deployments.
     ///
     /// Each entry gives a business system its own SMTP credentials and From

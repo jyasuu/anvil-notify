@@ -177,6 +177,7 @@ dependencies = [
 name = "anvil-notify"
 version = "0.1.0"
 dependencies = [
+ "anvil-notify-mcp",
  "anyhow",
  "api",
  "axum",
@@ -191,12 +192,14 @@ dependencies = [
  "rate_limiter",
  "recipient_filter",
  "reqwest",
+ "rmcp",
  "serde",
  "sqlx",
  "store",
  "syslog",
  "tokio",
  "tokio-util",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
 ]

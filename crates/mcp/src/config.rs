@@ -19,6 +19,15 @@ pub struct AmqpConfig {
     pub routing_key: String,
 }
 
+impl McpConfig {
+    pub fn new(database_url: String, amqp_url: String, exchange: String, routing_key: String) -> Self {
+        Self {
+            database: DatabaseConfig { url: database_url },
+            amqp: AmqpConfig { url: amqp_url, exchange, routing_key },
+        }
+    }
+}
+
 pub fn load(path: Option<&str>) -> Result<McpConfig> {
     let mut builder = config::Config::builder()
         .set_default("amqp.exchange", "anvil-notify")?
