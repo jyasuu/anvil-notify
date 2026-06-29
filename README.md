@@ -43,8 +43,8 @@ AnvilNotify sits between your business services and your mail provider. Business
 | `outbox`           | Outbox worker — polls business DB and publishes events to RabbitMQ        |
 | `rate_limiter`     | Token-bucket rate limiter for outbound mail throughput                    |
 | `recipient_filter` | Block/allow-list filtering (config-file and DB-backed)                    |
-| `mcp`              | MCP (Model Context Protocol) server — 5 tools for AI assistants to send  |
-|                    | email, query delivery status, list templates, health check, server info  |
+| `mcp`              | MCP (Model Context Protocol) server — 11 tools for AI assistants: send    |
+|                    | email, query status, manage templates & blocklist, health check           |
 | `anctl`            | Operator CLI: `send`, `retry`, `status`, `logs`, `template`, `blocklist`  |
 
 ---
@@ -144,10 +144,10 @@ Publish an event to the `email.requested` RabbitMQ queue:
 
 Optional fields on `channel_overrides.email`:
 
-| Field        | Type                 | Description                                                          |
-| ------------ | -------------------- | -------------------------------------------------------------------- |
-| `send_at`    | `ISO-8601` timestamp | If set to a future time, delivery is deferred until then             |
-| `priority`   | integer              | Lower values are dispatched first; affects outbox ordering only      |
+| Field      | Type                 | Description                                                     |
+| ---------- | -------------------- | --------------------------------------------------------------- |
+| `send_at`  | `ISO-8601` timestamp | If set to a future time, delivery is deferred until then        |
+| `priority` | integer              | Lower values are dispatched first; affects outbox ordering only |
 
 Or use the CLI to send a test event directly:
 
@@ -205,22 +205,22 @@ AN__HTTP__API_KEY="your-bearer-token"
 
 ### Key settings
 
-| Setting                        | Env var override                    | Default                             | Description                                                                               |
-| ------------------------------ | ----------------------------------- | ----------------------------------- | ----------------------------------------------------------------------------------------- |
-| `database.url`                 | `AN__DATABASE__URL`                 | `postgres://…localhost…`            | PostgreSQL connection string for the notification DB                                      |
-| `amqp.url`                     | `AN__AMQP__URL`                     | `amqp://guest:guest@localhost:5672` | RabbitMQ connection string                                                                |
-| `amqp.max_retries`             | `AN__AMQP__MAX_RETRIES`             | `3`                                 | Max delivery attempts before routing to DLQ                                               |
-| `amqp.max_concurrency`         | `AN__AMQP__MAX_CONCURRENCY`         | `10`                                | Max parallel message handlers                                                             |
-| `http.port`                    | `AN__HTTP__PORT`                    | `8080`                              | API server port                                                                           |
-| `http.api_key`                 | `AN__HTTP__API_KEY`                 | _(none)_                            | **Required in production.** Bearer token for all `/emails/*` and `/templates/*` endpoints |
-| `metrics_port`                 | `AN__METRICS_PORT`                  | `9091`                              | Prometheus `/metrics` port — keep this internal                                           |
-| `rate_limit.emails_per_second` | `AN__RATE_LIMIT__EMAILS_PER_SECOND` | `10`                                | Steady-state outbound send rate. Set to `0` to disable                                    |
-| `rate_limit.burst_size`        | `AN__RATE_LIMIT__BURST_SIZE`        | `20`                                | Token-bucket burst capacity                                                               |
-| `template_cache_ttl_secs`      | `AN__TEMPLATE_CACHE_TTL_SECS`       | `300`                               | Template in-memory cache lifetime                                                         |
-| `block_list_cache_ttl_secs`    | `AN__BLOCK_LIST_CACHE_TTL_SECS`     | `30`                                | Blocklist cache lifetime                                                                  |
-| `max_attachment_bytes`         | `AN__MAX_ATTACHMENT_BYTES`          | `10485760` (10 MiB)                 | Hard cap per attachment; excess is permanently rejected                                   |
-| `shutdown_timeout_secs`        | `AN__SHUTDOWN_TIMEOUT_SECS`         | `30`                                | Graceful shutdown window before forced exit                                               |
-| `mcp_cors_origin`              | `AN__MCP_CORS_ORIGIN`              | _(none)_                            | CORS origin for `/mcp` endpoint. Set to `"*"` for browser-based MCP clients. Requires `mcp` cargo feature |
+| Setting                        | Env var override                    | Default                             | Description                                                                                               |
+| ------------------------------ | ----------------------------------- | ----------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `database.url`                 | `AN__DATABASE__URL`                 | `postgres://…localhost…`            | PostgreSQL connection string for the notification DB                                                      |
+| `amqp.url`                     | `AN__AMQP__URL`                     | `amqp://guest:guest@localhost:5672` | RabbitMQ connection string                                                                                |
+| `amqp.max_retries`             | `AN__AMQP__MAX_RETRIES`             | `3`                                 | Max delivery attempts before routing to DLQ                                                               |
+| `amqp.max_concurrency`         | `AN__AMQP__MAX_CONCURRENCY`         | `10`                                | Max parallel message handlers                                                                             |
+| `http.port`                    | `AN__HTTP__PORT`                    | `8080`                              | API server port                                                                                           |
+| `http.api_key`                 | `AN__HTTP__API_KEY`                 | _(none)_                            | **Required in production.** Bearer token for all `/emails/*` and `/templates/*` endpoints                 |
+| `metrics_port`                 | `AN__METRICS_PORT`                  | `9091`                              | Prometheus `/metrics` port — keep this internal                                                           |
+| `rate_limit.emails_per_second` | `AN__RATE_LIMIT__EMAILS_PER_SECOND` | `10`                                | Steady-state outbound send rate. Set to `0` to disable                                                    |
+| `rate_limit.burst_size`        | `AN__RATE_LIMIT__BURST_SIZE`        | `20`                                | Token-bucket burst capacity                                                                               |
+| `template_cache_ttl_secs`      | `AN__TEMPLATE_CACHE_TTL_SECS`       | `300`                               | Template in-memory cache lifetime                                                                         |
+| `block_list_cache_ttl_secs`    | `AN__BLOCK_LIST_CACHE_TTL_SECS`     | `30`                                | Blocklist cache lifetime                                                                                  |
+| `max_attachment_bytes`         | `AN__MAX_ATTACHMENT_BYTES`          | `10485760` (10 MiB)                 | Hard cap per attachment; excess is permanently rejected                                                   |
+| `shutdown_timeout_secs`        | `AN__SHUTDOWN_TIMEOUT_SECS`         | `30`                                | Graceful shutdown window before forced exit                                                               |
+| `mcp_cors_origin`              | `AN__MCP_CORS_ORIGIN`               | _(none)_                            | CORS origin for `/mcp` endpoint. Set to `"*"` for browser-based MCP clients. Requires `mcp` cargo feature |
 
 ### Email backends
 
@@ -281,33 +281,33 @@ The publisher selects an account by setting `"sender_account": "billing"` in the
 
 All endpoints except `/health` and `/ready` require `Authorization: Bearer <api_key>` when `http.api_key` is configured.
 
-| Method    | Path                                        | Description                                              |
-| --------- | ------------------------------------------- | -------------------------------------------------------- |
-| `GET`     | `/health`                                   | Liveness check — always `200` if the process is up       |
-| `GET`     | `/ready`                                    | Readiness probe — performs a live DB ping                |
-| `GET`     | `/emails/:event_id`                         | Delivery status for all recipients in an event           |
-| `GET`     | `/emails/:event_id/recipients/:email`       | Delivery status for one recipient                        |
-| `POST`    | `/emails/:event_id/retry`                   | Reset all `FAILED` recipients → `PENDING` and re-enqueue |
-| `POST`    | `/emails/:event_id/recipients/:email/retry` | Reset one `FAILED` recipient and re-enqueue              |
-| `GET`     | `/templates`                                | List all templates (including inactive), no body fields  |
-| `POST`    | `/templates`                                | Create or upsert a template                              |
-| `GET`     | `/templates/:event_type`                    | Full content of all channel variants for one event type  |
-| `PATCH`   | `/templates/:event_type`                    | Partial update — toggle `active`, change subject, etc.   |
-| `DELETE`  | `/template-cache`                           | Clear the entire template cache                          |
-| `DELETE`  | `/template-cache/:event_type`               | Evict one event type from the template cache             |
-| `GET`     | `/admin/blocklist`                          | List all active block/allow-list entries                 |
-| `POST`    | `/admin/blocklist`                          | Add or reactivate a block/allow-list entry               |
-| `DELETE`  | `/admin/blocklist/:id`                      | Soft-delete an entry by ID                               |
-| `DELETE`  | `/admin/blocklist/cache`                    | Evict the blocklist cache (triggers lazy reload)         |
-| `POST`    | `/admin/blocklist/cache`                    | Evict and eagerly reload the blocklist cache             |
+| Method   | Path                                        | Description                                              |
+| -------- | ------------------------------------------- | -------------------------------------------------------- |
+| `GET`    | `/health`                                   | Liveness check — always `200` if the process is up       |
+| `GET`    | `/ready`                                    | Readiness probe — performs a live DB ping                |
+| `GET`    | `/emails/:event_id`                         | Delivery status for all recipients in an event           |
+| `GET`    | `/emails/:event_id/recipients/:email`       | Delivery status for one recipient                        |
+| `POST`   | `/emails/:event_id/retry`                   | Reset all `FAILED` recipients → `PENDING` and re-enqueue |
+| `POST`   | `/emails/:event_id/recipients/:email/retry` | Reset one `FAILED` recipient and re-enqueue              |
+| `GET`    | `/templates`                                | List all templates (including inactive), no body fields  |
+| `POST`   | `/templates`                                | Create or upsert a template                              |
+| `GET`    | `/templates/:event_type`                    | Full content of all channel variants for one event type  |
+| `PATCH`  | `/templates/:event_type`                    | Partial update — toggle `active`, change subject, etc.   |
+| `DELETE` | `/template-cache`                           | Clear the entire template cache                          |
+| `DELETE` | `/template-cache/:event_type`               | Evict one event type from the template cache             |
+| `GET`    | `/admin/blocklist`                          | List all active block/allow-list entries                 |
+| `POST`   | `/admin/blocklist`                          | Add or reactivate a block/allow-list entry               |
+| `DELETE` | `/admin/blocklist/:id`                      | Soft-delete an entry by ID                               |
+| `DELETE` | `/admin/blocklist/cache`                    | Evict the blocklist cache (triggers lazy reload)         |
+| `POST`   | `/admin/blocklist/cache`                    | Evict and eagerly reload the blocklist cache             |
 
 **MCP endpoint** (optional, requires `mcp` cargo feature):
 
-| Method | Path   | Description                                                     |
-| ------ | ------ | --------------------------------------------------------------- |
-| `POST` | `/mcp` | MCP Streamable HTTP transport — tool calls from AI assistants   |
+| Method | Path   | Description                                                   |
+| ------ | ------ | ------------------------------------------------------------- |
+| `POST` | `/mcp` | MCP Streamable HTTP transport — tool calls from AI assistants |
 
-The MCP server exposes 5 tools: `send_email`, `check_delivery_status`, `list_templates`, `health_check`, `get_server_info`.
+The MCP server exposes 11 tools: `send_email`, `check_delivery_status`, `list_templates`, `get_template`, `upsert_template`, `get_recipient_status`, `list_blocklist`, `add_blocklist_entry`, `remove_blocklist_entry`, `health_check`, `get_server_info`.
 
 > **Note:** Cache routes use the `/template-cache` prefix (not `/templates/…/cache`) to avoid path-parameter ambiguity with `GET /templates/:event_type`.
 
