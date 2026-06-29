@@ -4,7 +4,7 @@
     "anvil-notify": {
       "type": "local",
       "command": ["./target/release/anvil-notify-mcp"],
-      "enabled": true,
+      "enabled": false,
       "environment": {
         "AN__DATABASE__URL": "postgres://postgres:postgres@localhost:5432/anvil_notify",
         "AN__AMQP__URL": "amqp://guest:guest@localhost:5672"
@@ -13,7 +13,7 @@
     "anvil-notify-http": {
       "type": "url",
       "url": "http://localhost:8090/mcp",
-      "enabled": false
+      "enabled": true
     }
   }
 }
