@@ -9,6 +9,7 @@ members = [
     "crates/rate_limiter",
     "crates/recipient_filter",
     ".", "crates/anctl",
+    "crates/mcp",
 ]
 resolver = "2"
 

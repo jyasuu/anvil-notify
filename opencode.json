@@ -1,0 +1,14 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "anvil-notify": {
+      "type": "local",
+      "command": ["./target/release/anvil-notify-mcp"],
+      "enabled": true,
+      "environment": {
+        "AN__DATABASE__URL": "postgres://postgres:postgres@localhost:5432/anvil_notify",
+        "AN__AMQP__URL": "amqp://guest:guest@localhost:5672"
+      }
+    }
+  }
+}
