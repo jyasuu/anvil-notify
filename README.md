@@ -27,32 +27,9 @@ AnvilNotify sits between your business services and your mail provider. Business
 
 ## 🏗️ Architecture
 
-```
-[Business Service]
-  └── INSERT INTO outbox  (same DB transaction as your business data)
-            │
-            ▼
-  [Outbox Worker]  ── polls outbox table ──►  RabbitMQ
-                                                  │
-                                                  ▼
-                                          [anvil-notify consumer]
-                                            ├── Idempotency guard    (PostgreSQL)
-                                            ├── Template renderer    (minijinja)
-                                            ├── Recipient filter     (block/allow-list)
-                                            ├── Rate limiter         (token bucket)
-                                            ├── EmailSender          (SMTP or Webhook)
-                                            └── Retry / DLQ          (exponential backoff)
-
-                                          [anvil-notify HTTP API]
-                                            ├── GET    /emails/:id              (delivery status)
-                                            ├── POST   /emails/:id/retry        (manual recovery)
-                                            ├── GET    /templates               (list all)
-                                            ├── POST   /templates               (create/upsert)
-                                            ├── GET    /templates/:type         (show with bodies)
-                                            ├── PATCH  /templates/:type         (partial update)
-                                            ├── DELETE /template-cache[/:type]  (cache flush)
-                                            └── CRUD   /admin/blocklist         (runtime filtering)
-```
+<p align="center">
+  <img src="docs/architecture.svg" alt="AnvilNotify Architecture Diagram" width="800">
+</p>
 
 ### Workspace crates
 
@@ -66,6 +43,8 @@ AnvilNotify sits between your business services and your mail provider. Business
 | `outbox`           | Outbox worker — polls business DB and publishes events to RabbitMQ        |
 | `rate_limiter`     | Token-bucket rate limiter for outbound mail throughput                    |
 | `recipient_filter` | Block/allow-list filtering (config-file and DB-backed)                    |
+| `mcp`              | MCP (Model Context Protocol) server — 5 tools for AI assistants to send  |
+|                    | email, query delivery status, list templates, health check, server info  |
 | `anctl`            | Operator CLI: `send`, `retry`, `status`, `logs`, `template`, `blocklist`  |
 
 ---
@@ -122,6 +101,14 @@ cp .env.example .env
 ```bash
 cargo run
 ```
+
+To enable the MCP server (Model Context Protocol for AI assistants), compile with the `mcp` feature:
+
+```bash
+cargo run --features mcp
+```
+
+The MCP endpoint is available at **`http://localhost:8080/mcp`**.
 
 The API will be available at **`http://localhost:8080`**. Open **`http://localhost:8025`** in your browser to see delivered emails in Mailpit.
 
@@ -233,6 +220,7 @@ AN__HTTP__API_KEY="your-bearer-token"
 | `block_list_cache_ttl_secs`    | `AN__BLOCK_LIST_CACHE_TTL_SECS`     | `30`                                | Blocklist cache lifetime                                                                  |
 | `max_attachment_bytes`         | `AN__MAX_ATTACHMENT_BYTES`          | `10485760` (10 MiB)                 | Hard cap per attachment; excess is permanently rejected                                   |
 | `shutdown_timeout_secs`        | `AN__SHUTDOWN_TIMEOUT_SECS`         | `30`                                | Graceful shutdown window before forced exit                                               |
+| `mcp_cors_origin`              | `AN__MCP_CORS_ORIGIN`              | _(none)_                            | CORS origin for `/mcp` endpoint. Set to `"*"` for browser-based MCP clients. Requires `mcp` cargo feature |
 
 ### Email backends
 
@@ -312,6 +300,14 @@ All endpoints except `/health` and `/ready` require `Authorization: Bearer <api_
 | `DELETE`  | `/admin/blocklist/:id`                      | Soft-delete an entry by ID                               |
 | `DELETE`  | `/admin/blocklist/cache`                    | Evict the blocklist cache (triggers lazy reload)         |
 | `POST`    | `/admin/blocklist/cache`                    | Evict and eagerly reload the blocklist cache             |
+
+**MCP endpoint** (optional, requires `mcp` cargo feature):
+
+| Method | Path   | Description                                                     |
+| ------ | ------ | --------------------------------------------------------------- |
+| `POST` | `/mcp` | MCP Streamable HTTP transport — tool calls from AI assistants   |
+
+The MCP server exposes 5 tools: `send_email`, `check_delivery_status`, `list_templates`, `health_check`, `get_server_info`.
 
 > **Note:** Cache routes use the `/template-cache` prefix (not `/templates/…/cache`) to avoid path-parameter ambiguity with `GET /templates/:event_type`.
 
@@ -519,7 +515,7 @@ cargo test -p consumer
 cargo test -- --nocapture
 ```
 
-The test suite includes 109 unit tests covering the retry loop, idempotency logic, template rendering, rate limiter, recipient filter, and store layer. Integration tests against a live Postgres and RabbitMQ instance can be run via Docker Compose:
+The test suite includes **127 unit tests** covering the retry loop, idempotency logic, template rendering, rate limiter, recipient filter, and store layer. Integration tests against a live Postgres and RabbitMQ instance can be run via Docker Compose:
 
 ```bash
 docker compose up -d
