@@ -363,11 +363,9 @@ async fn main() -> anyhow::Result<()> {
             let mcp_service = StreamableHttpService::new(
                 move || Ok(mcp_server.clone()),
                 Arc::new(LocalSessionManager::default()),
-                StreamableHttpServerConfig {
-                    stateful_mode: true,
-                    sse_keep_alive: Some(std::time::Duration::from_secs(15)),
-                    ..Default::default()
-                },
+                StreamableHttpServerConfig::default()
+                    .with_stateful_mode(true)
+                    .with_sse_keep_alive(Some(std::time::Duration::from_secs(15))),
             );
 
             let mut mcp_router = axum::Router::new()
@@ -549,11 +547,11 @@ async fn main() -> anyhow::Result<()> {
     let consumer_task = tokio::spawn(async move {
         let ctx = ProcessorContext {
             store: Arc::new(store),
-            template_store,
+            template_store: Arc::new(template_store),
             sender,
             sender_registry,
             filter,
-            block_list_store,
+            block_list_store: Arc::new(block_list_store),
             rate_limiter,
         };
         if let Err(e) = run_consumer(consumer_cfg, ctx, consumer_http, consumer_shutdown).await {
