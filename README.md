@@ -13,7 +13,7 @@ AnvilNotify sits between your business services and your mail provider. Business
 ## ✨ Features
 
 - 📬 **Guaranteed delivery via Transactional Outbox** — email is enqueued atomically with your business data, so a crash between "write" and "send" is never a lost message.
-- 🔁 **Exponential backoff retry with Dead Letter Queue** — transient failures retry automatically; exhausted messages land in a DLQ for operator inspection rather than silently disappearing.
+- 🔁 **Exponential backoff retry with Dead Letter Queue** — transient failures retry automatically; recipients whose retries are exhausted are marked `FAILED` (visible via the status API and retryable on demand), and events that can never be processed (undeserializable, or permanent attachment-fetch failure) are dead-lettered to the DLQ rather than silently disappearing.
 - 🧩 **Idempotent processing** — every delivery is deduplicated by `(event_id, recipient)` so AMQP redeliveries never cause duplicate emails.
 - 🎨 **DB-managed Jinja2 templates** — add or edit templates with a single SQL `INSERT`; no code changes or restarts required.
 - 📎 **Attachment support** — fetch from pre-signed URLs (S3, GCS, Azure Blob) with configurable size limits and expiry validation.
@@ -209,7 +209,7 @@ AN__HTTP__API_KEY="your-bearer-token"
 | ------------------------------ | ----------------------------------- | ----------------------------------- | --------------------------------------------------------------------------------------------------------- |
 | `database.url`                 | `AN__DATABASE__URL`                 | `postgres://…localhost…`            | PostgreSQL connection string for the notification DB                                                      |
 | `amqp.url`                     | `AN__AMQP__URL`                     | `amqp://guest:guest@localhost:5672` | RabbitMQ connection string                                                                                |
-| `amqp.max_retries`             | `AN__AMQP__MAX_RETRIES`             | `3`                                 | Max delivery attempts before routing to DLQ                                                               |
+| `amqp.max_retries`             | `AN__AMQP__MAX_RETRIES`             | `3`                                 | Max send attempts per recipient before it is marked `FAILED` (not DLQ'd)                                  |
 | `amqp.max_concurrency`         | `AN__AMQP__MAX_CONCURRENCY`         | `10`                                | Max parallel message handlers                                                                             |
 | `http.port`                    | `AN__HTTP__PORT`                    | `8080`                              | API server port                                                                                           |
 | `http.api_key`                 | `AN__HTTP__API_KEY`                 | _(none)_                            | **Required in production.** Bearer token for all `/emails/*` and `/templates/*` endpoints                 |
@@ -279,16 +279,17 @@ The publisher selects an account by setting `"sender_account": "billing"` in the
 
 ## 🌐 HTTP API
 
-All endpoints except `/health` and `/ready` require `Authorization: Bearer <api_key>` when `http.api_key` is configured.
+All endpoints except `/health`, `/ready`, `/docs`, `/openapi.yaml` and `/asyncapi.yaml` require `Authorization: Bearer <api_key>` when `http.api_key` is configured.
 
 | Method   | Path                                        | Description                                              |
 | -------- | ------------------------------------------- | -------------------------------------------------------- |
 | `GET`    | `/health`                                   | Liveness check — always `200` if the process is up       |
 | `GET`    | `/ready`                                    | Readiness probe — performs a live DB ping                |
+| `POST`   | `/emails/send`                              | Enqueue a notification event directly (no outbox), `202` |
 | `GET`    | `/emails/:event_id`                         | Delivery status for all recipients in an event           |
 | `GET`    | `/emails/:event_id/recipients/:email`       | Delivery status for one recipient                        |
 | `POST`   | `/emails/:event_id/retry`                   | Reset all `FAILED` recipients → `PENDING` and re-enqueue |
-| `POST`   | `/emails/:event_id/recipients/:email/retry` | Reset one `FAILED` recipient and re-enqueue              |
+| `POST`   | `/emails/:event_id/recipients/:email/retry` | Reset one `FAILED`/`BLOCKED` recipient and re-enqueue    |
 | `GET`    | `/templates`                                | List all templates (including inactive), no body fields  |
 | `POST`   | `/templates`                                | Create or upsert a template                              |
 | `GET`    | `/templates/:event_type`                    | Full content of all channel variants for one event type  |
@@ -320,7 +321,7 @@ The MCP server exposes 11 tools: `send_email`, `check_delivery_status`, `list_te
 | OpenAPI 3.1 | The HTTP API above | [`docs/openapi.yaml`](docs/openapi.yaml) | `GET /openapi.yaml` |
 | AsyncAPI 3.0 | The RabbitMQ contract: `NotificationEvent`, exchanges, queues, DLQ | [`docs/asyncapi.yaml`](docs/asyncapi.yaml) | `GET /asyncapi.yaml` |
 
-Both are embedded in the binary and sit behind the same bearer-token check as the rest of the API. They are written by hand; CI (`scripts/check_api_docs.py`) fails when a route and `openapi.yaml` disagree. To browse them locally:
+Both are embedded in the binary and, like `/health` and `/ready`, are served without a bearer token. `GET /docs` serves a browsable Redoc view of the OpenAPI document (Redoc itself is loaded by your browser from jsDelivr, pinned and integrity-checked; use `/openapi.yaml` with a local viewer in air-gapped setups). They are written by hand; CI (`scripts/check_api_docs.py`) fails when a route and `openapi.yaml` disagree. To browse them locally:
 
 ```bash
 npx @redocly/cli preview-docs docs/openapi.yaml   # OpenAPI

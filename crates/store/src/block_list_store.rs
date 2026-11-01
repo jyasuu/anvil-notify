@@ -33,7 +33,11 @@ const CACHE_KEY: &str = "block_list";
 ///
 /// Scoped to the consumer's `check()` call so that tests can substitute a
 /// mock without needing a real DB pool.
+// clippy >= 1.9x flags `double_must_use` on every method of an `#[async_trait]`
+// trait (the boxed future is already `#[must_use]`).  The attribute is added
+// by the macro expansion, not written here, so allow the lint on the trait.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait BlockListChecker: Send + Sync {
     async fn check(&self, email: &str) -> Result<(), AppError>;
 }

@@ -17,8 +17,8 @@ info:
 
     ## Authentication
 
-    When `http.api_key` is configured, every route except `/health` and `/ready`
-    requires `Authorization: Bearer <token>`. A missing or malformed header returns
+    When `http.api_key` is configured, every route except `/health`, `/ready`, `/docs`,
+    `/openapi.yaml` and `/asyncapi.yaml` requires `Authorization: Bearer <token>`. A missing or malformed header returns
     **401**; a wrong token returns **403**. When no key is configured (network-isolated
     deployments, `allow_unauthenticated = true`) all routes are open.
 
@@ -56,7 +56,7 @@ tags:
   - name: Probes
     description: Liveness and readiness. Always unauthenticated.
   - name: Docs
-    description: This specification and its AsyncAPI companion.
+    description: This specification, its Redoc viewer and its AsyncAPI companion.
 
 security:
   - bearerAuth: []
@@ -110,35 +110,50 @@ paths:
                   status: { type: string, const: unavailable }
                   error: { type: string }
 
+  /docs:
+    get:
+      tags: [Docs]
+      operationId: getDocsPage
+      summary: Browsable API reference (Redoc)
+      description: |
+        HTML page that renders `/openapi.yaml` with Redoc. The page itself is served by
+        this service; the Redoc script is loaded by the browser from jsDelivr (pinned
+        version, Subresource Integrity). Served without authentication.
+      security: []
+      responses:
+        "200":
+          description: The HTML page.
+          content:
+            text/html:
+              schema: { type: string }
+
   /openapi.yaml:
     get:
       tags: [Docs]
       operationId: getOpenApi
       summary: This OpenAPI document
-      description: Embedded in the binary at build time, so it always matches the running version.
+      description: Embedded in the binary at build time, so it always matches the running version. Served without authentication.
+      security: []
       responses:
         "200":
           description: The OpenAPI 3.1 document.
           content:
             application/yaml:
               schema: { type: string }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
 
   /asyncapi.yaml:
     get:
       tags: [Docs]
       operationId: getAsyncApi
       summary: The AsyncAPI document for the RabbitMQ contract
-      description: Describes the `NotificationEvent` message, exchanges and queues.
+      description: Describes the `NotificationEvent` message, exchanges and queues. Served without authentication.
+      security: []
       responses:
         "200":
           description: The AsyncAPI 3.0 document.
           content:
             application/yaml:
               schema: { type: string }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
 
   /emails/send:
     post:
@@ -272,10 +287,10 @@ paths:
         The original `timestamp` is preserved, so attachments past their `max_age_secs`
         are rejected with 422. Rate limited with the other retry endpoint.
 
-        If the broker publish fails after the reset (503), the rows are already
-        `PENDING` with no queued message (counter `retry_publish_failed_total`).
-        Calling this endpoint again will **not** pick them up, because it only selects
-        `FAILED` rows. Re-publish the event instead.
+        If re-enqueueing fails after the reset (503 broker unavailable, or a 422 from the
+        replay checks), the rows are put back to `FAILED` with the reason in `last_error`,
+        so the call can simply be repeated once the cause is fixed. The broker case also
+        increments `retry_publish_failed_total`.
       responses:
         "202":
           description: Recipients reset and event re-enqueued.
@@ -325,8 +340,9 @@ paths:
         Retrying a `BLOCKED` recipient only helps after the address has been removed
         from the blocklist; otherwise the consumer blocks it again.
 
-        If the broker publish fails (503) the row is already `PENDING`, and calling
-        again returns 404. Re-publish the event instead.
+        If re-enqueueing fails (503 broker unavailable, or a 422 from the replay checks)
+        the row is put back to `FAILED` (a `BLOCKED` row comes back as `FAILED`, still
+        retryable) with the reason in `last_error`, so the call can simply be repeated.
       responses:
         "202":
           description: Recipient reset and event re-enqueued.

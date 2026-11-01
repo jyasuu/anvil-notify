@@ -82,14 +82,35 @@ async fn asyncapi_document_is_served() {
 }
 
 #[tokio::test]
-async fn documents_require_the_api_key_when_one_is_configured() {
+async fn docs_page_points_at_the_openapi_document() {
+    let (status, ctype, body) = get(state(Some("secret")), "/docs", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(ctype.starts_with("text/html"), "content-type: {ctype}");
+    assert!(body.contains("spec-url=\"/openapi.yaml\""));
+    // Pinned + integrity-checked: never an unpinned or floating script URL.
+    assert!(body.contains("redoc@2.") && body.contains("integrity=\"sha384-"));
+}
+
+#[tokio::test]
+async fn documents_are_public_even_when_an_api_key_is_configured() {
     for path in ["/openapi.yaml", "/asyncapi.yaml"] {
+        // No token, and a wrong token, are both accepted: the documents sit
+        // outside the bearer-auth layer, like the probes.
         let s = state(Some("secret"));
-        assert_eq!(get(s.clone(), path, None).await.0, StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            get(s.clone(), path, Some("wrong")).await.0,
-            StatusCode::FORBIDDEN
-        );
-        assert_eq!(get(s, path, Some("secret")).await.0, StatusCode::OK);
+        assert_eq!(get(s.clone(), path, None).await.0, StatusCode::OK);
+        assert_eq!(get(s, path, Some("wrong")).await.0, StatusCode::OK);
     }
+}
+
+#[tokio::test]
+async fn protected_routes_still_require_the_api_key() {
+    let s = state(Some("secret"));
+    assert_eq!(
+        get(s.clone(), "/templates", None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        get(s, "/templates", Some("wrong")).await.0,
+        StatusCode::FORBIDDEN
+    );
 }

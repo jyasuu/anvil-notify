@@ -279,6 +279,15 @@ mod processor_tests {
             unimplemented!("not needed for consumer unit tests")
         }
 
+        async fn revert_to_failed(
+            &self,
+            _event_id: Uuid,
+            _recipient_ids: &[String],
+            _reason: &str,
+        ) -> Result<u64, AppError> {
+            unimplemented!("not needed for consumer unit tests")
+        }
+
         fn pool(&self) -> &sqlx::PgPool {
             unimplemented!("not needed for consumer unit tests")
         }

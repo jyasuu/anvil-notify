@@ -106,13 +106,14 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/admin/blocklist/cache", delete(invalidate_blocklist_cache))
         .route("/admin/blocklist/cache", post(reload_blocklist_cache))
         .route("/admin/blocklist/{id}", delete(remove_blocklist_entry))
-        // ── API documents (OpenAPI / AsyncAPI) ────────────────────────────
-        .merge(crate::docs::router())
         .merge(retry_routes)
         .layer(middleware::from_fn_with_state(state.clone(), bearer_auth));
 
+    // The API documents describe the public contract and carry no data, so
+    // like the probes they are served without a bearer token.
     Router::new()
         .merge(probes)
+        .merge(crate::docs::router())
         .merge(protected)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(TraceLayer::new_for_http())

@@ -94,7 +94,11 @@ pub struct EventDeliveryDetail {
 /// The consumer processor (`processor.rs`) calls these methods; it never
 /// touches the underlying tables directly.  This makes adding a new channel
 /// a matter of writing a new implementor — the processor is unchanged.
+// clippy >= 1.9x flags `double_must_use` on every method of an `#[async_trait]`
+// trait (the boxed future is already `#[must_use]`).  The attribute is added
+// by the macro expansion, not written here, so allow the lint on the trait.
 #[async_trait::async_trait]
+#[allow(clippy::double_must_use)]
 pub trait NotificationStore: Send + Sync + 'static {
     /// Insert a PENDING delivery row.
     ///
@@ -223,6 +227,27 @@ pub trait NotificationStore: Send + Sync + 'static {
     /// Reset ALL FAILED rows for an event to PENDING, returning the
     /// recipient IDs that were actually reset.
     async fn reset_all_failed_for_event(&self, event_id: Uuid) -> Result<Vec<String>, AppError>;
+
+    /// Compensating action for a manual retry whose re-enqueue failed.
+    ///
+    /// `reset_for_retry` / `reset_all_failed_for_event` flip rows to `PENDING`
+    /// *before* the event is re-published.  If the publish (or any validation
+    /// in the replay path) then fails, no AMQP message exists to drive those
+    /// rows forward and neither retry endpoint can select them any more
+    /// (both require `FAILED`/`BLOCKED`), so the operator would get a 404
+    /// until the stale-PENDING reaper fires.  This puts the rows back to
+    /// `FAILED` with `reason` in `last_error` so the retry can simply be
+    /// called again.
+    ///
+    /// Only rows that are still `PENDING` are touched, so a row the consumer
+    /// has already picked up is never clobbered.  Returns the number of rows
+    /// reverted.
+    async fn revert_to_failed(
+        &self,
+        event_id: Uuid,
+        recipient_ids: &[String],
+        reason: &str,
+    ) -> Result<u64, AppError>;
 
     /// Return the authoritative event-level email replay data for `event_id`.
     ///
@@ -840,6 +865,37 @@ impl NotificationStore for EmailNotificationStore {
         .await?;
 
         Ok(rows.into_iter().map(|r| r.recipient_id).collect())
+    }
+
+    #[instrument(skip(self, reason))]
+    async fn revert_to_failed(
+        &self,
+        event_id: Uuid,
+        recipient_ids: &[String],
+        reason: &str,
+    ) -> Result<u64, AppError> {
+        // Runtime-checked query: avoids needing a regenerated `.sqlx` offline
+        // cache entry for this statement.
+        let result = sqlx::query(
+            r#"
+            UPDATE notification_log
+               SET status     = 'FAILED',
+                   last_error = $4,
+                   updated_at = now()
+             WHERE event_id     = $1
+               AND channel      = $2
+               AND recipient_id = ANY($3)
+               AND status       = 'PENDING'
+            "#,
+        )
+        .bind(event_id)
+        .bind(CHANNEL_EMAIL)
+        .bind(recipient_ids)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
     }
 
     #[instrument(skip(self))]

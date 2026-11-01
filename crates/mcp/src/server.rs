@@ -588,7 +588,7 @@ pub struct UpsertTemplateArgs {
     /// Email channel (defaults to "email")
     #[serde(default = "default_channel")]
     pub channel: String,
-    /// Subject line (supports Handlebars template variables)
+    /// Subject line (supports minijinja template variables)
     pub subject: String,
     /// HTML body content
     pub body_html: String,

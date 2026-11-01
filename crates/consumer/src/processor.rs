@@ -143,7 +143,7 @@ pub async fn process_recipient(
 
     // ── 2c. Template rendering (before DB write) ──────────────────────────────
     // Rendering is done here, before the idempotency DB write, so that a
-    // permanently broken template (bad Handlebars syntax) returns Failed without
+    // permanently broken template (bad minijinja syntax) returns Failed without
     // ever creating a PENDING row.  Without this, a bad template creates a row
     // on the first attempt, returns Failed, and the retry loop burns through
     // max_retries on a Duplicate path before giving up — producing log noise and

@@ -31,8 +31,9 @@ max_concurrency       = 10      # max parallel message handlers
 # Increase for providers with long rate-limit cooldown windows (e.g. free-tier
 # SendGrid); decrease to fail faster during sustained outages.
 max_rl_waits          = 5
-# Hard cap on recipients per AMQP message. Events exceeding this are sent to
-# the DLQ for operator inspection. Raise for bulk-mailing; default: 500.
+# Hard cap on recipients per AMQP message. Events exceeding this are not sent:
+# the consumer writes a sentinel FAILED row (visible via GET /emails/{event_id})
+# and ACKs the message. Raise for bulk-mailing; default: 500.
 max_recipients_per_event = 500
 outbox_poll_interval_ms      = 1000  # base ms between outbox polls; backs off up to 8× when idle
 outbox_batch_size            = 10    # rows per poll cycle (smaller = shorter IN_PROGRESS lock window)

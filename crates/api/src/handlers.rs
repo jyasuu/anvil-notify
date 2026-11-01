@@ -63,7 +63,7 @@ async fn republish_event(
     let detail = state.store.get_event_delivery_detail(event_id).await?;
 
     // ── 3. Validate stored from_override address ──────────────────────────────
-    // Reject before re-enqueuing so a stored bad address surfaces as a 400
+    // Reject before re-enqueuing so a stored bad address surfaces as a 422
     // here rather than a guaranteed permanent failure on every consumer retry.
     if let Some(ref ov) = detail.from_override {
         if let Some(email) = ov.get("email").and_then(|v| v.as_str()) {
@@ -265,8 +265,8 @@ async fn republish_event(
     // ── 10. Build and publish the replay envelope ─────────────────────────────
     //
     // Guard: if the stored payload is JSON null the template renderer will
-    // fail with a Template error on every consumer attempt, silently DLQ-ing
-    // the message.  Surface this as a 400 here so the operator knows the row
+    // fail with a Template error on every consumer attempt, ending in a FAILED
+    // row (the message is ACKed, not dead-lettered).  Surface this as a 422 here so the operator knows the row
     // needs repairing before a retry will work.
     if detail.payload.is_null() {
         return Err(ApiError(AppError::permanent_mailer(
@@ -301,13 +301,14 @@ async fn republish_event(
 
     // ── Atomicity note ────────────────────────────────────────────────────────
     // The DB rows were already reset to PENDING by the caller before this
-    // function runs. If the AMQP publish below fails, those rows stay PENDING
-    // with no message in the queue to drive them forward — they are "orphaned".
-    //
-    // Recovery: the Prometheus counter `retry_publish_failed_total` fires on
-    // every such failure. Alert on it. An operator can recover by calling the
-    // retry endpoint again once the broker is healthy; the consumer's idempotency
+    // function runs. If the AMQP publish below fails, no message exists to drive
+    // those rows forward.  `republish_or_revert` (the only caller) compensates
+    // by putting them back to FAILED, so the operator can simply call the retry
+    // endpoint again once the broker is healthy; the consumer's idempotency
     // check prevents double-processing if the first publish did succeed.
+    //
+    // The Prometheus counter `retry_publish_failed_total` fires on every such
+    // failure — alert on it to learn that the broker is rejecting retries.
     state.publisher.publish(body).await.map_err(|e| {
         counter!("retry_publish_failed_total",
             "event_id" => event_id.to_string())
@@ -316,8 +317,8 @@ async fn republish_event(
             %event_id,
             error = %e,
             "AMQP publish failed after DB rows reset to PENDING — \
-             rows are now orphaned (stuck PENDING with no queue message). \
-             Re-call the retry endpoint once the broker recovers. \
+             the caller will revert them to FAILED; re-call the retry endpoint \
+             once the broker recovers. \
              Monitor `retry_publish_failed_total` to alert on this condition."
         );
         ApiError(e)
@@ -705,6 +706,43 @@ pub async fn invalidate_all_template_cache(State(state): State<ApiState>) -> imp
     StatusCode::NO_CONTENT
 }
 
+/// Re-publish `only_emails` for `event_id`; if that fails for any reason,
+/// put the rows the caller just reset back to `FAILED`.
+///
+/// The retry endpoints reset rows to `PENDING` first (atomic guard against
+/// concurrent retries) and re-enqueue second.  Without this compensation a
+/// failure in between (broker down, expired attachment, bad stored
+/// `from_override`, …) strands the rows in `PENDING`: no message exists to
+/// process them and a second retry call 404s because it only selects
+/// `FAILED`/`BLOCKED` rows.
+async fn republish_or_revert(
+    state: &ApiState,
+    event_id: Uuid,
+    only_emails: &[String],
+) -> Result<(), ApiError> {
+    match republish_event(state, event_id, Some(only_emails)).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let reason = format!("manual retry aborted: re-enqueue failed: {}", e.0);
+            match state
+                .store
+                .revert_to_failed(event_id, only_emails, &reason)
+                .await
+            {
+                Ok(n) => tracing::warn!(
+                    %event_id, reverted = n,
+                    "Retry re-enqueue failed — reverted rows to FAILED so the retry can be repeated"
+                ),
+                Err(re) => tracing::error!(
+                    %event_id, error = %re,
+                    "Retry re-enqueue failed AND revert to FAILED failed — rows may be stuck PENDING until the stale-PENDING reaper runs"
+                ),
+            }
+            Err(e)
+        }
+    }
+}
+
 /// POST /emails/:event_id/recipients/:email/retry
 ///
 /// Atomically resets one FAILED recipient row back to PENDING and re-enqueues
@@ -714,7 +752,9 @@ pub async fn invalidate_all_template_cache(State(state): State<ApiState>) -> imp
 ///
 /// Returns:
 /// * 202 — reset successfully
-/// * 404 — no FAILED record for this event+recipient
+/// * 404 — no FAILED or BLOCKED record for this event+recipient
+/// * 422 / 503 — re-enqueue failed; the row is reverted to FAILED so the
+///   call can simply be repeated
 pub async fn retry_recipient(
     State(state): State<ApiState>,
     Path((event_id, email)): Path<(Uuid, String)>,
@@ -734,7 +774,7 @@ pub async fn retry_recipient(
     state.store.reset_for_retry(event_id, &email).await?;
     // Only re-enqueue the one recipient that was reset — not the whole event.
     // SENT/BLOCKED recipients in the same event must not be re-published.
-    republish_event(&state, event_id, Some(std::slice::from_ref(&email))).await?;
+    republish_or_revert(&state, event_id, std::slice::from_ref(&email)).await?;
 
     Ok((
         StatusCode::ACCEPTED,
@@ -775,7 +815,7 @@ pub async fn retry_event(
         ))));
     }
 
-    republish_event(&state, event_id, Some(&reset)).await?;
+    republish_or_revert(&state, event_id, &reset).await?;
 
     Ok((
         StatusCode::ACCEPTED,
@@ -980,7 +1020,7 @@ pub struct SendEmailRequest {
     /// Logical event type driving template selection (e.g. `"ORDER_CONFIRMATION"`).
     pub event_type: String,
 
-    /// Arbitrary key/value template variables forwarded to the Handlebars renderer.
+    /// Arbitrary key/value template variables forwarded to the minijinja renderer.
     pub payload: serde_json::Value,
 
     /// Email-specific options: recipients, CC/BCC, attachments, sender account, etc.
@@ -1001,8 +1041,9 @@ pub struct SendEmailRequest {
 ///
 /// Returns:
 /// * 202 — event accepted and enqueued; `event_id` is in the response body
-/// * 400 — validation failure (empty recipients, bad address, etc.)
-/// * 422 — permanently invalid field (e.g. malformed `from_override` email)
+/// * 400 — request body is not valid JSON / is missing required fields (axum extractor)
+/// * 422 — validation failure (empty `event_type`/recipients, bad address, malformed
+///   `from_override`, recipient count over `max_recipients_per_event`)
 /// * 503 — RabbitMQ unavailable
 pub async fn send_email(
     State(state): State<ApiState>,
@@ -1022,7 +1063,7 @@ pub async fn send_email(
     }
 
     // Enforce the same recipient ceiling the consumer applies so callers get a
-    // 400 here rather than a 202 followed by a silent FAILED row written by the
+    // 422 here rather than a 202 followed by a silent FAILED row written by the
     // consumer after the message has already been enqueued and dequeued.
     if req.email.recipients.len() > state.max_recipients_per_event {
         return Err(ApiError(AppError::permanent_mailer(format!(
