@@ -1,0 +1,424 @@
+asyncapi: 3.0.0
+
+info:
+  title: anvil-notify events
+  version: 0.1.0
+  description: |
+    The RabbitMQ contract of **anvil-notify**.
+
+    Business services (usually through the outbox worker) publish a
+    `NotificationEvent` to the `anvil-notify` exchange. The consumer renders the
+    template, delivers it and records one `notification_log` row per recipient.
+
+    Names below are the **defaults** from `config/default.toml` (`amqp.exchange`,
+    `amqp.queue`, `amqp.routing_key`). The `.dlx`, `.dlq` and `.delayed` names are
+    derived from them.
+
+    ## Publishing rules
+
+    * Publish with `content_type: application/json` and `delivery_mode: 2` (persistent).
+    * Use **publisher confirms** and `mandatory: true`, as the API and outbox worker do.
+      Without `mandatory`, publishing before the consumer has declared its queues is
+      confirmed by the broker and then silently lost.
+    * `event_id` is the idempotency key, per recipient. Re-publishing an event is safe.
+    * Replay is lossless: retries rebuild the event from the stored log, keeping the
+      original `timestamp`. Attachment URLs are therefore judged by their original age.
+
+    ## Topology
+
+    ```
+    publisher ──▶ [anvil-notify] direct ──email.requested──▶ (email.requested) ──▶ consumer
+                                                                  │
+                                    nack, requeue=false           │ send_at in the future
+                                           ▼                      ▼
+                       [anvil-notify.dlx] fanout        [anvil-notify.delayed] fanout
+                                           ▼                      ▼
+                             (email.requested.dlq)     (email.requested.delayed, per-message TTL)
+                                                                  │ TTL expires, dead-lettered to
+                                                                  ▼ [anvil-notify] / email.requested
+    ```
+
+    The consumer declares the topology on startup. The API's publisher declares only
+    the `anvil-notify` exchange (idempotent).
+  license:
+    name: MIT
+
+defaultContentType: application/json
+
+servers:
+  rabbitmq:
+    host: localhost:5672
+    protocol: amqp
+    protocolVersion: 0-9-1
+    description: |
+      The broker from `amqp.url` (default `amqp://guest:guest@localhost:5672`).
+      Replace the credentials in any real deployment.
+    security:
+      - $ref: "#/components/securitySchemes/userPassword"
+
+channels:
+  notificationRequests:
+    address: email.requested
+    title: Notification requests (exchange side)
+    description: |
+      Where publishers send. The address is the routing key; the target is the durable
+      direct exchange `anvil-notify`, which routes to the `email.requested` queue (see
+      `notificationQueue`).
+    servers:
+      - $ref: "#/servers/rabbitmq"
+    messages:
+      notificationEvent:
+        $ref: "#/components/messages/NotificationEvent"
+    bindings:
+      amqp:
+        is: routingKey
+        exchange:
+          name: anvil-notify
+          type: direct
+          durable: true
+          autoDelete: false
+        bindingVersion: 0.3.0
+
+  notificationQueue:
+    address: email.requested
+    title: Notification work queue
+    description: |
+      Main work queue, bound to `anvil-notify` with routing key `email.requested`.
+      Declared with `x-dead-letter-exchange: anvil-notify.dlx`.
+
+      Consumers prefetch `amqp.max_concurrency` messages (default 10). Several replicas
+      may consume the queue; the broker distributes round-robin.
+    servers:
+      - $ref: "#/servers/rabbitmq"
+    messages:
+      notificationEvent:
+        $ref: "#/components/messages/NotificationEvent"
+    bindings:
+      amqp:
+        is: queue
+        queue:
+          name: email.requested
+          durable: true
+          exclusive: false
+          autoDelete: false
+        bindingVersion: 0.3.0
+
+  scheduledHold:
+    address: anvil-notify.delayed
+    title: Scheduled notifications (exchange side)
+    description: |
+      Holding area for events whose `channel_overrides.email.send_at` is in the future.
+
+      **Publishers do not use this channel.** When the consumer receives such an event
+      it re-publishes the raw message to the fanout exchange `anvil-notify.delayed`
+      (routing key ignored), which feeds the queue `email.requested.delayed`, with a
+      per-message TTL equal to the time left until `send_at`. On expiry RabbitMQ
+      dead-letters it back to `anvil-notify` with routing key `email.requested`, and it is
+      processed as normal.
+
+      Nothing consumes `email.requested.delayed`. Avoid very long schedules: the delay
+      is bounded by what the broker does with a per-message TTL.
+    servers:
+      - $ref: "#/servers/rabbitmq"
+    messages:
+      notificationEvent:
+        $ref: "#/components/messages/NotificationEvent"
+    bindings:
+      amqp:
+        is: routingKey
+        exchange:
+          name: anvil-notify.delayed
+          type: fanout
+          durable: true
+          autoDelete: false
+        bindingVersion: 0.3.0
+
+  deadLetter:
+    address: email.requested.dlq
+    title: Dead-letter queue
+    description: |
+      Messages the consumer rejected without requeue: payloads that parse as neither
+      `NotificationEvent` nor the legacy `EmailEvent`, and events whose attachments fail
+      to fetch with a permanent error (bad URL, expired `max_age_secs`).
+
+      Inspect these by hand. Fix the cause and re-publish a corrected event. They are not
+      replayed automatically. Per-recipient delivery failures normally do **not** end here;
+      they are recorded as `FAILED` rows and retried through the HTTP API.
+
+      Fed by the fanout exchange `anvil-notify.dlx`, bound with the main queue's name as
+      binding key (ignored by fanout).
+    servers:
+      - $ref: "#/servers/rabbitmq"
+    messages:
+      notificationEvent:
+        $ref: "#/components/messages/NotificationEvent"
+    bindings:
+      amqp:
+        is: queue
+        queue:
+          name: email.requested.dlq
+          durable: true
+          exclusive: false
+          autoDelete: false
+        bindingVersion: 0.3.0
+
+operations:
+  publishNotificationEvent:
+    action: send
+    title: Request a notification
+    summary: Publish a NotificationEvent for delivery.
+    description: |
+      Done by business services through the outbox worker, by `POST /emails/send`, and
+      by the retry endpoints (which republish a reconstructed event).
+    channel:
+      $ref: "#/channels/notificationRequests"
+    messages:
+      - $ref: "#/channels/notificationRequests/messages/notificationEvent"
+    bindings:
+      amqp:
+        deliveryMode: 2
+        mandatory: true
+        bindingVersion: 0.3.0
+
+  consumeNotificationEvent:
+    action: receive
+    title: Deliver a notification
+    summary: Render, filter, send and log each recipient.
+    description: |
+      Internal to anvil-notify. Validates the event, applies the recipient filter,
+      defers future `send_at` events to the delayed queue, then delivers per recipient
+      with retries (`max_retries`, exponential back-off from `retry_base_ms`).
+      Messages are acknowledged manually.
+    channel:
+      $ref: "#/channels/notificationQueue"
+    messages:
+      - $ref: "#/channels/notificationQueue/messages/notificationEvent"
+
+  deferNotificationEvent:
+    action: send
+    title: Park a scheduled notification
+    summary: Re-publish an event with a TTL until its `send_at`.
+    description: Internal to anvil-notify.
+    channel:
+      $ref: "#/channels/scheduledHold"
+    messages:
+      - $ref: "#/channels/scheduledHold/messages/notificationEvent"
+
+  inspectDeadLetter:
+    action: receive
+    title: Inspect rejected messages
+    summary: Operator tooling reads the dead-letter queue.
+    channel:
+      $ref: "#/channels/deadLetter"
+    messages:
+      - $ref: "#/channels/deadLetter/messages/notificationEvent"
+
+components:
+  securitySchemes:
+    userPassword:
+      type: userPassword
+      description: Credentials embedded in `amqp.url`.
+
+  messages:
+    NotificationEvent:
+      name: NotificationEvent
+      title: Notification event
+      summary: A channel-agnostic request to notify one or more recipients.
+      description: |
+        Only the email channel exists today. Channel-specific options live under
+        `channel_overrides`, so new channels can be added without changing the envelope.
+
+        **Legacy shape.** The flat `EmailEvent` envelope (top-level `recipients`,
+        `cc`, `bcc`, ...) is still accepted and promoted to this shape, but is
+        deprecated. New publishers should use `channel_overrides.email`.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/NotificationEvent"
+      bindings:
+        amqp:
+          contentEncoding: utf-8
+          messageType: notification.event
+          bindingVersion: 0.3.0
+      examples:
+        - name: Single recipient
+          payload:
+            event_id: 0190a5c3-6a2e-7c2b-9d41-3f6f9c1e2a10
+            timestamp: "2026-11-01T08:30:00Z"
+            event_type: ORDER_CONFIRMATION
+            payload: { order_id: "123", name: Alice }
+            channel_overrides:
+              email:
+                recipients:
+                  - { email: alice@example.com, name: Alice }
+        - name: Group send with attachment, delayed
+          payload:
+            event_id: 0190a5c3-9b10-7e44-8a05-1d2c3b4a5f60
+            timestamp: "2026-11-01T08:30:00Z"
+            event_type: MONTHLY_STATEMENT
+            payload: { month: "2026-10" }
+            metadata: { source: billing-service }
+            channel_overrides:
+              email:
+                recipients:
+                  - { email: finance-a@example.com }
+                  - { email: finance-b@example.com }
+                send_mode: group
+                group_retry_mode: individual
+                send_at: "2026-11-02T09:00:00Z"
+                attachments:
+                  - url: https://storage.example.com/statements/2026-10.pdf?token=abc
+                    filename: statement-2026-10.pdf
+                    content_type: application/pdf
+                    max_age_secs: 86400
+
+  schemas:
+    NotificationEvent:
+      type: object
+      required: [event_id, timestamp, event_type, payload]
+      properties:
+        event_id:
+          type: string
+          format: uuid
+          description: Stable unique ID. Idempotency key, per recipient.
+        timestamp:
+          type: string
+          format: date-time
+          description: |
+            Publication time, set by the publisher. Attachment `max_age_secs` is measured
+            from this instant.
+        event_type:
+          type: string
+          description: Selects the template, for example `ORDER_CONFIRMATION`.
+        payload:
+          description: Template variables passed to the renderer. Send an object, not `null`.
+          type: [object, array, string, number, boolean]
+        metadata:
+          $ref: "#/components/schemas/Metadata"
+        channel_overrides:
+          $ref: "#/components/schemas/ChannelOverrides"
+
+    Metadata:
+      type: object
+      default: {}
+      properties:
+        source:
+          type: [string, "null"]
+          description: Origin tag for tracing.
+
+    ChannelOverrides:
+      type: object
+      default: {}
+      description: |
+        Per-channel options. An event with no channel set is skipped by the consumer
+        (status `SKIPPED`).
+      properties:
+        email:
+          oneOf:
+            - $ref: "#/components/schemas/EmailOptions"
+            - type: "null"
+
+    EmailOptions:
+      type: object
+      required: [recipients]
+      properties:
+        recipients:
+          type: array
+          description: |
+            TO recipients, each processed independently. Between 1 and
+            `amqp.max_recipients_per_event` (default 500). A longer list is acknowledged
+            without delivery and recorded as one sentinel `FAILED` row, visible through
+            `GET /emails/{event_id}`; split the event and re-publish.
+            The legacy key `recipient`, holding a single object, is accepted too.
+          items: { $ref: "#/components/schemas/Recipient" }
+        cc:
+          type: array
+          default: []
+          description: Blocked addresses are dropped silently (WARN log). Invalid ones fail the delivery.
+          items: { $ref: "#/components/schemas/Recipient" }
+        bcc:
+          type: array
+          default: []
+          items: { $ref: "#/components/schemas/Recipient" }
+        from_override:
+          oneOf:
+            - $ref: "#/components/schemas/FromOverride"
+            - type: "null"
+        attachments:
+          type: array
+          default: []
+          items: { $ref: "#/components/schemas/AttachmentRef" }
+        sender_account:
+          type: [string, "null"]
+          description: Key under `[sender_accounts]`. Falls back to the global `[mailer]` settings.
+        send_mode:
+          type: string
+          enum: [individual, group]
+          default: individual
+          description: |
+            `individual` — one email and one log row per recipient.
+            `group` — one shared email, all TO addresses visible, tracked as a unit.
+        group_retry_mode:
+          type: string
+          enum: [whole, individual]
+          default: whole
+          description: |
+            Only used when `send_mode = group`. `whole` retries the group email and may
+            duplicate mail to recipients already served. `individual` retries per recipient
+            and skips addresses already `SENT`.
+        retry_policy:
+          type: string
+          enum: [retry, no_retry]
+          default: retry
+          description: |
+            `no_retry` marks any failure `FAILED` at once, without automatic retries.
+            Manual retry through the HTTP API is still possible.
+        send_at:
+          type: [string, "null"]
+          format: date-time
+          description: Hold until this time. Past or absent means deliver now.
+        priority:
+          type: [integer, "null"]
+          minimum: 0
+          description: Outbox dispatch ordering. Lower values go first.
+
+    Recipient:
+      type: object
+      required: [email]
+      properties:
+        email: { type: string, format: email }
+        name:
+          type: [string, "null"]
+          description: Display name. Available to templates as `{{name}}`.
+
+    FromOverride:
+      type: object
+      required: [email]
+      properties:
+        email: { type: string, format: email }
+        name: { type: [string, "null"] }
+
+    AttachmentRef:
+      type: object
+      required: [url, filename, content_type]
+      description: Fetched with an HTTP GET when the email is sent, then attached.
+      properties:
+        url:
+          type: string
+          format: uri
+          description: Must start with `http://` or `https://`.
+        filename:
+          type: string
+          minLength: 1
+          description: Must not contain `/` or `\`.
+        content_type:
+          type: string
+          description: MIME type. Must contain `/`.
+        fetch_token:
+          type: [string, "null"]
+          description: Credential presented when fetching `url`.
+        max_age_secs:
+          type: [integer, "null"]
+          minimum: 0
+          description: |
+            The URL expires this many seconds after `timestamp`. Expired attachments fail
+            permanently, and a later retry cannot revive them: re-publish with fresh URLs.

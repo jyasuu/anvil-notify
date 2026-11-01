@@ -84,3 +84,20 @@ jobs:
 
       - name: Run audit
         run: cargo audit
+
+  # -- API documents ------------------------------------------------------------
+  # docs/openapi.yaml must stay in step with the axum routers; docs/asyncapi.yaml
+  # must be a valid AsyncAPI document.
+  api-docs:
+    name: API Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check OpenAPI matches the routers
+        run: |
+          pip install pyyaml openapi-spec-validator
+          python3 scripts/check_api_docs.py
+
+      - name: Validate AsyncAPI
+        run: npx --yes @asyncapi/cli validate docs/asyncapi.yaml

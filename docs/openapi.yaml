@@ -1,0 +1,972 @@
+openapi: 3.1.0
+
+info:
+  title: anvil-notify HTTP API
+  version: 0.1.0
+  summary: Send, inspect and retry notifications; manage templates and the recipient blocklist.
+  description: |
+    The HTTP API of **anvil-notify**.
+
+    Most notifications reach the service through the transactional outbox and
+    RabbitMQ (see the companion `asyncapi.yaml`). This API covers the rest:
+
+    * **Direct send** — enqueue one event without writing to an outbox.
+    * **Status and retry** — inspect per-recipient delivery state and re-enqueue failures.
+    * **Templates** — create, update and read email templates, and evict the template cache.
+    * **Blocklist admin** — manage the database-backed block/allow list.
+
+    ## Authentication
+
+    When `http.api_key` is configured, every route except `/health` and `/ready`
+    requires `Authorization: Bearer <token>`. A missing or malformed header returns
+    **401**; a wrong token returns **403**. When no key is configured (network-isolated
+    deployments, `allow_unauthenticated = true`) all routes are open.
+
+    ## Errors
+
+    Errors raised by handlers return `{"error": "<message>"}`. Errors raised by
+    the framework before a handler runs (invalid JSON, wrong `Content-Type`) return a
+    plain-text body, not this shape.
+
+    Validation failures return **422**, not 400. A **400** is returned only for
+    JSON that cannot be parsed at all.
+    Delivery-time problems (blocked recipient, SMTP failure) never fail the HTTP call;
+    they show up later in the status endpoints.
+
+    ## Limits
+
+    * Request bodies are capped at 1 MiB (**413** above that).
+    * The two retry endpoints share a token bucket of 60 calls per minute
+      (**429** with `Retry-After: 60`).
+  license:
+    name: MIT
+    identifier: MIT
+
+servers:
+  - url: http://localhost:8080
+    description: Local development (default `http.port`)
+
+tags:
+  - name: Emails
+    description: Direct send, delivery status and retry.
+  - name: Templates
+    description: Template CRUD and cache control.
+  - name: Blocklist
+    description: Database-backed block/allow list.
+  - name: Probes
+    description: Liveness and readiness. Always unauthenticated.
+  - name: Docs
+    description: This specification and its AsyncAPI companion.
+
+security:
+  - bearerAuth: []
+
+paths:
+  /health:
+    get:
+      tags: [Probes]
+      operationId: getHealth
+      summary: Liveness probe
+      description: Always returns 200 while the process is up. Does not touch the database.
+      security: []
+      responses:
+        "200":
+          description: Process is alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, const: ok }
+
+  /ready:
+    get:
+      tags: [Probes]
+      operationId: getReady
+      summary: Readiness probe
+      description: |
+        Acquires a database connection with a 500 ms timeout. Use this, not `/health`,
+        for Docker/Kubernetes health checks.
+      security: []
+      responses:
+        "200":
+          description: Database reachable.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, const: ready }
+        "503":
+          description: Database unreachable or the pool is saturated.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, error]
+                properties:
+                  status: { type: string, const: unavailable }
+                  error: { type: string }
+
+  /openapi.yaml:
+    get:
+      tags: [Docs]
+      operationId: getOpenApi
+      summary: This OpenAPI document
+      description: Embedded in the binary at build time, so it always matches the running version.
+      responses:
+        "200":
+          description: The OpenAPI 3.1 document.
+          content:
+            application/yaml:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /asyncapi.yaml:
+    get:
+      tags: [Docs]
+      operationId: getAsyncApi
+      summary: The AsyncAPI document for the RabbitMQ contract
+      description: Describes the `NotificationEvent` message, exchanges and queues.
+      responses:
+        "200":
+          description: The AsyncAPI 3.0 document.
+          content:
+            application/yaml:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /emails/send:
+    post:
+      tags: [Emails]
+      operationId: sendEmail
+      summary: Enqueue a notification event
+      description: |
+        Validates the request, publishes a `NotificationEvent` to RabbitMQ and returns
+        **202** immediately. Rendering, sending and retries happen in the consumer.
+
+        Intended for low-volume, operator-initiated or test sends. For high-volume
+        transactional mail, write to the outbox instead (at-least-once delivery
+        without a synchronous broker dependency).
+
+        **Idempotency.** Supply `event_id` to make the call idempotent: the consumer
+        skips an `event_id` + recipient pair it has already logged. If omitted, a
+        UUIDv7 is generated.
+
+        **Validation** (each failure is a 422): non-empty `event_type`; 1 to
+        `amqp.max_recipients_per_event` recipients (default 500); syntactically valid
+        addresses in `recipients`, `cc`, `bcc` and `from_override`; attachment
+        metadata checks (see `AttachmentRef`).
+
+        Blocked recipients are **not** rejected here — they are evaluated by the
+        consumer and surface as `BLOCKED` in the status endpoints.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SendEmailRequest" }
+            examples:
+              minimal:
+                summary: One recipient
+                value:
+                  event_type: ORDER_CONFIRMATION
+                  payload: { order_id: "123", name: Alice }
+                  email:
+                    recipients:
+                      - { email: alice@example.com, name: Alice }
+              group:
+                summary: Group send with CC and a delayed release
+                value:
+                  event_id: 0190a5c3-6a2e-7c2b-9d41-3f6f9c1e2a10
+                  event_type: INCIDENT_ALERT
+                  payload: { service: billing, severity: high }
+                  source: pager-bridge
+                  email:
+                    recipients:
+                      - { email: oncall-a@example.com }
+                      - { email: oncall-b@example.com }
+                    cc:
+                      - { email: manager@example.com }
+                    send_mode: group
+                    group_retry_mode: individual
+                    retry_policy: no_retry
+                    send_at: "2026-11-02T09:00:00Z"
+      responses:
+        "202":
+          description: Event accepted and published to the broker.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SendAccepted" }
+        "400": { $ref: "#/components/responses/MalformedJson" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+        "503":
+          description: |
+            The broker is unavailable, rejected the message (no queue bound), or did not
+            confirm within 10 s. Safe to retry; reuse `event_id` to stay idempotent.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /emails/{event_id}:
+    parameters:
+      - $ref: "#/components/parameters/EventId"
+    get:
+      tags: [Emails]
+      operationId: getEmailStatus
+      summary: Delivery status for every recipient of an event
+      description: |
+        Returns one entry per `notification_log` row, capped at 500. When the cap is
+        hit `summary.truncated` is `true`; query individual recipients through
+        `/emails/{event_id}/recipients/{email}` for the rest.
+
+        An event skipped at validation time has a single `SKIPPED` row whose `email`
+        is the sentinel `event:<uuid>`.
+      responses:
+        "200":
+          description: Status for the event.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EventStatus" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /emails/{event_id}/recipients/{email}:
+    parameters:
+      - $ref: "#/components/parameters/EventId"
+      - $ref: "#/components/parameters/Email"
+    get:
+      tags: [Emails]
+      operationId: getRecipientStatus
+      summary: Delivery status for one recipient
+      responses:
+        "200":
+          description: Status for the recipient.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RecipientStatus" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /emails/{event_id}/retry:
+    parameters:
+      - $ref: "#/components/parameters/EventId"
+    post:
+      tags: [Emails]
+      operationId: retryEvent
+      summary: Retry every FAILED recipient of an event
+      description: |
+        Resets all `FAILED` recipients to `PENDING` in one atomic update, rebuilds the
+        original event from the stored log (payload, sender override, CC/BCC,
+        attachments, send mode) and re-publishes it containing only the reset recipients.
+
+        The original `timestamp` is preserved, so attachments past their `max_age_secs`
+        are rejected with 422. Rate limited with the other retry endpoint.
+
+        If the broker publish fails after the reset (503), the rows are already
+        `PENDING` with no queued message (counter `retry_publish_failed_total`).
+        Calling this endpoint again will **not** pick them up, because it only selects
+        `FAILED` rows. Re-publish the event instead.
+      responses:
+        "202":
+          description: Recipients reset and event re-enqueued.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [message, eventId, recipientsReset, recipients]
+                properties:
+                  message: { type: string }
+                  eventId: { type: string, format: uuid }
+                  recipientsReset: { type: integer, minimum: 1 }
+                  recipients:
+                    type: array
+                    description: Addresses that were reset.
+                    items: { type: string, format: email }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404":
+          description: The event has no `FAILED` recipients (or does not exist).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: |
+            Not retryable: the event was skipped at validation time, an attachment URL
+            has expired, a blocked CC/BCC address is stored, or stored data is malformed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/RetryRateLimited" }
+        "503": { $ref: "#/components/responses/BrokerUnavailable" }
+
+  /emails/{event_id}/recipients/{email}/retry:
+    parameters:
+      - $ref: "#/components/parameters/EventId"
+      - $ref: "#/components/parameters/Email"
+    post:
+      tags: [Emails]
+      operationId: retryRecipient
+      summary: Retry one FAILED or BLOCKED recipient
+      description: |
+        Atomically flips one `FAILED` **or `BLOCKED`** row to `PENDING` (concurrent
+        callers: only one wins, the rest get 404) and re-publishes the event with that
+        recipient only. Other recipients are not re-published.
+
+        Retrying a `BLOCKED` recipient only helps after the address has been removed
+        from the blocklist; otherwise the consumer blocks it again.
+
+        If the broker publish fails (503) the row is already `PENDING`, and calling
+        again returns 404. Re-publish the event instead.
+      responses:
+        "202":
+          description: Recipient reset and event re-enqueued.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [message, eventId, email]
+                properties:
+                  message: { type: string }
+                  eventId: { type: string, format: uuid }
+                  email: { type: string, format: email }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404":
+          description: No `FAILED` or `BLOCKED` row for this event and recipient.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: Invalid address in the path, or the event cannot be replayed (see bulk retry).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/RetryRateLimited" }
+        "503": { $ref: "#/components/responses/BrokerUnavailable" }
+
+  /templates:
+    get:
+      tags: [Templates]
+      operationId: listTemplates
+      summary: List all templates
+      description: |
+        Every row, including inactive ones, ordered by event type then channel.
+        Bodies are omitted; use `GET /templates/{event_type}` for the full content.
+      responses:
+        "200":
+          description: Template summaries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [templates]
+                properties:
+                  templates:
+                    type: array
+                    items: { $ref: "#/components/schemas/TemplateSummary" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [Templates]
+      operationId: upsertTemplate
+      summary: Create or update a template
+      description: |
+        Upserts the row for `(event_type, channel)`. `version` is bumped only when the
+        content actually changes. Fields are trimmed before saving.
+        The write evicts this event type from the cache of the instance that handled
+        it. Other replicas keep their cached copy until it expires (default 5 minutes)
+        or you call `DELETE /template-cache/{event_type}` on each of them.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TemplateUpsert" }
+            example:
+              event_type: ORDER_CONFIRMATION
+              channel: email
+              subject: "Order {{ orderId }} confirmed"
+              body_html: "<h1>Hi {{ name }}</h1>"
+              body_text: "Hi {{ name }}"
+              active: true
+      responses:
+        "200":
+          description: Existing template updated (or unchanged).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TemplateWriteResult" }
+        "201":
+          description: New template created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TemplateWriteResult" }
+        "400": { $ref: "#/components/responses/MalformedJson" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+
+  /templates/{event_type}:
+    parameters:
+      - $ref: "#/components/parameters/EventType"
+    get:
+      tags: [Templates]
+      operationId: getTemplate
+      summary: Get every channel variant of a template
+      description: Includes inactive rows and full bodies.
+      responses:
+        "200":
+          description: Template variants.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [templates]
+                properties:
+                  templates:
+                    type: array
+                    items: { $ref: "#/components/schemas/Template" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [Templates]
+      operationId: patchTemplate
+      summary: Partially update a template
+      description: |
+        Applies only the fields present, in one atomic `UPDATE … RETURNING`.
+        Targets `(event_type, channel)`; `channel` defaults to `email`.
+        Does not create rows — use `POST /templates` first.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TemplatePatch" }
+            example:
+              subject: New subject line
+              active: false
+      responses:
+        "200":
+          description: Template updated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TemplateWriteResult" }
+        "400": { $ref: "#/components/responses/MalformedJson" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+
+  /template-cache:
+    delete:
+      tags: [Templates]
+      operationId: invalidateAllTemplateCache
+      summary: Clear the whole template cache
+      description: The next delivery for every event type re-reads its template from the database.
+      responses:
+        "204": { description: Cache cleared. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /template-cache/{event_type}:
+    parameters:
+      - $ref: "#/components/parameters/EventType"
+    delete:
+      tags: [Templates]
+      operationId: invalidateTemplateCache
+      summary: Evict one template from the cache
+      description: |
+        Use after editing `notification_template` so the change applies without a
+        restart. Returns 204 even if the key was not cached.
+      responses:
+        "204": { description: Entry evicted (or was not cached). }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/blocklist:
+    get:
+      tags: [Blocklist]
+      operationId: listBlocklist
+      summary: List active block/allow-list entries
+      responses:
+        "200":
+          description: Active entries ordered by id.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [entries]
+                properties:
+                  entries:
+                    type: array
+                    items: { $ref: "#/components/schemas/BlocklistEntry" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [Blocklist]
+      operationId: addBlocklistEntry
+      summary: Add or reactivate an entry
+      description: |
+        `blocked_*` kinds always apply. Any `allowed_*` entry switches the filter into
+        allowlist mode: only listed addresses and domains may receive mail.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BlocklistAdd" }
+            example: { kind: blocked_email, value: bad@example.com, reason: opt-out }
+      responses:
+        "201":
+          description: Entry stored.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BlocklistEntry" }
+        "400": { $ref: "#/components/responses/MalformedJson" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+
+  /admin/blocklist/{id}:
+    delete:
+      tags: [Blocklist]
+      operationId: removeBlocklistEntry
+      summary: Deactivate an entry
+      description: Soft delete. The row is kept with `active = false`.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        "204": { description: Entry deactivated. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /admin/blocklist/cache:
+    post:
+      tags: [Blocklist]
+      operationId: reloadBlocklistCache
+      summary: Reload the blocklist cache from the database
+      description: Useful after a bulk import, to avoid waiting for the next TTL expiry.
+      responses:
+        "200":
+          description: Cache reloaded.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [reloaded, entry_count]
+                properties:
+                  reloaded: { type: boolean, const: true }
+                  entry_count: { type: integer, minimum: 0 }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500":
+          description: Entries could not be listed from the database.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      tags: [Blocklist]
+      operationId: invalidateBlocklistCache
+      summary: Evict the blocklist cache
+      description: The next recipient check reloads from the database. Use after direct DB edits.
+      responses:
+        "204": { description: Cache evicted. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Value of `http.api_key`. Only enforced when that setting is configured.
+
+  parameters:
+    EventId:
+      name: event_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Email:
+      name: email
+      in: path
+      required: true
+      description: Recipient address, URL-encoded (for example `alice%40example.com`).
+      schema: { type: string, format: email }
+    EventType:
+      name: event_type
+      in: path
+      required: true
+      description: Logical event type, for example `ORDER_CONFIRMATION`.
+      schema: { type: string }
+
+  responses:
+    MalformedJson:
+      description: Body is not valid JSON. Plain-text body from the framework.
+      content:
+        text/plain:
+          schema: { type: string }
+    Unauthorized:
+      description: '`Authorization` header missing or not of the form `Bearer <token>`.'
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: Bearer token does not match `http.api_key`.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Resource does not exist.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    PayloadTooLarge:
+      description: Body exceeds 1 MiB.
+      content:
+        text/plain:
+          schema: { type: string }
+    UnsupportedMediaType:
+      description: '`Content-Type` is not `application/json`. Plain-text body from the framework.'
+      content:
+        text/plain:
+          schema: { type: string }
+    Unprocessable:
+      description: |
+        Validation failed (missing or empty field, invalid address, unknown `kind`,
+        or JSON that does not match the schema). Handler-raised validation errors use
+        the `Error` shape; schema mismatches caught by the framework are plain text.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+        text/plain:
+          schema: { type: string }
+    BrokerUnavailable:
+      description: RabbitMQ unavailable or did not confirm the publish in time.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RetryRateLimited:
+      description: More than 60 retry calls in a minute (shared by both retry endpoints).
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying.
+          schema: { type: integer, const: 60 }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+
+    # ── Send ──────────────────────────────────────────────────────────────
+    SendEmailRequest:
+      type: object
+      required: [event_type, payload, email]
+      properties:
+        event_id:
+          type: [string, "null"]
+          format: uuid
+          description: Stable ID for idempotency. Generated (UUIDv7) when omitted.
+        event_type:
+          type: string
+          minLength: 1
+          description: Drives template selection, for example `ORDER_CONFIRMATION`.
+        payload:
+          description: |
+            Template variables passed to the renderer. Send an object. `null` is not
+            checked here, but the renderer rejects it and the delivery fails.
+          type: [object, array, string, number, boolean]
+        email:
+          $ref: "#/components/schemas/EmailOptions"
+        source:
+          type: [string, "null"]
+          description: Free-form origin tag stored as `metadata.source` for tracing.
+
+    SendAccepted:
+      type: object
+      required: [message, eventId, eventType]
+      properties:
+        message: { type: string }
+        eventId: { type: string, format: uuid }
+        eventType: { type: string }
+
+    EmailOptions:
+      description: |
+        Email-channel options. Shared by the send endpoint and the AMQP
+        `NotificationEvent` (`channel_overrides.email`).
+      type: object
+      required: [recipients]
+      properties:
+        recipients:
+          type: array
+          description: |
+            TO recipients, each processed independently (a blocked one does not stop the
+            others). The legacy key `recipient`, holding one object, is also accepted.
+          items: { $ref: "#/components/schemas/Recipient" }
+        cc:
+          type: array
+          default: []
+          description: |
+            Visible CC list. Blocked addresses are dropped silently (logged at WARN);
+            an invalid address fails the delivery permanently.
+          items: { $ref: "#/components/schemas/Recipient" }
+        bcc:
+          type: array
+          default: []
+          description: Hidden copy list. Same rules as `cc`.
+          items: { $ref: "#/components/schemas/Recipient" }
+        from_override:
+          oneOf:
+            - $ref: "#/components/schemas/FromOverride"
+            - type: "null"
+        attachments:
+          type: array
+          default: []
+          description: Files the service downloads at send time and attaches.
+          items: { $ref: "#/components/schemas/AttachmentRef" }
+        sender_account:
+          type: [string, "null"]
+          description: |
+            Key under `[sender_accounts]` in the service config. Falls back to the global
+            `[mailer]` settings when absent or unknown.
+        send_mode:
+          type: string
+          enum: [individual, group]
+          default: individual
+          description: |
+            `individual` — one email and one log row per recipient (recipients cannot see
+            each other). `group` — one shared email with every TO address visible; tracked
+            and retried as a unit.
+        group_retry_mode:
+          type: string
+          enum: [whole, individual]
+          default: whole
+          description: |
+            Only meaningful with `send_mode = group`. `whole` retries the group email and
+            may duplicate mail to recipients already served; `individual` falls back to
+            per-recipient sends and skips addresses already `SENT`.
+        retry_policy:
+          type: string
+          enum: [retry, no_retry]
+          default: retry
+          description: |
+            `retry` — retry transient failures with exponential back-off up to
+            `max_retries`. `no_retry` — mark `FAILED` immediately; the row stays eligible
+            for manual retry through the retry endpoints.
+        send_at:
+          type: [string, "null"]
+          format: date-time
+          description: Do not deliver before this time. The event is parked in the delayed queue until then.
+        priority:
+          type: [integer, "null"]
+          minimum: 0
+          description: Outbox ordering hint. Lower values dispatch first.
+
+    Recipient:
+      type: object
+      required: [email]
+      properties:
+        email: { type: string, format: email }
+        name: { type: [string, "null"] }
+
+    FromOverride:
+      type: object
+      required: [email]
+      properties:
+        email: { type: string, format: email }
+        name: { type: [string, "null"] }
+
+    AttachmentRef:
+      type: object
+      required: [url, filename, content_type]
+      description: |
+        A file fetched by the service with an HTTP GET when the email is sent.
+      properties:
+        url:
+          type: string
+          format: uri
+          description: Must start with `http://` or `https://`.
+        filename:
+          type: string
+          minLength: 1
+          description: Must not contain `/` or `\`.
+        content_type:
+          type: string
+          description: MIME type, for example `application/pdf`. Must contain `/`.
+          examples: [application/pdf]
+        fetch_token:
+          type: [string, "null"]
+          description: Credential the service presents when fetching `url`.
+        max_age_secs:
+          type: [integer, "null"]
+          minimum: 0
+          description: |
+            The URL expires this many seconds after the event timestamp. Expired
+            attachments fail validation, including on retry.
+
+    # ── Status ────────────────────────────────────────────────────────────
+    DeliveryStatus:
+      type: string
+      enum: [PENDING, SENT, FAILED, BLOCKED, SKIPPED]
+      description: |
+        `PENDING` — queued or being retried. `SENT` — accepted by the mail server.
+        `FAILED` — retries exhausted or permanent error (manually retryable).
+        `BLOCKED` — recipient filter rejected it. `SKIPPED` — whole event rejected at
+        validation (not retryable; re-publish a corrected event).
+
+    EventStatus:
+      type: object
+      required: [eventId, recipients, summary]
+      properties:
+        eventId: { type: string, format: uuid }
+        recipients:
+          type: array
+          items: { $ref: "#/components/schemas/RecipientStatus" }
+        summary:
+          type: object
+          required: [total, sent, blocked, failed, pending, skipped, truncated]
+          properties:
+            total: { type: integer, minimum: 0 }
+            sent: { type: integer, minimum: 0 }
+            blocked: { type: integer, minimum: 0 }
+            failed: { type: integer, minimum: 0 }
+            pending: { type: integer, minimum: 0 }
+            skipped: { type: integer, minimum: 0 }
+            truncated:
+              type: boolean
+              description: True when the 500-row cap was hit and more recipients exist.
+
+    RecipientStatus:
+      type: object
+      required: [email, status, retryCount, totalAttempts, lastError, createdAt, updatedAt]
+      properties:
+        eventId:
+          type: string
+          format: uuid
+          description: Present on the single-recipient endpoint only.
+        email: { type: string }
+        status: { $ref: "#/components/schemas/DeliveryStatus" }
+        retryCount:
+          type: integer
+          description: Attempts since the last manual retry. Resets on each manual retry.
+        totalAttempts:
+          type: integer
+          description: Lifetime attempts. Never reset.
+        lastError: { type: [string, "null"] }
+        toRecipients:
+          description: |
+            Present on the event-status endpoint only. Non-null for group sends with
+            `group_retry_mode = whole`: the full To list, carried on the primary row.
+          type: [array, "null"]
+          items: { $ref: "#/components/schemas/Recipient" }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    # ── Templates ─────────────────────────────────────────────────────────
+    TemplateSummary:
+      type: object
+      required: [event_type, channel, subject, version, active, updated_at]
+      properties:
+        event_type: { type: string }
+        channel: { type: string, examples: [email] }
+        subject: { type: string }
+        version: { type: integer, minimum: 1 }
+        active: { type: boolean }
+        updated_at: { type: string, format: date-time }
+
+    Template:
+      allOf:
+        - $ref: "#/components/schemas/TemplateSummary"
+        - type: object
+          required: [body_html, body_text]
+          properties:
+            body_html: { type: string }
+            body_text: { type: string }
+
+    TemplateUpsert:
+      type: object
+      required: [event_type, subject, body_html, body_text]
+      properties:
+        event_type: { type: string, minLength: 1 }
+        channel: { type: string, minLength: 1, default: email }
+        subject:
+          type: string
+          minLength: 1
+          description: Jinja2 template (minijinja).
+        body_html: { type: string, description: Jinja2 template (minijinja). }
+        body_text: { type: string, description: Jinja2 template (minijinja). }
+        active: { type: boolean, default: true }
+
+    TemplatePatch:
+      type: object
+      description: Every field is optional; absent fields stay unchanged.
+      properties:
+        channel:
+          type: string
+          default: email
+          description: Selects which `(event_type, channel)` row to update.
+        subject: { type: string }
+        body_html: { type: string }
+        body_text: { type: string }
+        active: { type: boolean }
+
+    TemplateWriteResult:
+      type: object
+      required: [event_type, channel, version, active]
+      properties:
+        event_type: { type: string }
+        channel: { type: string }
+        version: { type: integer, minimum: 1 }
+        active: { type: boolean }
+        inserted:
+          type: boolean
+          description: Present on `POST /templates` only. True when a new row was created.
+
+    # ── Blocklist ─────────────────────────────────────────────────────────
+    BlocklistKind:
+      type: string
+      enum: [blocked_email, blocked_domain, allowed_email, allowed_domain]
+
+    BlocklistAdd:
+      type: object
+      required: [kind, value]
+      properties:
+        kind: { $ref: "#/components/schemas/BlocklistKind" }
+        value:
+          type: string
+          minLength: 1
+          description: |
+            A valid address for `*_email` kinds. For `*_domain` kinds, a bare domain such
+            as `example.com` (contains a dot, no `@`).
+        reason: { type: [string, "null"] }
+
+    BlocklistEntry:
+      type: object
+      required: [id, kind, value, reason, createdAt]
+      properties:
+        id: { type: integer, format: int64 }
+        kind: { $ref: "#/components/schemas/BlocklistKind" }
+        value: { type: string }
+        reason: { type: [string, "null"] }
+        createdAt: { type: string, format: date-time }

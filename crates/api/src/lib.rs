@@ -1,3 +1,4 @@
+mod docs;
 mod errors;
 mod handlers;
 mod publisher;

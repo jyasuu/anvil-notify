@@ -313,6 +313,20 @@ The MCP server exposes 11 tools: `send_email`, `check_delivery_status`, `list_te
 
 > **Kubernetes probes:** use `/ready` for `readinessProbe` (it pings the DB) and `/health` for `livenessProbe` (shallow process check only).
 
+### API documents
+
+| Document | Describes | Source | Served at |
+| -------- | --------- | ------ | --------- |
+| OpenAPI 3.1 | The HTTP API above | [`docs/openapi.yaml`](docs/openapi.yaml) | `GET /openapi.yaml` |
+| AsyncAPI 3.0 | The RabbitMQ contract: `NotificationEvent`, exchanges, queues, DLQ | [`docs/asyncapi.yaml`](docs/asyncapi.yaml) | `GET /asyncapi.yaml` |
+
+Both are embedded in the binary and sit behind the same bearer-token check as the rest of the API. They are written by hand; CI (`scripts/check_api_docs.py`) fails when a route and `openapi.yaml` disagree. To browse them locally:
+
+```bash
+npx @redocly/cli preview-docs docs/openapi.yaml   # OpenAPI
+npx @asyncapi/cli start studio docs/asyncapi.yaml # AsyncAPI
+```
+
 ---
 
 ## 🎨 Templates
