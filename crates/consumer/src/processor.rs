@@ -105,6 +105,41 @@ pub async fn process_recipient(
     cc_bcc: &EffectiveCcBcc,
     shutdown: &tokio_util::sync::CancellationToken,
 ) -> RecipientOutcome {
+    process_recipient_resumable(
+        ctx,
+        event,
+        email_opts,
+        recipient,
+        attachments,
+        cc_bcc,
+        shutdown,
+        false,
+    )
+    .await
+}
+
+/// [`process_recipient`] with control over how an existing row is treated.
+///
+/// With `resume = false` (what [`process_recipient`] uses) an existing
+/// non-terminal row yields [`RecipientOutcome::Duplicate`] so the caller can
+/// seed its attempt counter from the stored `retry_count`.
+///
+/// With `resume = true` the caller — the retry loop in `delivery.rs` — already
+/// knows the row exists, so a `PENDING` row means "carry on and send".  Without
+/// this the loop would receive `Duplicate` again on every iteration and spin
+/// forever.  `FAILED` / `SKIPPED` rows are never re-sent here: they are
+/// terminal for automatic delivery (`FAILED` only via the operator retry API).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn process_recipient_resumable(
+    ctx: &ProcessorContext,
+    event: &NotificationEvent,
+    email_opts: &common::EmailOptions,
+    recipient: &Recipient,
+    attachments: &[ResolvedAttachment],
+    cc_bcc: &EffectiveCcBcc,
+    shutdown: &tokio_util::sync::CancellationToken,
+    resume: bool,
+) -> RecipientOutcome {
     // ── 0. Recipient email validation (before DB write) ─────────────────────
     if !is_valid_email(&recipient.email) {
         return RecipientOutcome::Failed(AppError::permanent_mailer(format!(
@@ -196,6 +231,11 @@ pub async fn process_recipient(
         }) => match NotificationStatus::try_from(status.as_str()) {
             Ok(NotificationStatus::Sent) | Ok(NotificationStatus::Blocked) => {
                 info!("Skipping already-terminal recipient");
+                return RecipientOutcome::Skipped;
+            }
+            Ok(NotificationStatus::Pending) if resume => {}
+            Ok(_) if resume => {
+                info!(status = %status, "Skipping non-resumable recipient row");
                 return RecipientOutcome::Skipped;
             }
             Ok(_) => return RecipientOutcome::Duplicate { retry_count },
@@ -320,6 +360,32 @@ pub async fn process_group(
     cc_bcc: &EffectiveCcBcc,
     max_recipients: usize,
     shutdown: &tokio_util::sync::CancellationToken,
+) -> RecipientOutcome {
+    process_group_resumable(
+        ctx,
+        event,
+        email_opts,
+        attachments,
+        cc_bcc,
+        max_recipients,
+        shutdown,
+        false,
+    )
+    .await
+}
+
+/// [`process_group`] with control over how an existing primary row is
+/// treated.  See [`process_recipient_resumable`] for the meaning of `resume`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn process_group_resumable(
+    ctx: &ProcessorContext,
+    event: &NotificationEvent,
+    email_opts: &common::EmailOptions,
+    attachments: &[ResolvedAttachment],
+    cc_bcc: &EffectiveCcBcc,
+    max_recipients: usize,
+    shutdown: &tokio_util::sync::CancellationToken,
+    resume: bool,
 ) -> RecipientOutcome {
     let recipients = &email_opts.recipients;
 
@@ -518,6 +584,11 @@ pub async fn process_group(
                 // the caller (runner) drives per-recipient retries, so Skipped
                 // here means this individual row is already terminal.
                 info!("Group send: skipping already-terminal event");
+                return RecipientOutcome::Skipped;
+            }
+            Ok(NotificationStatus::Pending) if resume => {}
+            Ok(_) if resume => {
+                info!(status = %status, "Group send: skipping non-resumable primary row");
                 return RecipientOutcome::Skipped;
             }
             Ok(_) => {

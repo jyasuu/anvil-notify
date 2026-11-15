@@ -84,17 +84,15 @@ impl MailRateLimiter {
     /// Construct from config.  If `emails_per_second == 0`, all `wait_for_token`
     /// calls return immediately (passthrough mode).
     pub fn new(cfg: RateLimitConfig) -> Self {
-        if cfg.emails_per_second == 0 {
+        let Some(per_sec) = NonZeroU32::new(cfg.emails_per_second) else {
             return Self { inner: None };
-        }
-
-        let per_sec = NonZeroU32::new(cfg.emails_per_second).expect("emails_per_second > 0");
+        };
         if cfg.burst_size == 0 {
             tracing::warn!(
                 "rate_limit.burst_size is 0 — overriding to 1. Set burst_size >= 1 in config."
             );
         }
-        let burst = NonZeroU32::new(cfg.burst_size.max(1)).expect("burst_size >= 1");
+        let burst = NonZeroU32::new(cfg.burst_size).unwrap_or(NonZeroU32::MIN);
         let quota = Quota::per_second(per_sec).allow_burst(burst);
         let limiter = RateLimiter::direct(quota);
 

@@ -82,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
                     .allow_origin(
                         cors_origin
                             .parse::<HeaderValue>()
-                            .expect("invalid CORS origin"),
+                            .with_context(|| format!("invalid MCP_CORS_ORIGIN: {cors_origin:?}"))?,
                     )
                     .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
                     .allow_headers(Any)

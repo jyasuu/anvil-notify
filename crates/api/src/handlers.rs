@@ -913,7 +913,11 @@ pub async fn add_blocklist_entry(
                 ))));
             }
         }
-        _ => unreachable!("kind already validated above"),
+        _ => {
+            return Err(ApiError(AppError::permanent_mailer(format!(
+                "unsupported kind '{kind}'"
+            ))))
+        }
     }
 
     let entry = state
