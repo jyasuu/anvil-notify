@@ -13,6 +13,10 @@ members = [
 ]
 resolver = "2"
 
+[workspace.lints.rust]
+# No crate in this workspace uses `unsafe`; keep it that way.
+unsafe_code = "forbid"
+
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -96,6 +100,9 @@ axum        = "0.8"
 config = "0.14"
 
 
+
+[lints]
+workspace = true
 
 [profile.release]
 opt-level = 3        # Default performance optimisation; "s"/"z" are for embedded/binary-size targets

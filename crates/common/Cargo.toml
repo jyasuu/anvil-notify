@@ -10,3 +10,6 @@ uuid        = { workspace = true }
 chrono      = { workspace = true }
 thiserror   = { workspace = true }
 sqlx        = { version = "0.8", features = ["postgres"], default-features = false }
+
+[lints]
+workspace = true

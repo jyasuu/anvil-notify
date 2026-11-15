@@ -373,21 +373,20 @@ async fn main() -> anyhow::Result<()> {
                 .layer(middleware::from_fn(ensure_mcp_accept));
 
             if let Some(cors_origin) = &cfg.mcp_cors_origin {
-                let cors = if cors_origin == "*" {
-                    CorsLayer::new()
-                        .allow_origin(Any)
-                        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-                        .allow_headers(Any)
-                } else {
-                    CorsLayer::new()
-                        .allow_origin(
-                            cors_origin
-                                .parse::<HeaderValue>()
-                                .expect("invalid CORS origin"),
-                        )
-                        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-                        .allow_headers(Any)
-                };
+                let cors =
+                    if cors_origin == "*" {
+                        CorsLayer::new()
+                            .allow_origin(Any)
+                            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                            .allow_headers(Any)
+                    } else {
+                        CorsLayer::new()
+                            .allow_origin(cors_origin.parse::<HeaderValue>().with_context(
+                                || format!("invalid MCP CORS origin: {cors_origin:?}"),
+                            )?)
+                            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                            .allow_headers(Any)
+                    };
                 mcp_router = mcp_router.layer(cors);
             }
 
