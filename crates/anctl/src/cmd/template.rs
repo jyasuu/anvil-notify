@@ -130,7 +130,7 @@ fn store_section(
             }
             *body_text = Some(content);
         }
-        _ => unreachable!(),
+        other => bail!("unexpected section marker {other:?}"),
     }
     Ok(())
 }

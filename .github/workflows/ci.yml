@@ -43,9 +43,7 @@ jobs:
         run: cargo clippy --all --all-targets --all-features -- -D warnings
 
   # ── Build ─────────────────────────────────────────────────────────────────
-  # This is a binary-only crate (no [lib] target), so there are no unit tests
-  # to run separately from the integration suite.  We just verify the release
-  # binary compiles cleanly and upload it for downstream jobs.
+  # Compile check only; tests run in the `test` job below.
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -71,6 +69,97 @@ jobs:
       - name: Build (debug)
         run: cargo build --all
 
+
+  # ── Tests ─────────────────────────────────────────────────────────────────
+  # `#[sqlx::test]` (store crate) and the `integration` API tests need a live
+  # Postgres; the version matches docker-compose.yml.
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: lint
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: anvil_notify
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      # Real broker for the consumer's end-to-end tests (`--ignored` below);
+      # same major.minor as docker-compose.yml.
+      rabbitmq:
+        image: rabbitmq:3.13-alpine
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/anvil_notify
+      TEST_AMQP_URL: amqp://guest:guest@localhost:5672
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
+            ${{ runner.os }}-cargo-
+
+      - name: Apply migrations
+        run: |
+          for f in migrations/0*.sql; do
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      - name: Unit and sqlx tests (instrumented)
+        run: cargo llvm-cov --no-report --workspace
+
+      - name: API integration tests (instrumented)
+        run: cargo llvm-cov --no-report -p api --features integration -- --test-threads=1
+
+      - name: Consumer AMQP end-to-end tests (instrumented)
+        run: cargo llvm-cov --no-report -p consumer --lib -- --ignored
+
+      # Baseline measured on 2026-11-16: 33.2% line coverage.  The floor below
+      # only guards against regressions -- raise it as coverage improves.
+      # Large untested areas: anctl, mcp, src/main.rs and the DB-backed paths
+      # in store, api and outbox.
+      - name: Coverage report
+        run: |
+          cargo llvm-cov report --workspace --summary-only
+          cargo llvm-cov report --workspace --lcov --output-path lcov.info
+          cargo llvm-cov report --workspace --summary-only --fail-under-lines 32 > /dev/null
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: ignore
 
   # ── Security Audit ────────────────────────────────────────────────────────
   audit:

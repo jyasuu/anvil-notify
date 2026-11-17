@@ -31,3 +31,8 @@ reqwest = { workspace = true }
 
 [dev-dependencies]
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres"] }
+# `test-util` provides paused time so retry-backoff tests do not really sleep.
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

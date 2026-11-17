@@ -2720,4 +2720,752 @@ mod processor_tests {
         let (status_y, _) = store.status_of(event.event_id, "y@blocked.com").unwrap();
         assert_eq!(status_y, "BLOCKED");
     }
+
+    // ── process_one_recipient retry-loop tests ────────────────────────────────
+    //
+    // These cover `delivery::process_one_recipient`, the per-recipient retry
+    // loop.  Backoff sleeps run on tokio's paused clock, so they cost no real
+    // time.
+
+    mod delivery_retry_tests {
+        use super::*;
+        use std::time::Duration;
+
+        use common::RetryPolicy;
+
+        use crate::delivery::{process_one_group, process_one_recipient};
+        use crate::processor::EffectiveCcBcc;
+        use tokio_util::sync::CancellationToken;
+
+        const EMAIL: &str = "ok@example.com";
+
+        /// Run `body` on a dedicated thread with a paused-time runtime and fail
+        /// (instead of hanging the whole test run) if it has not finished after
+        /// 20 *real* seconds.  Retry loops sleep for minutes of virtual time;
+        /// paused time lets them complete instantly, and the watchdog turns a
+        /// non-terminating loop into a clear test failure.
+        fn run_bounded<F, Fut>(body: F)
+        where
+            F: FnOnce() -> Fut + Send + 'static,
+            Fut: std::future::Future<Output = ()>,
+        {
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let handle = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .start_paused(true)
+                    .build()
+                    .unwrap();
+                rt.block_on(body());
+                let _ = tx.send(());
+            });
+            match rx.recv_timeout(Duration::from_secs(20)) {
+                Ok(()) => handle.join().unwrap(),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    if let Err(panic) = handle.join() {
+                        std::panic::resume_unwind(panic);
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("process_one_recipient did not terminate within 20s (hot loop?)")
+                }
+            }
+        }
+
+        struct Harness {
+            store: Arc<MockNotificationStore>,
+            sender: Arc<MockSender>,
+            ctx: crate::ProcessorContext,
+            event: NotificationEvent,
+            opts: common::EmailOptions,
+        }
+
+        impl Harness {
+            fn new(send_outcomes: Vec<Result<(), AppError>>) -> Self {
+                let store = Arc::new(MockNotificationStore::new());
+                let resolver = Arc::new(MockTemplateResolver::new());
+                resolver.register("ORDER_CONFIRMATION", "Subject", "<b>Hi</b>", "Hi");
+                let sender = Arc::new(mock_sender(send_outcomes));
+                let ctx = build_test_context(store.clone(), sender.clone(), resolver);
+                let (event, opts) = make_individual_test_data(EMAIL);
+                Self {
+                    store,
+                    sender,
+                    ctx,
+                    event,
+                    opts,
+                }
+            }
+
+            async fn run(&self, cfg: &ConsumerConfig, shutdown: &CancellationToken) {
+                let cc_bcc = Arc::new(EffectiveCcBcc {
+                    cc: vec![],
+                    bcc: vec![],
+                });
+                process_one_recipient(
+                    &self.ctx,
+                    &self.event,
+                    &self.opts,
+                    &self.opts.recipients[0],
+                    &[],
+                    &cc_bcc,
+                    cfg,
+                    shutdown,
+                )
+                .await;
+            }
+
+            fn status(&self) -> String {
+                self.store
+                    .status_of(self.event.event_id, EMAIL)
+                    .expect("row should exist")
+                    .0
+            }
+
+            fn error_msg(&self) -> String {
+                let rows = self.store.rows.lock().unwrap();
+                rows.get(&(self.event.event_id, EMAIL.to_string()))
+                    .and_then(|r| r.error_msg.clone())
+                    .unwrap_or_default()
+            }
+
+            fn unused_send_outcomes(&self) -> usize {
+                self.sender.outcomes.lock().unwrap().len()
+            }
+        }
+
+        fn cfg(max_retries: u32, max_rl_waits: u32) -> ConsumerConfig {
+            ConsumerConfig {
+                max_retries,
+                retry_base_ms: 10,
+                max_rl_waits,
+                ..ConsumerConfig::default()
+            }
+        }
+
+        #[test]
+        fn permanent_failure_marks_failed_without_retry() {
+            run_bounded(|| async {
+                let h = Harness::new(vec![Err(AppError::permanent_mailer("550 no such user"))]);
+                h.run(&cfg(3, 5), &CancellationToken::new()).await;
+
+                assert_eq!(h.status(), "FAILED");
+                assert!(h.error_msg().contains("550"));
+                assert_eq!(h.unused_send_outcomes(), 0);
+            });
+        }
+
+        #[test]
+        fn transient_failure_with_no_retries_left_marks_failed() {
+            run_bounded(|| async {
+                let h = Harness::new(vec![Err(AppError::transient_mailer("smtp 451"))]);
+                h.run(&cfg(0, 5), &CancellationToken::new()).await;
+
+                assert_eq!(h.status(), "FAILED");
+                assert!(h.error_msg().contains("451"));
+            });
+        }
+
+        #[test]
+        fn no_retry_policy_fails_immediately_on_transient_error() {
+            run_bounded(|| async {
+                let mut h = Harness::new(vec![Err(AppError::transient_mailer("smtp 451"))]);
+                h.opts.retry_policy = RetryPolicy::NoRetry;
+                // Plenty of retry budget: only the policy can stop the loop.
+                h.run(&cfg(5, 5), &CancellationToken::new()).await;
+
+                assert_eq!(h.status(), "FAILED");
+                assert_eq!(h.unused_send_outcomes(), 0);
+            });
+        }
+
+        #[test]
+        fn rate_limit_budget_exhausted_marks_failed() {
+            run_bounded(|| async {
+                let h = Harness::new(vec![Err(AppError::RateLimited("slow down".into()))]);
+                h.run(&cfg(3, 0), &CancellationToken::new()).await;
+
+                assert_eq!(h.status(), "FAILED");
+                assert!(h.error_msg().contains("slow down"));
+            });
+        }
+
+        #[test]
+        fn shutdown_during_retry_backoff_marks_failed_for_manual_retry() {
+            run_bounded(|| async {
+                let h = Harness::new(vec![Err(AppError::transient_mailer("smtp 451"))]);
+                let shutdown = CancellationToken::new();
+                shutdown.cancel();
+                h.run(&cfg(3, 5), &shutdown).await;
+
+                assert_eq!(h.status(), "FAILED");
+                assert!(h.error_msg().contains("shutdown during retry backoff"));
+            });
+        }
+
+        #[test]
+        fn shutdown_during_rate_limit_backoff_marks_failed_for_manual_retry() {
+            run_bounded(|| async {
+                let h = Harness::new(vec![Err(AppError::RateLimited("slow down".into()))]);
+                let shutdown = CancellationToken::new();
+                shutdown.cancel();
+                h.run(&cfg(3, 5), &shutdown).await;
+
+                assert_eq!(h.status(), "FAILED");
+                assert!(h.error_msg().contains("shutdown during rate-limit backoff"));
+            });
+        }
+
+        #[test]
+        fn already_sent_recipient_is_skipped_not_resent() {
+            run_bounded(|| async {
+                // Only one send outcome is queued: a second send would panic.
+                let h = Harness::new(vec![Ok(())]);
+                let shutdown = CancellationToken::new();
+                h.run(&cfg(3, 5), &shutdown).await;
+                assert_eq!(h.status(), "SENT");
+
+                // Re-delivery of the same event must be a no-op.
+                h.run(&cfg(3, 5), &shutdown).await;
+                assert_eq!(h.status(), "SENT");
+                assert_eq!(h.unused_send_outcomes(), 0);
+            });
+        }
+
+        // ── Retry must resume the row it already owns ──────────────────────────
+        //
+        // After a transient failure `mark_failed(.., false)` leaves the row
+        // PENDING, and the next iteration's `insert_pending` reports it as a
+        // `Duplicate`.  The loop must treat that as "mine — carry on and send";
+        // before the `resume` flag existed it received `Duplicate` forever and
+        // never re-sent.
+
+        #[test]
+        fn transient_failure_then_success_ends_sent() {
+            run_bounded(|| async {
+                let h = Harness::new(vec![Err(AppError::transient_mailer("smtp 451")), Ok(())]);
+                h.run(&cfg(3, 5), &CancellationToken::new()).await;
+
+                assert_eq!(h.status(), "SENT");
+                assert_eq!(h.unused_send_outcomes(), 0);
+            });
+        }
+
+        #[test]
+        fn rate_limited_then_success_ends_sent() {
+            run_bounded(|| async {
+                let h = Harness::new(vec![Err(AppError::RateLimited("slow down".into())), Ok(())]);
+                h.run(&cfg(3, 5), &CancellationToken::new()).await;
+
+                assert_eq!(h.status(), "SENT");
+                assert_eq!(h.unused_send_outcomes(), 0);
+            });
+        }
+
+        #[test]
+        fn exhausting_retries_after_several_transient_failures_marks_failed() {
+            run_bounded(|| async {
+                // max_retries = 2: the initial attempt plus two retries.
+                let h = Harness::new(vec![
+                    Err(AppError::transient_mailer("smtp 451 #1")),
+                    Err(AppError::transient_mailer("smtp 451 #2")),
+                    Err(AppError::transient_mailer("smtp 451 #3")),
+                ]);
+                h.run(&cfg(2, 5), &CancellationToken::new()).await;
+
+                assert_eq!(h.status(), "FAILED");
+                assert_eq!(h.unused_send_outcomes(), 0, "all three sends must be tried");
+            });
+        }
+
+        impl Harness {
+            /// Create the row exactly as a previous (crashed or earlier) delivery
+            /// would have left it: PENDING, optionally flipped to FAILED.
+            async fn seed_existing_row(&self, failed: bool) {
+                self.store
+                    .insert_pending(&EmailInsertPendingArgs {
+                        event_id: self.event.event_id,
+                        event_type: &self.event.event_type,
+                        recipient_email: EMAIL,
+                        recipient_name: None,
+                        payload: &self.event.payload,
+                        from_override: None,
+                        attachments: None,
+                        sender_account: None,
+                        cc: None,
+                        bcc: None,
+                        send_mode: "individual",
+                        group_retry_mode: None,
+                        to_recipients: None,
+                        event_timestamp: self.event.timestamp,
+                    })
+                    .await
+                    .unwrap();
+                if failed {
+                    self.store
+                        .mark_failed(self.event.event_id, EMAIL, "earlier failure", true)
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+
+        #[test]
+        fn redelivered_pending_row_is_resumed_and_sent() {
+            run_bounded(|| async {
+                let h = Harness::new(vec![Ok(())]);
+                h.seed_existing_row(false).await;
+                h.run(&cfg(3, 5), &CancellationToken::new()).await;
+
+                assert_eq!(h.status(), "SENT");
+                assert_eq!(h.unused_send_outcomes(), 0);
+            });
+        }
+
+        #[test]
+        fn redelivered_failed_row_is_not_resent() {
+            run_bounded(|| async {
+                // No send outcomes queued: any send attempt would panic.
+                let h = Harness::new(vec![]);
+                h.seed_existing_row(true).await;
+                h.run(&cfg(3, 5), &CancellationToken::new()).await;
+
+                assert_eq!(h.status(), "FAILED");
+            });
+        }
+
+        // ── process_one_group (Whole mode) ────────────────────────────────────
+
+        struct GroupHarness {
+            store: Arc<MockNotificationStore>,
+            sender: Arc<MockSender>,
+            ctx: crate::ProcessorContext,
+            event: NotificationEvent,
+            opts: common::EmailOptions,
+        }
+
+        impl GroupHarness {
+            fn new(send_outcomes: Vec<Result<(), AppError>>) -> Self {
+                Self::with_mode(send_outcomes, common::GroupRetryMode::Whole)
+            }
+
+            fn with_mode(
+                send_outcomes: Vec<Result<(), AppError>>,
+                mode: common::GroupRetryMode,
+            ) -> Self {
+                let store = Arc::new(MockNotificationStore::new());
+                let resolver = Arc::new(MockTemplateResolver::new());
+                resolver.register("ORDER_CONFIRMATION", "Subject", "<b>Hi</b>", "Hi");
+                let sender = Arc::new(mock_sender(send_outcomes));
+                let ctx = build_test_context(store.clone(), sender.clone(), resolver);
+                let (event, opts) =
+                    make_group_test_data(vec!["a@example.com", "b@example.com"], mode);
+                Self {
+                    store,
+                    sender,
+                    ctx,
+                    event,
+                    opts,
+                }
+            }
+
+            async fn run(&self, cfg: &ConsumerConfig, shutdown: &CancellationToken) {
+                let cc_bcc = Arc::new(EffectiveCcBcc {
+                    cc: vec![],
+                    bcc: vec![],
+                });
+                process_one_group(
+                    &self.ctx,
+                    &self.event,
+                    &self.opts,
+                    &[],
+                    cc_bcc,
+                    cfg,
+                    shutdown,
+                )
+                .await;
+            }
+
+            fn primary_status(&self) -> String {
+                self.status("a@example.com")
+            }
+
+            fn status(&self, email: &str) -> String {
+                self.store
+                    .status_of(self.event.event_id, email)
+                    .unwrap_or_else(|| panic!("row for {email} should exist"))
+                    .0
+            }
+        }
+
+        #[test]
+        fn group_permanent_failure_marks_primary_failed() {
+            run_bounded(|| async {
+                let h = GroupHarness::new(vec![Err(AppError::permanent_mailer("550 rejected"))]);
+                h.run(&cfg(3, 5), &CancellationToken::new()).await;
+
+                assert_eq!(h.primary_status(), "FAILED");
+            });
+        }
+
+        #[test]
+        fn group_transient_failure_then_success_ends_sent() {
+            run_bounded(|| async {
+                let h =
+                    GroupHarness::new(vec![Err(AppError::transient_mailer("smtp 451")), Ok(())]);
+                h.run(&cfg(3, 5), &CancellationToken::new()).await;
+
+                assert_eq!(h.primary_status(), "SENT");
+                assert_eq!(h.sender.outcomes.lock().unwrap().len(), 0);
+            });
+        }
+
+        // ── process_one_group (Individual mode) → per-recipient fallback ───────
+
+        #[test]
+        fn group_individual_mode_failure_falls_back_to_per_recipient_sends() {
+            run_bounded(|| async {
+                // 1st outcome: the group send fails.  Then one successful send
+                // per recipient from the fallback tasks.
+                let h = GroupHarness::with_mode(
+                    vec![Err(AppError::transient_mailer("smtp 451")), Ok(()), Ok(())],
+                    common::GroupRetryMode::Individual,
+                );
+                h.run(&cfg(3, 5), &CancellationToken::new()).await;
+
+                assert_eq!(h.status("a@example.com"), "SENT");
+                assert_eq!(h.status("b@example.com"), "SENT");
+                assert_eq!(h.sender.outcomes.lock().unwrap().len(), 0);
+            });
+        }
+
+        #[test]
+        fn group_individual_fallback_marks_each_recipient_failed_on_permanent_errors() {
+            run_bounded(|| async {
+                let h = GroupHarness::with_mode(
+                    vec![
+                        Err(AppError::transient_mailer("smtp 451")),
+                        Err(AppError::permanent_mailer("550 rejected")),
+                        Err(AppError::permanent_mailer("550 rejected")),
+                    ],
+                    common::GroupRetryMode::Individual,
+                );
+                h.run(&cfg(3, 5), &CancellationToken::new()).await;
+
+                assert_eq!(h.status("a@example.com"), "FAILED");
+                assert_eq!(h.status("b@example.com"), "FAILED");
+            });
+        }
+    }
+
+    // ── End-to-end tests against a real RabbitMQ ──────────────────────────────
+    //
+    // These run the real `run_consumer` (reconnect loop, topology declaration,
+    // consume loop, `handle_delivery`, retry loops) against a live broker, with
+    // the store, mailer and template resolver mocked.  They are `#[ignore]`d so
+    // a plain `cargo test` needs no broker:
+    //
+    //     TEST_AMQP_URL=amqp://guest:guest@localhost:5672 \
+    //         cargo test -p consumer -- --ignored
+    //
+    // Every test uses uniquely named queues/exchanges, so they can run in
+    // parallel and against a shared broker.
+
+    mod amqp_e2e_tests {
+        use super::*;
+        use std::time::Duration;
+
+        use lapin::{
+            options::{
+                BasicPublishOptions, ExchangeDeleteOptions, QueueDeclareOptions, QueueDeleteOptions,
+            },
+            types::FieldTable,
+            BasicProperties, Connection, ConnectionProperties,
+        };
+        use tokio_util::sync::CancellationToken;
+
+        const EMAIL: &str = "ok@example.com";
+
+        fn amqp_url() -> String {
+            std::env::var("TEST_AMQP_URL")
+                .expect("set TEST_AMQP_URL (e.g. amqp://guest:guest@localhost:5672) to run these")
+        }
+
+        /// Poll `check` every 50 ms until it returns true, or panic after `timeout`.
+        async fn wait_until<F, Fut>(what: &str, timeout: Duration, mut check: F)
+        where
+            F: FnMut() -> Fut,
+            Fut: std::future::Future<Output = bool>,
+        {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if check().await {
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out after {timeout:?} waiting for: {what}"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        /// Ready-message count of `queue`, or `None` if it does not exist.
+        /// A passive declare of a missing queue makes the broker close the
+        /// channel, so each probe uses its own throw-away channel.
+        async fn queue_depth(conn: &Connection, queue: &str) -> Option<u32> {
+            let ch = conn.create_channel().await.ok()?;
+            ch.queue_declare(
+                queue,
+                QueueDeclareOptions {
+                    passive: true,
+                    ..Default::default()
+                },
+                FieldTable::default(),
+            )
+            .await
+            .ok()
+            .map(|q| q.message_count())
+        }
+
+        /// Run `body` on its own thread and multi-thread runtime, failing the
+        /// test (rather than hanging it) if it panics or takes over 30 s.
+        ///
+        /// The result is reported *before* the runtime is torn down: if the
+        /// code under test ever busy-loops without yielding, dropping the
+        /// runtime would block forever and turn a clean failure into a CI job
+        /// timeout.
+        fn run_e2e<F, Fut>(body: F)
+        where
+            F: FnOnce() -> Fut + Send + 'static,
+            Fut: std::future::Future<Output = ()>,
+        {
+            let (tx, rx) = std::sync::mpsc::channel::<std::thread::Result<()>>();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.block_on(body())));
+                let _ = tx.send(result);
+                rt.shutdown_background();
+            });
+            match rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(Ok(())) => {}
+                Ok(Err(panic)) => std::panic::resume_unwind(panic),
+                Err(_) => panic!("end-to-end test did not finish within 30s"),
+            }
+        }
+
+        struct E2e {
+            cfg: ConsumerConfig,
+            store: Arc<MockNotificationStore>,
+            sender: Arc<MockSender>,
+            conn: Connection,
+            shutdown: CancellationToken,
+            consumer: tokio::task::JoinHandle<anyhow::Result<()>>,
+        }
+
+        impl E2e {
+            async fn start(send_outcomes: Vec<Result<(), AppError>>) -> Self {
+                let id = uuid::Uuid::new_v4().simple().to_string();
+                let cfg = ConsumerConfig {
+                    amqp_url: amqp_url(),
+                    queue: format!("it.{id}"),
+                    exchange: format!("it-ex.{id}"),
+                    routing_key: format!("it.{id}"),
+                    max_retries: 3,
+                    retry_base_ms: 10,
+                    max_concurrency: 4,
+                    ..ConsumerConfig::default()
+                };
+
+                let store = Arc::new(MockNotificationStore::new());
+                let resolver = Arc::new(MockTemplateResolver::new());
+                resolver.register("ORDER_CONFIRMATION", "Subject", "<b>Hi</b>", "Hi");
+                let sender = Arc::new(mock_sender(send_outcomes));
+                let ctx = build_test_context(store.clone(), sender.clone(), resolver);
+
+                let shutdown = CancellationToken::new();
+                let consumer = tokio::spawn(crate::runner::run_consumer(
+                    cfg.clone(),
+                    ctx,
+                    Arc::new(reqwest::Client::new()),
+                    shutdown.clone(),
+                ));
+
+                let conn = Connection::connect(&cfg.amqp_url, ConnectionProperties::default())
+                    .await
+                    .expect("connect to RabbitMQ");
+                let this = Self {
+                    cfg,
+                    store,
+                    sender,
+                    conn,
+                    shutdown,
+                    consumer,
+                };
+
+                // The consumer declares the topology on startup; wait for it.
+                let (conn, queue) = (&this.conn, this.cfg.queue.clone());
+                wait_until(
+                    "consumer to declare its queue",
+                    Duration::from_secs(15),
+                    || {
+                        let queue = queue.clone();
+                        async move { queue_depth(conn, &queue).await.is_some() }
+                    },
+                )
+                .await;
+                this
+            }
+
+            async fn publish(&self, body: &[u8]) {
+                let ch = self.conn.create_channel().await.unwrap();
+                ch.basic_publish(
+                    &self.cfg.exchange,
+                    &self.cfg.routing_key,
+                    BasicPublishOptions::default(),
+                    body,
+                    BasicProperties::default().with_delivery_mode(2),
+                )
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+            }
+
+            /// Publish a well-formed single-recipient event; returns its id.
+            async fn publish_event(&self) -> uuid::Uuid {
+                let (event, _) = make_individual_test_data(EMAIL);
+                self.publish(&serde_json::to_vec(&event).unwrap()).await;
+                event.event_id
+            }
+
+            async fn wait_for_status(&self, event_id: uuid::Uuid, want: &str) {
+                wait_until(
+                    &format!("row status {want}"),
+                    Duration::from_secs(15),
+                    || async move {
+                        self.store
+                            .status_of(event_id, EMAIL)
+                            .is_some_and(|(status, _)| status == want)
+                    },
+                )
+                .await;
+            }
+
+            /// Stop the consumer (it must exit cleanly) and delete the topology.
+            async fn finish(self) {
+                self.shutdown.cancel();
+                let joined = tokio::time::timeout(Duration::from_secs(15), self.consumer)
+                    .await
+                    .expect("run_consumer did not stop within 15s of shutdown")
+                    .expect("consumer task panicked");
+                assert!(joined.is_ok(), "run_consumer returned an error: {joined:?}");
+
+                if let Ok(ch) = self.conn.create_channel().await {
+                    let dlq = format!("{}.dlq", self.cfg.queue);
+                    let dlx = format!("{}.dlx", self.cfg.exchange);
+                    for q in [self.cfg.queue.as_str(), dlq.as_str()] {
+                        let _ = ch.queue_delete(q, QueueDeleteOptions::default()).await;
+                    }
+                    for x in [self.cfg.exchange.as_str(), dlx.as_str()] {
+                        let _ = ch
+                            .exchange_delete(x, ExchangeDeleteOptions::default())
+                            .await;
+                    }
+                }
+            }
+        }
+
+        #[test]
+        #[ignore = "requires RabbitMQ: set TEST_AMQP_URL and run with --ignored"]
+        fn published_event_is_delivered_sent_and_acked() {
+            run_e2e(|| async {
+                let t = E2e::start(vec![Ok(())]).await;
+                let event_id = t.publish_event().await;
+
+                t.wait_for_status(event_id, "SENT").await;
+                assert_eq!(t.sender.outcomes.lock().unwrap().len(), 0);
+
+                // Acked: nothing left ready on the queue or dead-lettered.
+                wait_until("queue to drain", Duration::from_secs(5), || async {
+                    queue_depth(&t.conn, &t.cfg.queue).await == Some(0)
+                })
+                .await;
+                let dlq = format!("{}.dlq", t.cfg.queue);
+                assert_eq!(queue_depth(&t.conn, &dlq).await, Some(0));
+
+                t.finish().await;
+            });
+        }
+
+        #[test]
+        #[ignore = "requires RabbitMQ: set TEST_AMQP_URL and run with --ignored"]
+        fn malformed_message_is_dead_lettered() {
+            run_e2e(|| async {
+                let t = E2e::start(vec![]).await;
+                t.publish(b"this is not json").await;
+
+                let dlq = format!("{}.dlq", t.cfg.queue);
+                wait_until(
+                    "message to reach the DLQ",
+                    Duration::from_secs(15),
+                    || async { queue_depth(&t.conn, &dlq).await == Some(1) },
+                )
+                .await;
+                assert_eq!(queue_depth(&t.conn, &t.cfg.queue).await, Some(0));
+
+                t.finish().await;
+            });
+        }
+
+        #[test]
+        #[ignore = "requires RabbitMQ: set TEST_AMQP_URL and run with --ignored"]
+        fn transient_send_failure_is_retried_until_sent() {
+            run_e2e(|| async {
+                // Regression test for the retry loop spinning on `Duplicate`:
+                // here it runs through the real consumer and broker.
+                let t = E2e::start(vec![Err(AppError::transient_mailer("smtp 451")), Ok(())]).await;
+                let event_id = t.publish_event().await;
+
+                t.wait_for_status(event_id, "SENT").await;
+                assert_eq!(t.sender.outcomes.lock().unwrap().len(), 0);
+
+                t.finish().await;
+            });
+        }
+
+        #[test]
+        #[ignore = "requires RabbitMQ: set TEST_AMQP_URL and run with --ignored"]
+        fn permanent_send_failure_marks_failed_and_acks() {
+            run_e2e(|| async {
+                let t = E2e::start(vec![Err(AppError::permanent_mailer("550 rejected"))]).await;
+                let event_id = t.publish_event().await;
+
+                t.wait_for_status(event_id, "FAILED").await;
+                // A permanent failure is recorded in the log, not dead-lettered.
+                wait_until("queue to drain", Duration::from_secs(5), || async {
+                    queue_depth(&t.conn, &t.cfg.queue).await == Some(0)
+                })
+                .await;
+                let dlq = format!("{}.dlq", t.cfg.queue);
+                assert_eq!(queue_depth(&t.conn, &dlq).await, Some(0));
+
+                t.finish().await;
+            });
+        }
+
+        #[test]
+        #[ignore = "requires RabbitMQ: set TEST_AMQP_URL and run with --ignored"]
+        fn consumer_stops_cleanly_on_shutdown_when_idle() {
+            run_e2e(|| async {
+                let t = E2e::start(vec![]).await;
+                t.finish().await;
+            });
+        }
+    }
 }
