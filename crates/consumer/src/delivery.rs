@@ -182,8 +182,8 @@ use store::{EmailInsertPendingArgs, InsertResult, NotificationStore};
 use crate::{
     config::ConsumerConfig,
     processor::{
-        is_retryable, process_group, process_recipient, EffectiveCcBcc, ProcessorContext,
-        RecipientOutcome,
+        is_retryable, process_group_resumable, process_recipient_resumable, EffectiveCcBcc,
+        ProcessorContext, RecipientOutcome,
     },
 };
 
@@ -205,7 +205,7 @@ const MAX_RETRY_DELAY_MS: u64 = 30 * 60 * 1000; // 30 minutes
 /// **CC / BCC filtering** runs once here before dispatch.  Invalid or
 /// block-listed copy addresses are excluded (WARN-logged) and delivery
 /// continues.  TO recipients are *not* filtered at this stage; their validity
-/// and block-list checks run inside [`process_recipient`] after the
+/// and block-list checks run inside [`process_recipient`](crate::processor::process_recipient) after the
 /// idempotency INSERT (see module-level doc for the rationale).
 ///
 /// **Recipients** are processed in parallel via a `JoinSet`: each TO recipient
@@ -611,7 +611,7 @@ pub(crate) async fn handle_delivery(
 
 /// Drive one recipient through the retry loop (individual send mode).
 ///
-/// Calls [`process_recipient`] on each iteration and acts on the returned
+/// Calls [`process_recipient`](crate::processor::process_recipient) on each iteration and acts on the returned
 /// [`RecipientOutcome`]: terminal outcomes (`Sent`, `Blocked`, `Skipped`,
 /// permanent failures) return immediately; transient failures sleep with
 /// exponential backoff and retry; `RateLimited` outcomes use a separate
@@ -636,8 +636,14 @@ pub(crate) async fn process_one_recipient(
     let mut attempt: u32 = 0;
     let mut rl_count: u32 = 0;
 
+    // The first call may legitimately create the row (Inserted) or find one left
+    // by a previous delivery (Duplicate).  From the second iteration on the row
+    // exists and this loop owns it, so `process_recipient_resumable` must carry
+    // on and send instead of returning `Duplicate` again.
+    let mut resume = false;
+
     loop {
-        match process_recipient(
+        let outcome = process_recipient_resumable(
             ctx,
             event,
             email_opts,
@@ -645,9 +651,12 @@ pub(crate) async fn process_one_recipient(
             attachments,
             cc_bcc,
             shutdown,
+            resume,
         )
-        .await
-        {
+        .await;
+        resume = true;
+
+        match outcome {
             RecipientOutcome::Sent | RecipientOutcome::Blocked(_) | RecipientOutcome::Skipped => {
                 return;
             }
@@ -850,7 +859,7 @@ pub(crate) async fn process_one_recipient(
 
 /// Drive a group send through the retry loop (group send mode).
 ///
-/// Calls [`process_group`] on each iteration, which builds one
+/// Calls [`process_group`](crate::processor::process_group) on each iteration, which builds one
 /// [`EmailMessage`](mailer::message::EmailMessage) with all recipients sharing
 /// the `To:` header.  Retry logic mirrors [`process_one_recipient`] with one
 /// additional outcome:
@@ -876,8 +885,12 @@ pub(crate) async fn process_one_group(
     let mut attempt: u32 = 0;
     let mut rl_count: u32 = 0;
 
+    // See `process_one_recipient`: after the first iteration the primary row
+    // exists and is owned by this loop, so resume instead of re-reporting it.
+    let mut resume = false;
+
     loop {
-        match process_group(
+        let outcome = process_group_resumable(
             ctx,
             event,
             email_opts,
@@ -885,9 +898,12 @@ pub(crate) async fn process_one_group(
             &cc_bcc,
             cfg.max_recipients_per_event,
             shutdown,
+            resume,
         )
-        .await
-        {
+        .await;
+        resume = true;
+
+        match outcome {
             RecipientOutcome::Sent | RecipientOutcome::Blocked(_) | RecipientOutcome::Skipped => {
                 return;
             }

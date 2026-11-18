@@ -1,7 +1,9 @@
 [advisories]
 ignore = [
     "RUSTSEC-2023-0071",  # 忽略 rsa 的 Marvin Attack 漏洞
-    "RUSTSEC-2026-0185",  # quinn-proto: 内存耗尽漏洞 (建议尽快升级至 >=0.11.15)
+    "RUSTSEC-2026-0459",  # libsqlite3-sys: 僅存在於 Cargo.lock(sqlx 的 sqlite driver),任何 build graph 都未編入;待 sqlx 升級後移除
+    "RUSTSEC-2026-0457",  # rmcp OAuth client SSRF: 未啟用 rmcp 的 `auth`/`client` feature,僅使用 server 端;待升級 rmcp 3.x 後移除
+    "RUSTSEC-2026-0462",  # rmcp Streamable HTTP client 緩衝: 同上,僅使用 server 端;待升級 rmcp 3.x 後移除
     "RUSTSEC-2024-0384",  # instant: 库已停止维护 (unmaintained)
     "RUSTSEC-2025-0119",  # number_prefix: 库已停止维护 (unmaintained)
     "RUSTSEC-2024-0370",  # proc-macro-error: 库已停止维护 (unmaintained)

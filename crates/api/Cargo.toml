@@ -36,3 +36,6 @@ serde_json  = { workspace = true }
 sqlx        = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "migrate"] }
 uuid        = { workspace = true }
 tower       = "0.5"
+
+[lints]
+workspace = true

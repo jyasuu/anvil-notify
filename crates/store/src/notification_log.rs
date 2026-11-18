@@ -195,6 +195,9 @@ pub trait NotificationStore: Send + Sync + 'static {
     ) -> Result<(), AppError>;
 
     /// Fetch all delivery rows for an event (one per recipient).
+    ///
+    /// Returns [`AppError::NotFound`] when the event has no rows, and at most
+    /// 500 rows for very large events.
     async fn get_by_event_id(&self, event_id: Uuid) -> Result<Vec<NotificationLog>, AppError>;
 
     /// Fetch delivery rows for an event, optionally filtered to a subset of

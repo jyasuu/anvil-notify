@@ -11,5 +11,12 @@ pub use template_store::{
     EmailTemplate, NotificationTemplate, TemplateResolver, TemplateRow, TemplateStore,
 };
 
+#[cfg(test)]
+mod block_list_store_tests;
+#[cfg(test)]
+mod cli_queries_tests;
+#[cfg(test)]
+mod notification_log_tests;
+
 pub mod block_list_store;
 pub use block_list_store::{BlockListChecker, BlockListEntry, BlockListStore};
